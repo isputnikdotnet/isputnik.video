@@ -1,0 +1,7 @@
+# Every text file is stored with LF and checked out with LF, whatever the
+# developer's core.autocrlf says (binary files are detected and left alone).
+* text=auto eol=lf
+
+# Shell scripts run inside the Linux container: a CRLF on the shebang line makes
+# the kernel look for "/bin/sh\r" and the entrypoint fails to start.
+*.sh text eol=lf

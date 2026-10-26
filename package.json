@@ -1,0 +1,39 @@
+{
+  "name": "isputnik-video",
+  "private": true,
+  "version": "0.1.0",
+  "stage": "alpha",
+  "description": "The video engine for isputnik.home: TV shows and movies, scanned, described and played behind the home server.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "cross-env PORT=4300 tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json && node --input-type=module -e \"import('node:fs').then(fs => fs.copyFileSync('src/schema.sql', 'dist/schema.sql'))\"",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "fast-xml-parser": "^5.11.2",
+    "fastify": "^5.12.7",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.5",
+    "cross-env": "^10.1.0",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.8.2",
+    "typescript-eslint": "^8.71.2",
+    "vitest": "^5.0.5"
+  }
+}

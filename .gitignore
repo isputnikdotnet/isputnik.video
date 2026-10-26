@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.local
+.claude
+
+# Runtime data: the catalog database and the poster cache — never sync to remote
+data/
