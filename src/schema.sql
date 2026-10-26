@@ -84,6 +84,21 @@ CREATE TABLE IF NOT EXISTS movies (
   UNIQUE (library_id, folder)
 );
 
+-- How far each person got: one row per person and episode or movie. Ids stay
+-- the same across rescans, so a rescan keeps everyone's place; the daily sweep
+-- drops rows whose item is gone.
+CREATE TABLE IF NOT EXISTS progress (
+  user_id     TEXT NOT NULL,
+  item_id     TEXT NOT NULL,
+  item_type   TEXT NOT NULL CHECK (item_type IN ('episode', 'movie')),
+  position_s  REAL NOT NULL DEFAULT 0,
+  duration_s  REAL,
+  watched     INTEGER NOT NULL DEFAULT 0,
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (user_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS progress_recent ON progress (user_id, updated_at DESC);
+
 -- What happened, for the admin to read from home (Control panel → Apps → Events).
 CREATE TABLE IF NOT EXISTS events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,

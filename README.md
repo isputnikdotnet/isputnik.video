@@ -7,8 +7,10 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: V1 in progress (0.1.0, alpha). Catalog and library sync work; the home
-side, posters, TMDB and playback come next.
+Status: 0.2.0, alpha. Catalog, library sync and direct play work, with each
+person's progress (resume, next episode, Continue watching). Remux and
+transcode for files a browser cannot play, subtitles, posters and TMDB come
+next.
 
 ## The contract, from this side
 
@@ -29,6 +31,10 @@ side, posters, TMDB and playback come next.
 | `GET /video/api/libraries` | signed | the libraries this person may see |
 | `GET /video/api/shows`, `/shows/:id` | signed | shows, then seasons and episodes |
 | `GET /video/api/movies`, `/movies/:id` | signed | movies |
+| `GET /video/api/play/:id` | signed | an episode or movie for the player: playable as is (`direct`), where to resume, what is next |
+| `GET /video/api/stream/:id` | signed | the file, with byte ranges |
+| `PUT /video/api/progress/:id` | signed | `{ position, duration, watched? }` — this person's place in it |
+| `GET /video/api/continue` | signed | left halfway, and the next episode of a show, newest first |
 | `GET /video/api/admin/libraries` | admin | every library with counts and scan state |
 | `PUT /video/api/admin/libraries/:id` | admin | create or change a library (scans it) |
 | `DELETE /video/api/admin/libraries/:id` | admin | delete it and its catalog |

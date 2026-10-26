@@ -3,6 +3,7 @@
 // home worked it out). Home's screens draw it; this answers in plain JSON.
 import type { Db } from "./db.js";
 import { canSee, type Identity } from "./identity.js";
+import { browserPlayability, nextUp, progressFor, resumeAt } from "./playback.js";
 
 export interface ListQuery {
   library?: string;
@@ -88,8 +89,9 @@ export function getShow(db: Db, identity: Identity, id: string) {
     WHERE s.id = ? AND l.state = 'active'
   `).get(id) as Record<string, unknown> | undefined;
   if (!show || !canSee(identity, show.library_id as string)) return null;
-  const episodes = db.prepare("SELECT id, season, episode, title, plot, aired, runtime_minutes FROM episodes WHERE show_id = ? ORDER BY season, episode, file")
-    .all(id) as { id: string; season: number; episode: number; title: string | null; plot: string | null; aired: string | null; runtime_minutes: number | null }[];
+  const episodes = db.prepare("SELECT id, season, episode, title, plot, aired, runtime_minutes, file FROM episodes WHERE show_id = ? ORDER BY season, episode, file")
+    .all(id) as { id: string; season: number; episode: number; title: string | null; plot: string | null; aired: string | null; runtime_minutes: number | null; file: string }[];
+  const progress = progressFor(db, identity.id, episodes.map((episode) => episode.id));
   const seasons = new Map<number, { number: number; episodes: unknown[] }>();
   for (const episode of episodes) {
     if (!seasons.has(episode.season)) seasons.set(episode.season, { number: episode.season, episodes: [] });
@@ -99,9 +101,12 @@ export function getShow(db: Db, identity: Identity, id: string) {
       title: episode.title,
       plot: episode.plot,
       aired: episode.aired,
-      runtimeMinutes: episode.runtime_minutes
+      runtimeMinutes: episode.runtime_minutes,
+      direct: browserPlayability(episode.file).direct,
+      progress: progress.get(episode.id) ?? null
     });
   }
+  const next = nextUp(db, identity.id, id);
   return {
     id: show.id as string,
     libraryId: show.library_id as string,
@@ -115,7 +120,9 @@ export function getShow(db: Db, identity: Identity, id: string) {
     imdbId: (show.imdb_id as string | null) ?? null,
     tmdbId: (show.tmdb_id as string | null) ?? null,
     source: show.source as "nfo" | "folder",
-    seasons: [...seasons.values()]
+    seasons: [...seasons.values()],
+    /** What Play on the show starts: null once every episode is watched. */
+    nextUp: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title, position: resumeAt(progress.get(next.id)) } : null
   };
 }
 
@@ -136,6 +143,8 @@ export function getMovie(db: Db, identity: Identity, id: string) {
     runtimeMinutes: (movie.runtime_minutes as number | null) ?? null,
     imdbId: (movie.imdb_id as string | null) ?? null,
     tmdbId: (movie.tmdb_id as string | null) ?? null,
-    source: movie.source as "nfo" | "folder"
+    source: movie.source as "nfo" | "folder",
+    direct: browserPlayability(movie.file as string).direct,
+    progress: progressFor(db, identity.id, [movie.id as string]).get(movie.id as string) ?? null
   };
 }

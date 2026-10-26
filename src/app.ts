@@ -2,9 +2,11 @@
 // every library; this server scans the folders, keeps the catalog and answers
 // for both (home's docs/video-architecture.md). Reached only through home's
 // gateway, under /video, with the person's identity in signed headers.
+import fs from "node:fs";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./catalog.js";
+import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress } from "./playback.js";
 import { BASE_PATH } from "./config.js";
 import { openDatabase } from "./db.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
@@ -82,6 +84,39 @@ const listQuerySchema = z.object({
 
 const itemIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 
+const progressBodySchema = z.object({
+  position: z.number().min(0).max(1e6),
+  duration: z.number().positive().max(1e6).nullable().default(null),
+  watched: z.boolean().optional()
+});
+
+const continueQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
+
+/** A single byte range from a Range header; null for none (the whole file),
+ *  "invalid" for one that cannot be served. Several ranges get the whole file,
+ *  which every player accepts. */
+export function parseRange(header: string | undefined, size: number): { start: number; end: number } | null | "invalid" {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return header.includes(",") ? null : "invalid";
+  const [, from, to] = match;
+  if (from === "" && to === "") return "invalid";
+  let start: number;
+  let end: number;
+  if (from === "") {
+    // The last N bytes.
+    const suffix = Number(to);
+    if (suffix === 0) return "invalid";
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(from);
+    end = to === "" ? size - 1 : Math.min(Number(to), size - 1);
+  }
+  if (start >= size || start > end) return "invalid";
+  return { start, end };
+}
+
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const secret = options.gatewaySecret;
   const dev = secret ? null : options.devUser ? devIdentity(options.devUser) : null;
@@ -109,6 +144,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     pruneEvents(db, EVENT_RETENTION_DAYS);
     const purged = purgeDetached(db);
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
+    purgeOrphanProgress(db);
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -239,6 +275,88 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.get(`${API}/movies/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const movie = getMovie(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
     return movie ?? reply.code(404).send({ error: "No such movie" });
+  });
+
+  // ── Watching ─────────────────────────────────────────────────────────────
+
+  // What home's player needs to start: the item, whether the browser can play
+  // the file as it is, where to resume, and what comes next.
+  app.get(`${API}/play/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const identity = request.identity!;
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    if (!item) return reply.code(404).send({ error: "Not found" });
+    const file = fileOf(options.mediaRoot, item);
+    const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
+    const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : null;
+    const { mime, direct } = browserPlayability(item.relative);
+    return {
+      id: item.id,
+      type: item.type,
+      title: item.title,
+      show: item.show,
+      season: item.season,
+      episode: item.episode,
+      runtimeMinutes: item.runtimeMinutes,
+      available: Boolean(file),
+      sizeBytes: file?.size ?? null,
+      mime,
+      direct,
+      stream: `${API}/stream/${item.id}`,
+      progress,
+      resumeAt: resumeAt(progress),
+      next: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title } : null
+    };
+  });
+
+  // The file itself, with byte ranges so the player can seek. Streamed straight
+  // from disk; the reply is written by hand so nothing buffers a film.
+  app.get(`${API}/stream/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
+    const file = item ? fileOf(options.mediaRoot, item) : null;
+    if (!item || !file) return reply.code(404).send({ error: "Not found" });
+    const range = parseRange(request.headers.range, file.size);
+    if (range === "invalid") {
+      return reply.code(416).header("Content-Range", `bytes */${file.size}`).send({ error: "Range not satisfiable" });
+    }
+    const { start, end } = range ?? { start: 0, end: file.size - 1 };
+    const headers: Record<string, string | number> = {
+      "Content-Type": browserPlayability(item.relative).mime,
+      "Content-Length": file.size === 0 ? 0 : end - start + 1,
+      "Accept-Ranges": "bytes",
+      "Last-Modified": file.modified.toUTCString(),
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "X-Robots-Tag": "noindex, nofollow"
+    };
+    if (range) headers["Content-Range"] = `bytes ${start}-${end}/${file.size}`;
+    reply.hijack();
+    reply.raw.writeHead(range ? 206 : 200, headers);
+    if (request.method === "HEAD" || file.size === 0) {
+      reply.raw.end();
+      return;
+    }
+    const stream = fs.createReadStream(file.absolute, { start, end });
+    stream.on("error", (err) => {
+      request.log.warn({ err, item: item.id }, "Reading a video file failed mid-stream");
+      reply.raw.destroy(err);
+    });
+    // A player that seeks closes the connection: stop reading the disk too.
+    reply.raw.on("close", () => stream.destroy());
+    stream.pipe(reply.raw);
+  });
+
+  // How far the person got; the player sends it every few seconds and on pause.
+  app.put(`${API}/progress/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const identity = request.identity!;
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    if (!item) return reply.code(404).send({ error: "Not found" });
+    const body = progressBodySchema.parse(request.body);
+    return { progress: saveProgress(db, identity.id, item, body) };
+  });
+
+  app.get(`${API}/continue`, { preHandler: requireIdentity }, async (request) => {
+    const { limit } = continueQuerySchema.parse(request.query ?? {});
+    return { items: continueWatching(db, request.identity!, limit) };
   });
 
   // ── Libraries, as home manages them (home's server calls these) ─────────
