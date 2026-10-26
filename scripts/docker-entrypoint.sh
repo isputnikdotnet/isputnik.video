@@ -10,7 +10,8 @@ PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 
 if [ "$(id -u)" = "0" ]; then
-  mkdir -p /config
+  mkdir -p /config /transcode
+  chown "${PUID}:${PGID}" /transcode 2>/dev/null || true
   chown "${PUID}:${PGID}" /config 2>/dev/null || true
   mark="/config/.owner-uid"
   if [ "$(cat "$mark" 2>/dev/null)" != "${PUID}:${PGID}" ]; then

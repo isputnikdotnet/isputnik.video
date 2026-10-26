@@ -3,10 +3,16 @@
 // for both (home's docs/video-architecture.md). Reached only through home's
 // gateway, under /video, with the person's identity in signed headers.
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./catalog.js";
-import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress } from "./playback.js";
+import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
+import { findTools, toolsWork, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { HlsError, HlsSessions, buildPlan, playlist, type HlsPlan } from "./hls.js";
+import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { openDatabase } from "./db.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
@@ -39,6 +45,12 @@ export interface AppOptions {
   version: string;
   stage: string | null;
   logBuffer?: LogBuffer;
+  /** ffmpeg and ffprobe, for converting what a browser can't play; found on
+   *  PATH (or the dev dependencies) when left out, none at all when null. */
+  tools?: Tools | null;
+  /** Where segments are made while someone watches (TRANSCODE_PATH); emptied on
+   *  start and removed on close. A fresh temporary folder when left out. */
+  transcodeDir?: string;
   /** Tests settle files at once instead of waiting out a copy. */
   scan?: ScanOptions;
   fastify?: FastifyServerOptions;
@@ -128,6 +140,34 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
   const db = openDatabase(options.dbPath);
 
+  // ffmpeg converts what a browser can't play (delivery.ts, hls.ts); without it
+  // a file plays as it is or not at all.
+  const tools = options.tools === undefined ? findTools() : options.tools;
+  const toolsReady = tools ? toolsWork(tools) : Promise.resolve(false);
+  void toolsReady.then((ok) => {
+    if (!ok) app.log.warn("ffmpeg or ffprobe not found: only files a browser plays as they are will play");
+  });
+  const mediaProbe = tools ? new MediaProbe(db, tools) : null;
+  const hls = tools
+    ? new HlsSessions(tools, options.transcodeDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-hls-")), {
+      info: (obj, msg) => app.log.info(obj, msg),
+      warn: (obj, msg) => app.log.warn(obj, msg)
+    })
+    : null;
+
+  /** How the file reaches the browser, from what ffprobe finds inside it; null
+   *  when ffmpeg is missing or can't read the file. */
+  const deliveryFor = async (item: PlayableItem, file: ProbedFile): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
+    if (!mediaProbe || !(await toolsReady)) return null;
+    try {
+      const info = await mediaProbe.info(item.id, file);
+      return { info, delivery: decideDelivery(info, path.extname(item.relative)) };
+    } catch (err) {
+      app.log.warn({ err, item: item.id }, "ffprobe could not read a video file");
+      return null;
+    }
+  };
+
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
   const queued = new Set<string>();
@@ -135,6 +175,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.addHook("onClose", async () => {
     clearInterval(daily);
+    hls?.close();
     await scanChain.catch(() => undefined);
     db.close();
   });
@@ -145,6 +186,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const purged = purgeDetached(db);
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
     purgeOrphanProgress(db);
+    purgeOrphanProbes(db);
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -288,7 +330,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = fileOf(options.mediaRoot, item);
     const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : null;
-    const { mime, direct } = browserPlayability(item.relative);
+    const stream = `${API}/stream/${item.id}`;
+    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null } =
+      { mode: "none", reasons: [], url: null, duration: null };
+    if (file) {
+      const decided = await deliveryFor(item, file);
+      if (decided) {
+        const { mode, reasons, videoCopy } = decided.delivery;
+        playback = { mode, reasons, url: mode === "direct" ? stream : `${API}/hls/${item.id}/index.m3u8`, duration: decided.info.duration || null };
+        // The playlist of a picture copied as it is needs its keyframes: start
+        // reading them now, while the page opens.
+        if (mode === "remux" && videoCopy) void mediaProbe!.keyframes(item.id, file).catch(() => undefined);
+      } else if (browserPlayability(item.relative).direct !== "no") {
+        // Nothing to look inside it with: offered as it is, and the browser decides.
+        playback = { mode: "direct", reasons: [], url: stream, duration: null };
+      }
+    }
     return {
       id: item.id,
       type: item.type,
@@ -299,9 +356,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       runtimeMinutes: item.runtimeMinutes,
       available: Boolean(file),
       sizeBytes: file?.size ?? null,
-      mime,
-      direct,
-      stream: `${API}/stream/${item.id}`,
+      playback,
       progress,
       resumeAt: resumeAt(progress),
       next: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title } : null
@@ -343,6 +398,63 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // A player that seeks closes the connection: stop reading the disk too.
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
+  });
+
+  // HLS, for what the browser can't play as it is: the playlist of the whole
+  // film, then each segment, made as it is asked for (hls.ts).
+  const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan } | null> => {
+    const identity = request.identity!;
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    const file = item ? fileOf(options.mediaRoot, item) : null;
+    if (!item || !file || !hls || !mediaProbe) return null;
+    const decided = await deliveryFor(item, file);
+    if (!decided) return null;
+    const keyframes = decided.delivery.videoCopy ? await mediaProbe.keyframes(item.id, file) : null;
+    return { key: `${identity.id}:${item.id}`, plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes) };
+  };
+
+  app.get(`${API}/hls/:id/:name`, { preHandler: requireIdentity }, async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const segment = /^(\d{1,6})\.ts$/.exec(name);
+    if (name !== "index.m3u8" && !segment) return reply.code(404).send({ error: "Not found" });
+    const found = await planFor(request);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    if (!segment) {
+      return reply.header("Content-Type", "application/vnd.apple.mpegurl").header("Cache-Control", "private, no-store").send(playlist(found.plan));
+    }
+    const n = Number(segment[1]);
+    if (n >= found.plan.starts.length) return reply.code(404).send({ error: "Not found" });
+    let file: string;
+    try {
+      file = await hls!.segment(found.key, found.plan, n);
+    } catch (err) {
+      if (!(err instanceof HlsError)) throw err;
+      return reply.code(503).header("Retry-After", "2").send({ error: err.message });
+    }
+    let size: number;
+    try {
+      size = fs.statSync(file).size;
+    } catch {
+      return reply.code(503).header("Retry-After", "1").send({ error: "The segment went missing" });
+    }
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "video/mp2t",
+      "Content-Length": size,
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff"
+    });
+    const stream = fs.createReadStream(file);
+    stream.on("error", (err) => reply.raw.destroy(err));
+    reply.raw.on("close", () => stream.destroy());
+    stream.pipe(reply.raw);
+  });
+
+  // The player has gone: stop converting for it now rather than after a minute.
+  app.delete(`${API}/hls/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    hls?.stop(`${request.identity!.id}:${id}`);
+    return reply.code(204).send();
   });
 
   // How far the person got; the player sends it every few seconds and on pause.

@@ -112,7 +112,9 @@ describe("progress", () => {
     expect((await saveProgress(id, { position: 600, duration: 2400 })).json().progress).toMatchObject({ position: 600, duration: 2400, watched: false });
 
     const play = (await get(`/video/api/play/${id}`, as("mum"))).json();
-    expect(play).toMatchObject({ type: "episode", show: { title: "Радар" }, season: 1, episode: 1, direct: "maybe", resumeAt: 600, available: true });
+    expect(play).toMatchObject({ type: "episode", show: { title: "Радар" }, season: 1, episode: 1, resumeAt: 600, available: true });
+    // Not a real film: nothing to look inside, so offered as it is.
+    expect(play.playback).toMatchObject({ mode: "direct", url: `/video/api/stream/${id}` });
     expect(play.next).toMatchObject({ id: episode(2).id, episode: 2 });
 
     const show = (await get(`/video/api/shows/${radar.id}`, as("mum"))).json();

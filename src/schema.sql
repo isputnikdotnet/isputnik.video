@@ -99,6 +99,19 @@ CREATE TABLE IF NOT EXISTS progress (
 );
 CREATE INDEX IF NOT EXISTS progress_recent ON progress (user_id, updated_at DESC);
 
+-- What is inside each file, from ffprobe: its streams for choosing how it
+-- plays, and where its keyframes are for cutting it (a whole-file read, so it
+-- is kept). Stale once the file's size or date changes; the sweep drops rows
+-- whose item is gone.
+CREATE TABLE IF NOT EXISTS media_probe (
+  item_id      TEXT PRIMARY KEY,
+  size         INTEGER NOT NULL,
+  modified_ms  INTEGER NOT NULL,
+  info         TEXT NOT NULL,
+  keyframes    TEXT,
+  probed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 -- What happened, for the admin to read from home (Control panel → Apps → Events).
 CREATE TABLE IF NOT EXISTS events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,

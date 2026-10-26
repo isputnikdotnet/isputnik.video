@@ -27,8 +27,9 @@ WORKDIR /app
 # has none, so a template edit or an update cannot leave the tile blank.
 LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/icon.png"
 
-# gosu drops the entrypoint from root to the runtime user (scripts/docker-entrypoint.sh).
-RUN apt-get update && apt-get install -y --no-install-recommends gosu \
+# gosu drops the entrypoint from root to the runtime user (scripts/docker-entrypoint.sh);
+# ffmpeg converts what a browser can't play as it is (src/delivery.ts, src/hls.ts).
+RUN apt-get update && apt-get install -y --no-install-recommends gosu ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=prod-deps /build/node_modules ./node_modules
@@ -36,6 +37,9 @@ COPY --from=build /build/dist ./dist
 # Carries "type": "module", and config.ts reads the version from it (one level
 # above dist/).
 COPY package.json ./
+
+# ffmpeg is there, with the encoders the conversion uses.
+RUN ffmpeg -hide_banner -encoders | grep -q libx264 && ffmpeg -hide_banner -encoders | grep -q " aac " && ffprobe -version > /dev/null
 
 # Import smoke test: every production dependency must load from this tree, so a
 # missing package fails THIS build instead of the container at startup.
@@ -48,6 +52,8 @@ ENV PORT=4300
 ENV DB_PATH=/config/video.sqlite
 # The video folders — mount them read-only; every library is a folder under it.
 ENV MEDIA_ROOT=/media
+# Segments made while someone watches; mount RAM or a fast disk here if you like.
+ENV TRANSCODE_PATH=/transcode
 # GATEWAY_SECRET must be set at run time; the server refuses to start without it.
 # Who the server runs as; the entrypoint takes ownership of /config for them.
 ENV PUID=1000

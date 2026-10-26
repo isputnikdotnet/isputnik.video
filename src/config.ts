@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkSecret } from "./identity.js";
@@ -30,6 +31,9 @@ export const config = {
   /** Where the video folders are mounted, read-only (the image: /media). Every
    *  library folder is a path under it. */
   mediaRoot: process.env.MEDIA_ROOT ?? path.join(rootDir, "data", "media"),
+  /** Where segments are made while someone watches; emptied on start. Fast
+   *  local disk or RAM is best (the image: /transcode). */
+  transcodeDir: process.env.TRANSCODE_PATH?.trim() || path.join(os.tmpdir(), "isputnik-video-hls"),
   gatewaySecret,
   /** Development only: who the server pretends is signed in when no secret is set, "id:name". */
   devUser: process.env.DEV_USER ?? "dev:Developer",

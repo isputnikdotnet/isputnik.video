@@ -7,10 +7,11 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.2.0, alpha. Catalog, library sync and direct play work, with each
-person's progress (resume, next episode, Continue watching). Remux and
-transcode for files a browser cannot play, subtitles, posters and TMDB come
-next.
+Status: 0.3.0, alpha. Catalog, library sync and playback work, with each
+person's progress (resume, next episode, Continue watching). A file a browser
+plays as it is goes as it is; the rest are converted to HLS as they play — the
+sound to AAC, the picture to H.264 only when a browser can't show it.
+Subtitles, choosing a dub, posters and TMDB come next.
 
 ## The contract, from this side
 
@@ -31,8 +32,10 @@ next.
 | `GET /video/api/libraries` | signed | the libraries this person may see |
 | `GET /video/api/shows`, `/shows/:id` | signed | shows, then seasons and episodes |
 | `GET /video/api/movies`, `/movies/:id` | signed | movies |
-| `GET /video/api/play/:id` | signed | an episode or movie for the player: playable as is (`direct`), where to resume, what is next |
+| `GET /video/api/play/:id` | signed | an episode or movie for the player: how it plays (`playback`: direct, remux or transcode, and its address), where to resume, what is next |
 | `GET /video/api/stream/:id` | signed | the file, with byte ranges |
+| `GET /video/api/hls/:id/index.m3u8`, `/:n.ts` | signed | the film as HLS, its segments cut as they are asked for |
+| `DELETE /video/api/hls/:id` | signed | the player has gone: stop converting |
 | `PUT /video/api/progress/:id` | signed | `{ position, duration, watched? }` — this person's place in it |
 | `GET /video/api/continue` | signed | left halfway, and the next episode of a show, newest first |
 | `GET /video/api/admin/libraries` | admin | every library with counts and scan state |
@@ -63,20 +66,24 @@ two minutes is left for the next scan, so a copy in progress is never catalogued
 | `MEDIA_ROOT` | `data/media` | the video folders, mounted read-only (image: `/media`) |
 | `DB_PATH` | `data/video.sqlite` | the catalog (image: `/config/video.sqlite`) |
 | `PORT` / `HOST` | `4300` / `127.0.0.1` | |
+| `TRANSCODE_PATH` | temp folder | where segments are made while someone watches (image: `/transcode`); emptied on start |
+| `FFMPEG_PATH` / `FFPROBE_PATH` | on `PATH` | the image installs both; a checkout uses the ffmpeg-static dev dependencies |
 | `LOG_LEVEL` | `info` | |
 | `DEV_USER` | `dev:Developer` | development without a secret: an admin who sees every library |
 
 ## Running it
 
-The image is `ghcr.io/isputnikdotnet/isputnik.video` (tags `latest`, `0.1`,
-`0.1.0`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
+The image is `ghcr.io/isputnikdotnet/isputnik.video` (tags `latest`, `0.3`,
+`0.3.0`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
 put it on the same user-defined Docker network as the isputnik container
 (`docker network create isputnik`), mount `/config` (the catalog) and `/media`
-(the video share, read-only), then:
+(the video share, read-only) — and, if you like, `/transcode` on RAM or a fast
+disk — then:
 
-1. On the isputnik container set `VIDEO_URL=http://isputnik-video:4300` and restart it.
-2. In home, Control panel → Apps → Setup → Video → **Generate secret**; paste it
-   here as `GATEWAY_SECRET`. The container won't start without it.
+1. In home, Control panel → Apps → Setup → Video: save the address
+   `http://isputnik-video:4300`.
+2. On the same page, **Generate secret**; paste it here as `GATEWAY_SECRET`. The
+   container won't start without it.
 3. Add a library: Control panel → Library → Libraries → Add library → Video.
 
 Home's guide `docs/users/apps.md` has the whole walk-through.

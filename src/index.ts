@@ -11,6 +11,7 @@ const app = await buildApp({
   devUser: config.production ? null : config.devUser,
   dbPath: config.dbPath,
   mediaRoot: config.mediaRoot,
+  transcodeDir: config.transcodeDir,
   version: config.version,
   stage: config.stage,
   logBuffer,

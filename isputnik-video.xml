@@ -60,6 +60,16 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Required="true"
           Mask="false">/mnt/user/data/video</Config>
 
+  <Config Name="Transcode"
+          Target="/transcode"
+          Default=""
+          Mode="rw"
+          Description="Optional. Where a video is converted while someone watches it (a few hundred MB per viewer, deleted as they go). Point it at RAM (/tmp/isputnik-video) or a cache-pool folder to keep it off the array; left empty, it stays inside the container."
+          Type="Path"
+          Display="advanced"
+          Required="false"
+          Mask="false"></Config>
+
   <!-- Environment Variables -->
 
   <Config Name="Gateway Secret"
