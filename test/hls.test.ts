@@ -214,6 +214,65 @@ describe("real segments", () => {
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/tx/index.m3u8`, headers })).statusCode).toBe(404);
   }, 60_000);
 
+  const adminHeaders = { ...headers, "x-isputnik-user-id": "admin", "x-isputnik-user-role": "admin" };
+  const conversion = async () => (await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers: adminHeaders })).json();
+  const setConversion = (payload: object) => app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers: adminHeaders, payload });
+
+  it("keeps finished segments in memory, and on the disk when the admin gives none", async () => {
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
+    let state = await conversion();
+    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+    expect(state.usage.viewers).toMatchObject([{ user: "Mum", title: "Loud Film", mode: "remux" }]);
+    expect(state.usage.memoryBytes).toBeGreaterThan(0);
+    expect(state.usage.diskBytes).toBe(0);
+
+    expect((await setConversion({ memoryPerViewerMb: 0, maxViewers: 3, whenFull: "disk" })).statusCode).toBe(200);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+    const segment = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers });
+    expect(segment.statusCode).toBe(200);
+    expect(Number(segment.headers["content-length"])).toBe(segment.rawPayload.length);
+    state = await conversion();
+    expect(state.usage.memoryBytes).toBe(0);
+    expect(state.usage.diskBytes).toBeGreaterThan(0);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+  }, 60_000);
+
+  it("turns away a viewer past the admin's limit, and lets them in once a place is free", async () => {
+    await setConversion({ memoryPerViewerMb: 300, maxViewers: 1, whenFull: "wait" });
+    const dad = { ...headers, "x-isputnik-user-id": "dad", "x-isputnik-user-name": "Dad" };
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
+
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: dad })).json().playback.busy).toEqual({ limit: 1 });
+    const refused = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/index.m3u8`, headers: dad });
+    expect(refused.statusCode).toBe(503);
+    expect(refused.json()).toMatchObject({ code: "busy", limit: 1 });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).json().code).toBe("busy");
+    // Mum, already watching, carries on.
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers })).json().playback.busy).toBeNull();
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers })).statusCode).toBe(200);
+
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).statusCode).toBe(200);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers: dad });
+    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+  }, 60_000);
+
+  it("keeps the admin's settings, refuses ones out of range, and lets only an admin near them", async () => {
+    expect((await setConversion({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" })).json().settings)
+      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" });
+    expect((await conversion()).settings.memoryPerViewerMb).toBe(512);
+    expect((await setConversion({ memoryPerViewerMb: -1, maxViewers: 2, whenFull: "wait" })).statusCode).toBe(400);
+    expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 0, whenFull: "wait" })).statusCode).toBe(400);
+    expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 2, whenFull: "swap" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers, payload: { memoryPerViewerMb: 1, maxViewers: 1, whenFull: "disk" } })).statusCode).toBe(403);
+    const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=conversion.changed", headers: adminHeaders })).json();
+    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting, 512 MB of memory each, then waiting");
+    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+  });
+
   it("refuses a segment that isn't in the playlist, and someone who can't see the film", async () => {
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/99.ts`, headers })).statusCode).toBe(404);
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/x.ts`, headers })).statusCode).toBe(404);

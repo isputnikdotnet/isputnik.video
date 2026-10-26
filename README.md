@@ -67,7 +67,7 @@ two minutes is left for the next scan, so a copy in progress is never catalogued
 | `MEDIA_ROOT` | `data/media` | the video folders, mounted read-only (image: `/media`) |
 | `DB_PATH` | `data/video.sqlite` | the catalog (image: `/config/video.sqlite`) |
 | `PORT` / `HOST` | `4300` / `127.0.0.1` | |
-| `TRANSCODE_PATH` | temp folder | where segments are made while someone watches (image: `/transcode`); emptied on start |
+| `TRANSCODE_PATH` | temp folder | where ffmpeg writes segments while someone watches (image: `/transcode`); finished ones move into memory up to the share set on home's Apps → Installed, the rest stay here; emptied on start |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | on `PATH` | the image installs both; a checkout uses the ffmpeg-static dev dependencies |
 | `LOG_LEVEL` | `info` | |
 | `DEV_USER` | `dev:Developer` | development without a secret: an admin who sees every library |

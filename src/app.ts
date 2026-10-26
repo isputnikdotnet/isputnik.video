@@ -10,7 +10,8 @@ import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./ca
 import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
-import { HlsError, HlsSessions, buildPlan, playlist, type HlsPlan } from "./hls.js";
+import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type SegmentData } from "./hls.js";
+import { conversionSchema, readConversion, saveConversion } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { openDatabase } from "./db.js";
@@ -159,6 +160,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       warn: (obj, msg) => app.log.warn(obj, msg)
     })
     : null;
+  hls?.configure(readConversion(db));
 
   /** How the file reaches the browser, from what ffprobe finds inside it; null
    *  when ffmpeg is missing or can't read the file. */
@@ -339,21 +341,23 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const { audio: audioIndex } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
-    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null } =
-      { mode: "none", reasons: [], url: null, duration: null };
+    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: { limit: number } | null } =
+      { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const decided = await deliveryFor(item, file, audioIndex);
       if (decided) {
         const { mode, reasons, videoCopy } = decided.delivery;
         const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
-        playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null };
+        // Every place to watch converted video taken: the player says so instead.
+        const busy = mode !== "direct" && hls && !hls.canStart(`${identity.id}:${item.id}`) ? { limit: hls.limit } : null;
+        playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null, busy };
         audioTracks = decided.info.audio.map((track) => ({ ...track, selected: track.index === decided.delivery.audio?.index }));
         // The playlist of a picture copied as it is needs its keyframes: start
         // reading them now, while the page opens.
         if (mode === "remux" && videoCopy) void mediaProbe!.keyframes(item.id, file).catch(() => undefined);
       } else if (browserPlayability(item.relative).direct !== "no") {
         // Nothing to look inside it with: offered as it is, and the browser decides.
-        playback = { mode: "direct", reasons: [], url: stream, duration: null };
+        playback = { mode: "direct", reasons: [], url: stream, duration: null, busy: null };
       }
     }
     return {
@@ -413,7 +417,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // HLS, for what the browser can't play as it is: the playlist of the whole
   // film, then each segment, made as it is asked for (hls.ts).
-  const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan } | null> => {
+  const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan; who: { user: string; title: string } } | null> => {
     const identity = request.identity!;
     const { id, track } = request.params as { id: string; track?: string };
     const item = findItem(db, identity, itemIdSchema.parse(id));
@@ -427,7 +431,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // An address for a track the file doesn't have is not this film.
     if (track !== undefined && trackSegment(decided.delivery) !== track) return null;
     const keyframes = decided.delivery.videoCopy ? await mediaProbe.keyframes(item.id, file) : null;
-    return { key: `${identity.id}:${item.id}`, plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes) };
+    const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
+    return {
+      key: `${identity.id}:${item.id}`,
+      plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes),
+      who: { user: identity.name || identity.id, title }
+    };
   };
 
   const serveHls = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -436,36 +445,36 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (name !== "index.m3u8" && !segment) return reply.code(404).send({ error: "Not found" });
     const found = await planFor(request);
     if (!found) return reply.code(404).send({ error: "Not found" });
+    // Every place taken: refused before the player waits on a segment.
+    if (!hls!.canStart(found.key)) return busyReply(reply, hls!.limit);
     if (!segment) {
       return reply.header("Content-Type", "application/vnd.apple.mpegurl").header("Cache-Control", "private, no-store").send(playlist(found.plan));
     }
     const n = Number(segment[1]);
     if (n >= found.plan.starts.length) return reply.code(404).send({ error: "Not found" });
-    let file: string;
+    let made: SegmentData;
     try {
-      file = await hls!.segment(found.key, found.plan, n);
+      made = await hls!.segment(found.key, found.plan, n, found.who);
     } catch (err) {
+      if (err instanceof HlsBusyError) return busyReply(reply, err.limit);
       if (!(err instanceof HlsError)) throw err;
       return reply.code(503).header("Retry-After", "2").send({ error: err.message });
     }
-    let size: number;
-    try {
-      size = fs.statSync(file).size;
-    } catch {
-      return reply.code(503).header("Retry-After", "1").send({ error: "The segment went missing" });
-    }
+    const headers = { "Content-Type": "video/mp2t", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
+    if ("data" in made) return reply.headers(headers).send(made.data);
+    const file = made.file;
+    if (!fs.existsSync(file)) return reply.code(503).header("Retry-After", "1").send({ error: "The segment went missing" });
     reply.hijack();
-    reply.raw.writeHead(200, {
-      "Content-Type": "video/mp2t",
-      "Content-Length": size,
-      "Cache-Control": "private, no-store",
-      "X-Content-Type-Options": "nosniff"
-    });
+    reply.raw.writeHead(200, { ...headers, "Content-Length": made.size || fs.statSync(file).size });
     const stream = fs.createReadStream(file);
     stream.on("error", (err) => reply.raw.destroy(err));
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
   };
+  /** Every place to watch converted video is taken. */
+  const busyReply = (reply: FastifyReply, limit: number) =>
+    reply.code(503).send({ error: `${limit} ${limit === 1 ? "person is" : "people are"} already watching converted video`, code: "busy", limit });
+
   app.get(`${API}/hls/:id/:track/:name`, { preHandler: requireIdentity }, serveHls);
   app.get(`${API}/hls/:id/:name`, { preHandler: requireIdentity }, serveHls);
 
@@ -536,6 +545,25 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
 
   // ── The admin's window, read by home through the gateway ─────────────────
+
+  // Watching converted video: the admin's limits, and who is using what now.
+  const conversion = () => ({
+    available: Boolean(hls),
+    settings: readConversion(db),
+    usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 }
+  });
+
+  app.get(`${API}/admin/conversion`, { preHandler: requireAdmin }, async () => conversion());
+
+  app.put(`${API}/admin/conversion`, { preHandler: requireAdmin }, async (request) => {
+    const settings = conversionSchema.parse(request.body);
+    saveConversion(db, settings);
+    hls?.configure(settings);
+    const memory = settings.memoryPerViewerMb === 0 ? "no memory" : `${settings.memoryPerViewerMb} MB of memory each, then ${settings.whenFull === "disk" ? "the disk" : "waiting"}`;
+    note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting, ${memory}` });
+    return conversion();
+  });
+
 
   app.get(`${API}/admin/events`, { preHandler: requireAdmin }, async (request) => {
     const query = eventsQuerySchema.parse(request.query ?? {});
