@@ -60,6 +60,21 @@ two minutes is left for the next scan, so a copy in progress is never catalogued
 | `LOG_LEVEL` | `info` | |
 | `DEV_USER` | `dev:Developer` | development without a secret: an admin who sees every library |
 
+## Running it
+
+The image is `ghcr.io/isputnikdotnet/isputnik.video` (tags `latest`, `0.1`,
+`0.1.0`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
+put it on the same user-defined Docker network as the isputnik container
+(`docker network create isputnik`), mount `/config` (the catalog) and `/media`
+(the video share, read-only), then:
+
+1. On the isputnik container set `VIDEO_URL=http://isputnik-video:4300` and restart it.
+2. In home, Control panel → Apps → Setup → Video → **Generate secret**; paste it
+   here as `GATEWAY_SECRET`. The container won't start without it.
+3. Add a library: Control panel → Library → Libraries → Add library → Video.
+
+Home's guide `docs/users/apps.md` has the whole walk-through.
+
 ## Development
 
 ```

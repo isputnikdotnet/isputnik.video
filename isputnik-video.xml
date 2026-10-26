@@ -1,0 +1,105 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for isputnik.video — a DEPLOYMENT
+  artifact (the container's install manifest), not source code. DO NOT DELETE.
+  The <Icon> below is a raw.githubusercontent URL to Assets/ on the main branch,
+  so the repo-root Assets/ folder must stay too.
+
+  The video container publishes no port on purpose: only the isputnik.home
+  container talks to it, by name, over a user-defined Docker network, and the
+  home app signs people in for it and shows its libraries. See README.md.
+-->
+<Container version="2">
+  <Name>isputnik-video</Name>
+  <Repository>ghcr.io/isputnikdotnet/isputnik.video:latest</Repository>
+  <Registry>https://ghcr.io/isputnikdotnet/isputnik.video</Registry>
+  <!-- Pick the same user-defined network as the isputnik container (create it
+       once: `docker network create isputnik`). On Docker's default bridge the
+       containers cannot reach each other by name. -->
+  <Network>isputnik</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <!-- The health check (GET /video/api/health) is built into the image. -->
+  <ExtraParams>--stop-timeout=30</ExtraParams>
+  <Support>https://github.com/isputnikdotnet/isputnik.video/issues</Support>
+  <Project>https://github.com/isputnikdotnet/isputnik.video</Project>
+
+  <Overview>
+The video engine for isputnik.home: TV shows and movies, scanned from your video folders, described from .nfo files and played in the browser. Alpha.
+
+This container has no sign-in and no web address of its own. The isputnik.home container reaches it by name over a shared Docker network; video libraries are created, shared and watched in isputnik.home. Set up: put both containers on one user-defined Docker network (docker network create isputnik); set the isputnik container's Video URL (VIDEO_URL) to http://isputnik-video:4300 and restart it; in isputnik.home open Control panel, Apps, Setup, choose Video, press Generate secret and paste it here as Gateway Secret. Then add a library under Control panel, Library, Libraries, Add library, Video.
+  </Overview>
+
+  <Category>MediaServer:Video</Category>
+
+  <!-- No <WebUI>: the libraries are opened through the isputnik container. -->
+
+  <TemplateURL>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/isputnik-video.xml</TemplateURL>
+
+  <Icon>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/icon.png</Icon>
+
+  <!-- Application Data -->
+
+  <Config Name="Config &amp; Data"
+          Target="/config"
+          Default="/mnt/user/appdata/isputnik-video"
+          Mode="rw"
+          Description="Stores the catalog: shows, seasons, episodes and movies found in the video folders (a SQLite database). Keep it apart from the isputnik container's appdata."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/isputnik-video</Config>
+
+  <Config Name="Video Folders"
+          Target="/media"
+          Default="/mnt/user/data/video"
+          Mode="ro"
+          Description="The share that holds your shows and movies, mounted read-only: the engine never writes to it. Each video library is a folder under it, for example Shows or Movies, chosen in isputnik.home when the library is added."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/data/video</Config>
+
+  <!-- Environment Variables -->
+
+  <Config Name="Gateway Secret"
+          Target="GATEWAY_SECRET"
+          Default=""
+          Mode=""
+          Description="The secret made in isputnik.home under Control panel, Apps, Setup, Video (Generate secret, then Copy), or a long random string of at least 32 characters (openssl rand -hex 32) also set on the isputnik container as VIDEO_GATEWAY_SECRET. Every request the home app forwards carries it, which is how this server knows who is signed in. Required: the server refuses to start without it, or with a short one."
+          Type="Variable"
+          Display="always"
+          Required="true"
+          Mask="true"></Config>
+
+  <Config Name="PUID"
+          Target="PUID"
+          Default="99"
+          Mode=""
+          Description="User ID the server runs as. It runs unprivileged (not root); on first start it takes ownership of the Config &amp; Data path as this user. This user must be able to read the Video Folders. 99 (nobody) matches the default owner of an Unraid share."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">99</Config>
+
+  <Config Name="PGID"
+          Target="PGID"
+          Default="100"
+          Mode=""
+          Description="Group ID the server runs as. 100 (users) matches the default group of an Unraid share."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">100</Config>
+
+  <Config Name="Log Level"
+          Target="LOG_LEVEL"
+          Default="info"
+          Mode=""
+          Description="trace, debug, info, warn, error, fatal or silent. The isputnik container shows this log under Control panel, Apps, Logs."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">info</Config>
+
+</Container>
