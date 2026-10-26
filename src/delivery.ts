@@ -45,15 +45,19 @@ export function chooseAudio(info: MediaInfo): AudioStream | null {
   return info.audio.find((stream) => stream.default) ?? info.audio[0] ?? null;
 }
 
-export function decideDelivery(info: MediaInfo, extension: string): Delivery {
-  const audio = chooseAudio(info);
+/** `audioIndex`: the sound the person chose (ffprobe's stream index); the default
+ *  one when it is left out or isn't in the file. */
+export function decideDelivery(info: MediaInfo, extension: string, audioIndex?: number | null): Delivery {
+  const audio = info.audio.find((stream) => stream.index === audioIndex) ?? chooseAudio(info);
   const reasons: DeliveryReason[] = [];
   const ext = extension.toLowerCase();
 
   // Direct: an MP4 with H.264, or a real WebM (VP8/VP9/AV1), with sound to match.
   const directContainer = (isMp4(info.container) && [".mp4", ".m4v", ".mov"].includes(ext)) || (ext === ".webm" && isWebm(info.container));
   const directVideo = !info.video || (isMp4(info.container) ? browserH264(info) : ["vp8", "vp9", "av1"].includes(info.video.codec));
-  const directAudio = !audio || DIRECT_AUDIO.has(audio.codec);
+  // With more than one sound track the browser picks which it plays, and no
+  // browser lets a page choose reliably: those go as HLS, with the one chosen.
+  const directAudio = !audio || (DIRECT_AUDIO.has(audio.codec) && info.audio.length <= 1);
   if (directContainer && directVideo && directAudio) {
     return { mode: "direct", reasons, audio, audioCopy: true, videoCopy: true };
   }

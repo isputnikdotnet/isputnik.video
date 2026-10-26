@@ -9,7 +9,7 @@ import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./catalog.js";
 import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
-import { findTools, toolsWork, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { HlsError, HlsSessions, buildPlan, playlist, type HlsPlan } from "./hls.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
@@ -101,6 +101,12 @@ const progressBodySchema = z.object({
   watched: z.boolean().optional()
 });
 
+/** The sound track chosen, by ffprobe stream index. */
+const playQuerySchema = z.object({ audio: z.coerce.number().int().min(0).max(999).optional() });
+
+/** The HLS address of one sound track: t<index>, or t- for a silent film. */
+const trackSegment = (delivery: Delivery) => (delivery.audio ? `t${delivery.audio.index}` : "t-");
+
 const continueQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
 
 /** A single byte range from a Range header; null for none (the whole file),
@@ -156,11 +162,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   /** How the file reaches the browser, from what ffprobe finds inside it; null
    *  when ffmpeg is missing or can't read the file. */
-  const deliveryFor = async (item: PlayableItem, file: ProbedFile): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
+  const deliveryFor = async (item: PlayableItem, file: ProbedFile, audioIndex?: number | null): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
     if (!mediaProbe || !(await toolsReady)) return null;
     try {
       const info = await mediaProbe.info(item.id, file);
-      return { info, delivery: decideDelivery(info, path.extname(item.relative)) };
+      return { info, delivery: decideDelivery(info, path.extname(item.relative), audioIndex) };
     } catch (err) {
       app.log.warn({ err, item: item.id }, "ffprobe could not read a video file");
       return null;
@@ -320,8 +326,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // ── Watching ─────────────────────────────────────────────────────────────
 
-  // What home's player needs to start: the item, whether the browser can play
-  // the file as it is, where to resume, and what comes next.
+  // What home's player needs to start: the item, how it plays (with the sound
+  // track asked for, ?audio=<index>), its sound tracks, where to resume, and
+  // what comes next.
   app.get(`${API}/play/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const identity = request.identity!;
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
@@ -329,14 +336,18 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = fileOf(options.mediaRoot, item);
     const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : null;
+    const { audio: audioIndex } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
+    let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null } =
       { mode: "none", reasons: [], url: null, duration: null };
     if (file) {
-      const decided = await deliveryFor(item, file);
+      const decided = await deliveryFor(item, file, audioIndex);
       if (decided) {
         const { mode, reasons, videoCopy } = decided.delivery;
-        playback = { mode, reasons, url: mode === "direct" ? stream : `${API}/hls/${item.id}/index.m3u8`, duration: decided.info.duration || null };
+        const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
+        playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null };
+        audioTracks = decided.info.audio.map((track) => ({ ...track, selected: track.index === decided.delivery.audio?.index }));
         // The playlist of a picture copied as it is needs its keyframes: start
         // reading them now, while the page opens.
         if (mode === "remux" && videoCopy) void mediaProbe!.keyframes(item.id, file).catch(() => undefined);
@@ -356,6 +367,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       available: Boolean(file),
       sizeBytes: file?.size ?? null,
       playback,
+      audioTracks,
       progress,
       resumeAt: resumeAt(progress),
       next: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title } : null
@@ -403,16 +415,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // film, then each segment, made as it is asked for (hls.ts).
   const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan } | null> => {
     const identity = request.identity!;
-    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    const { id, track } = request.params as { id: string; track?: string };
+    const item = findItem(db, identity, itemIdSchema.parse(id));
     const file = item ? fileOf(options.mediaRoot, item) : null;
     if (!item || !file || !hls || !mediaProbe) return null;
-    const decided = await deliveryFor(item, file);
+    // No track in the address (home 4.40.0): the default sound.
+    const chosen = track === undefined ? null : /^t(\d{1,3})$/.exec(track);
+    if (track !== undefined && track !== "t-" && !chosen) return null;
+    const decided = await deliveryFor(item, file, chosen ? Number(chosen[1]) : null);
     if (!decided) return null;
+    // An address for a track the file doesn't have is not this film.
+    if (track !== undefined && trackSegment(decided.delivery) !== track) return null;
     const keyframes = decided.delivery.videoCopy ? await mediaProbe.keyframes(item.id, file) : null;
     return { key: `${identity.id}:${item.id}`, plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes) };
   };
 
-  app.get(`${API}/hls/:id/:name`, { preHandler: requireIdentity }, async (request, reply) => {
+  const serveHls = async (request: FastifyRequest, reply: FastifyReply) => {
     const { name } = request.params as { name: string };
     const segment = /^(\d{1,6})\.ts$/.exec(name);
     if (name !== "index.m3u8" && !segment) return reply.code(404).send({ error: "Not found" });
@@ -447,7 +465,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     stream.on("error", (err) => reply.raw.destroy(err));
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
-  });
+  };
+  app.get(`${API}/hls/:id/:track/:name`, { preHandler: requireIdentity }, serveHls);
+  app.get(`${API}/hls/:id/:name`, { preHandler: requireIdentity }, serveHls);
 
   // The player has gone: stop converting for it now rather than after a minute.
   app.delete(`${API}/hls/:id`, { preHandler: requireIdentity }, async (request, reply) => {

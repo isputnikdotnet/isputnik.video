@@ -183,7 +183,8 @@ export class HlsSessions {
   async segment(key: string, plan: HlsPlan, n: number): Promise<string> {
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
     let session = this.sessions.get(key);
-    if (session && session.plan.file !== plan.file) {
+    // Another file under the same id, or another sound track: a new session.
+    if (session && (session.plan.file !== plan.file || session.plan.delivery.audio?.index !== plan.delivery.audio?.index)) {
       this.stop(key);
       session = undefined;
     }

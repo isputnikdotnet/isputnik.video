@@ -43,6 +43,15 @@ describe("how a file plays", () => {
       .toMatchObject({ mode: "transcode", reasons: ["video"] });
   });
 
+  it("sends a file with more than one sound track as HLS, since a page can't choose among them", () => {
+    const mp4 = info({ container: "mov,mp4,m4a,3gp,3g2,mj2" });
+    mp4.audio.push({ index: 2, codec: "aac", channels: 2, language: "rus", title: null, default: false });
+    expect(decideDelivery(mp4, ".mp4")).toMatchObject({ mode: "remux", audio: { index: 1 }, audioCopy: true });
+    expect(decideDelivery(mp4, ".mp4", 2)).toMatchObject({ mode: "remux", audio: { index: 2 } });
+    // A track the file doesn't have: the default one.
+    expect(decideDelivery(mp4, ".mp4", 7)).toMatchObject({ audio: { index: 1 } });
+  });
+
   it("plays the default sound track", () => {
     const two = info({});
     two.audio = [
@@ -127,7 +136,10 @@ describe("real segments", () => {
     const film = path.join(fixture.root, "Movies", "Loud Film (2020)", "Loud Film (2020).mkv");
     fs.mkdirSync(path.dirname(film), { recursive: true });
     execFileSync(tools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-      "-t", "20", "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-c:a", "ac3", "-b:a", "192k", film]);
+      "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000",
+      "-t", "20", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48",
+      "-c:a:0", "ac3", "-b:a:0", "192k", "-c:a:1", "aac", "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=rus",
+      "-metadata:s:a:1", "title=Дубляж", "-disposition:a:0", "default", "-disposition:a:1", "0", film]);
     const hourAgo = new Date(Date.now() - 3600_000);
     fs.utimesSync(film, hourAgo, hourAgo);
 
@@ -145,7 +157,11 @@ describe("real segments", () => {
 
   it("offers the film as HLS, its sound converted", async () => {
     const play = (await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers })).json();
-    expect(play.playback).toMatchObject({ mode: "remux", reasons: ["container", "audio"], url: `/video/api/hls/${filmId}/index.m3u8` });
+    expect(play.playback).toMatchObject({ mode: "remux", reasons: ["container", "audio"], url: `/video/api/hls/${filmId}/t1/index.m3u8` });
+    expect(play.audioTracks).toMatchObject([
+      { index: 1, codec: "ac3", language: "eng", default: true, selected: true },
+      { index: 2, codec: "aac", language: "rus", title: "Дубляж", default: false, selected: false }
+    ]);
     expect(play.playback.duration).toBeCloseTo(20, 0);
   });
 
@@ -173,6 +189,29 @@ describe("real segments", () => {
       const expected = lengths.slice(0, n).reduce((a, b) => a + b, 0);
       expect(Number(video.start_time)).toBeCloseTo(expected, 1);
     }
+  }, 60_000);
+
+  it("plays the sound track chosen, and refuses one the film doesn't have", async () => {
+    const play = (await app.inject({ method: "GET", url: `/video/api/play/${filmId}?audio=2`, headers })).json();
+    expect(play.playback.url).toBe(`/video/api/hls/${filmId}/t2/index.m3u8`);
+    expect(play.audioTracks.find((track: { selected: boolean }) => track.selected).index).toBe(2);
+
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t2/index.m3u8`, headers })).statusCode).toBe(200);
+    const segment = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t2/1.ts`, headers });
+    expect(segment.statusCode).toBe(200);
+    const saved = path.join(fixture.root, "segment-t2.ts");
+    fs.writeFileSync(saved, segment.rawPayload);
+    const probed = JSON.parse(execFileSync(tools.ffprobe, ["-v", "error", "-show_streams", "-of", "json", saved]).toString()) as {
+      streams: { codec_type: string; channels?: number }[];
+    };
+    const sound = probed.streams.filter((stream) => stream.codec_type === "audio");
+    // Only the one chosen: the Russian AAC, copied as it is (mono), not the
+    // English AC3 converted to stereo.
+    expect(sound).toHaveLength(1);
+    expect(sound[0].channels).toBe(1);
+
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t9/index.m3u8`, headers })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/tx/index.m3u8`, headers })).statusCode).toBe(404);
   }, 60_000);
 
   it("refuses a segment that isn't in the playlist, and someone who can't see the film", async () => {
