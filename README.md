@@ -7,7 +7,7 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.3.0, alpha. Catalog, library sync and playback work, with each
+Status: 0.3.1, alpha. Catalog, library sync and playback work, with each
 person's progress (resume, next episode, Continue watching). A file a browser
 plays as it is goes as it is; the rest are converted to HLS as they play — the
 sound to AAC, the picture to H.264 only when a browser can't show it.
@@ -74,7 +74,7 @@ two minutes is left for the next scan, so a copy in progress is never catalogued
 ## Running it
 
 The image is `ghcr.io/isputnikdotnet/isputnik.video` (tags `latest`, `0.3`,
-`0.3.0`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
+`0.3.1`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
 put it on the same user-defined Docker network as the isputnik container
 (`docker network create isputnik`), mount `/config` (the catalog) and `/media`
 (the video share, read-only) — and, if you like, `/transcode` on RAM or a fast

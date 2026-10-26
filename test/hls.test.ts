@@ -3,13 +3,14 @@
 // real (tiny) film with AC3 sound.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
 import { findTools, type MediaInfo } from "../src/ffmpeg.js";
-import { buildPlan, ffmpegArgs, playlist, segmentStarts } from "../src/hls.js";
+import { HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec?: string }): MediaInfo => ({
@@ -78,6 +79,36 @@ describe("the cuts and the playlist", () => {
     expect(args[args.indexOf("-segment_times") + 1]).toBe("5.700,11.700");
     expect(args[args.indexOf("-segment_start_number") + 1]).toBe("2");
     expect(args).toEqual(expect.arrayContaining(["-c:v", "copy", "-c:a", "aac", "-copyts"]));
+  });
+});
+
+describe("the transcode folder", () => {
+  const quiet = { info: () => undefined, warn: () => undefined };
+
+  it("is emptied, never removed: in the image it is a mount point this user can't remove", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-root-"));
+    fs.mkdirSync(path.join(root, "s-left-behind"));
+    fs.writeFileSync(path.join(root, "s-left-behind", "3.ts"), "x");
+    const inode = fs.statSync(root).ino;
+    expect(prepareRoot(root, quiet)).toBe(root);
+    expect(fs.readdirSync(root)).toEqual([]);
+    expect(fs.statSync(root).ino).toBe(inode);
+    const sessions = new HlsSessions(findTools(), root, quiet);
+    sessions.close();
+    expect(fs.existsSync(root)).toBe(true);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("falls back to a temporary folder, saying so, when it can't be written to", () => {
+    const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-root-")), "a-file");
+    fs.writeFileSync(blocker, "not a folder");
+    const warnings: string[] = [];
+    const log = { info: () => undefined, warn: (_obj: object, msg: string) => { warnings.push(msg); } };
+    expect(prepareRoot(path.join(blocker, "transcode"), log)).toBeNull();
+    const sessions = new HlsSessions(findTools(), path.join(blocker, "transcode"), log);
+    expect(warnings[0]).toMatch(/using a temporary folder/);
+    sessions.close();
+    fs.rmSync(path.dirname(blocker), { recursive: true, force: true });
   });
 });
 

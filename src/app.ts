@@ -3,7 +3,6 @@
 // for both (home's docs/video-architecture.md). Reached only through home's
 // gateway, under /video, with the person's identity in signed headers.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
@@ -149,7 +148,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
   const mediaProbe = tools ? new MediaProbe(db, tools) : null;
   const hls = tools
-    ? new HlsSessions(tools, options.transcodeDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-hls-")), {
+    ? new HlsSessions(tools, options.transcodeDir ?? null, {
       info: (obj, msg) => app.log.info(obj, msg),
       warn: (obj, msg) => app.log.warn(obj, msg)
     })

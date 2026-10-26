@@ -14,6 +14,7 @@
 // is stopped and its segments deleted.
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { Delivery } from "./delivery.js";
 import type { MediaInfo, Tools } from "./ffmpeg.js";
@@ -141,6 +142,22 @@ interface Session {
 
 export class HlsError extends Error {}
 
+/** Empties the folder and checks it can be written to; null when it can't. Only
+ *  what is inside goes: the folder itself is often a mount point (/transcode in
+ *  the image), which this user could never remove. What a previous process
+ *  left behind is nobody's. */
+export function prepareRoot(root: string, log: Pick<HlsLog, "warn">): string | null {
+  try {
+    fs.mkdirSync(root, { recursive: true });
+    for (const entry of fs.readdirSync(root)) fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+    fs.rmdirSync(fs.mkdtempSync(path.join(root, "check-")));
+    return root;
+  } catch (err) {
+    log.warn({ err, root }, `Can't convert video in ${root} (${(err as NodeJS.ErrnoException).code ?? "unwritable"}); using a temporary folder inside the container instead`);
+    return null;
+  }
+}
+
 export interface HlsLog {
   info(obj: object, msg: string): void;
   warn(obj: object, msg: string): void;
@@ -149,11 +166,15 @@ export interface HlsLog {
 export class HlsSessions {
   private sessions = new Map<string, Session>();
   private sweeper: NodeJS.Timeout;
+  private root: string;
+  /** A folder made here (no TRANSCODE_PATH, or it was unusable): removed on close. */
+  private ownsRoot: boolean;
 
-  constructor(private tools: Tools, private root: string, private log: HlsLog) {
-    // What a previous process left behind is nobody's.
-    fs.rmSync(root, { recursive: true, force: true });
-    fs.mkdirSync(root, { recursive: true });
+  /** `root` null: a fresh temporary folder. */
+  constructor(private tools: Tools, root: string | null, private log: HlsLog) {
+    const usable = root ? prepareRoot(root, log) : null;
+    this.root = usable ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-hls-"));
+    this.ownsRoot = !usable;
     this.sweeper = setInterval(() => this.sweep(), 15_000);
     this.sweeper.unref();
   }
@@ -209,7 +230,7 @@ export class HlsSessions {
   close(): void {
     clearInterval(this.sweeper);
     for (const key of [...this.sessions.keys()]) this.stop(key);
-    fs.rm(this.root, { recursive: true, force: true }, () => undefined);
+    if (this.ownsRoot) fs.rm(this.root, { recursive: true, force: true }, () => undefined);
   }
 
   private open(key: string, plan: HlsPlan): Session {
