@@ -534,9 +534,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     }
     const n = Number(segment[1]);
     if (n >= found.plan.starts.length) return reply.code(404).send({ error: "Not found" });
+    // The player cancels the segment it was loading when someone seeks: stop
+    // waiting for it then, or the wait outlives the seek and fights it.
+    const hungUp = new AbortController();
+    reply.raw.on("close", () => { if (!reply.raw.writableEnded) hungUp.abort(); });
     let made: SegmentData;
     try {
-      made = await hls!.segment(found.key, found.plan, n, found.who);
+      made = await hls!.segment(found.key, found.plan, n, { who: found.who, signal: hungUp.signal });
     } catch (err) {
       if (err instanceof HlsBusyError) return busyReply(reply, err.limit);
       if (!(err instanceof HlsError)) throw err;

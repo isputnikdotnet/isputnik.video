@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
-import { findTools, type MediaInfo } from "../src/ffmpeg.js";
+import { findTools, keyframes, probe, type MediaInfo } from "../src/ffmpeg.js";
 import { HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
@@ -119,6 +119,55 @@ describe("the transcode folder", () => {
     expect(warnings[0]).toMatch(/using a temporary folder/);
     sessions.close();
     fs.rmSync(path.dirname(blocker), { recursive: true, force: true });
+  });
+});
+
+describe("seeking", () => {
+  const quiet = { info: () => undefined, warn: () => undefined };
+  const tools = findTools();
+  let dir: string;
+  let plan: ReturnType<typeof buildPlan>;
+
+  beforeAll(async () => {
+    // A minute of tiny picture with AC3 sound, a keyframe every second: ten segments.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-seek-"));
+    const film = path.join(dir, "film.mkv");
+    execFileSync(tools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-g", "12", "-c:a", "ac3", film]);
+    const info = await probe(tools, film);
+    plan = buildPlan("seek", film, info, decideDelivery(info, ".mkv"), await keyframes(tools, film));
+  }, 60_000);
+
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it("lets the newest request move the run: one still waiting behind it gives way instead of dragging it back", async () => {
+    expect(plan.starts.length).toBeGreaterThanOrEqual(9);
+    const sessions = new HlsSessions(tools, null, quiet);
+    try {
+      const started = Date.now();
+      // The jump goes first; the request it replaces is still waiting, further back.
+      const jump = sessions.segment("mum:seek", plan, 8);
+      const behind = sessions.segment("mum:seek", plan, 1);
+      const [far, near] = await Promise.allSettled([jump, behind]);
+      // The older one either got its segment in passing or stood aside; before,
+      // the two restarted ffmpeg in turn until both gave up after 45 seconds.
+      if (far.status === "rejected") expect((far.reason as Error).message).toBe("Superseded");
+      expect(near.status).toBe("fulfilled");
+      expect(Date.now() - started).toBeLessThan(15_000);
+    } finally {
+      sessions.close();
+    }
+  }, 60_000);
+
+  it("stops waiting once the player hangs up", async () => {
+    const sessions = new HlsSessions(tools, null, quiet);
+    try {
+      const gone = new AbortController();
+      gone.abort();
+      await expect(sessions.segment("mum:seek", plan, 6, { signal: gone.signal })).rejects.toThrow("Cancelled");
+    } finally {
+      sessions.close();
+    }
   });
 });
 

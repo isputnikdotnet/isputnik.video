@@ -199,6 +199,9 @@ interface Session {
   writing: number;
   failure: string | null;
   lastWanted: number;
+  /** Counts requests: only the newest may move the run (a seek), so one
+   *  still waiting for a segment behind it can't drag the run back. */
+  asked: number;
   touched: number;
 }
 
@@ -264,8 +267,12 @@ export class HlsSessions {
     return this.sessions.has(key) || this.sessions.size < this.settings.maxViewers;
   }
 
-  /** Segment `n`, made if it isn't there yet. `who` names the session for the admin. */
-  async segment(key: string, plan: HlsPlan, n: number, who: { user: string; title: string } = { user: "", title: "" }): Promise<SegmentData> {
+  /** Segment `n`, made if it isn't there yet. `who` names the session for the
+   *  admin; `signal` is the player hanging up (a seek cancels the segment it
+   *  was loading), which ends the wait. */
+  async segment(key: string, plan: HlsPlan, n: number, options: { who?: { user: string; title: string }; signal?: AbortSignal } = {}): Promise<SegmentData> {
+    const who = options.who ?? { user: "", title: "" };
+    const signal = options.signal;
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
     let session = this.sessions.get(key);
     // Another file under the same id, another sound track or other subtitles burned in: a new session.
@@ -280,6 +287,7 @@ export class HlsSessions {
     }
     session.touched = Date.now();
     session.lastWanted = n;
+    const ask = ++session.asked;
     this.forgetBehind(session, n);
 
     const deadline = Date.now() + WAIT_MS;
@@ -295,10 +303,14 @@ export class HlsSessions {
         // Not forgotten while it was read in: it stayed on the disk.
         if (session.done.has(n)) return { file: path.join(session.dir, `${n}.ts`), size: session.onDisk.get(n) ?? 0 };
       }
+      if (signal?.aborted) throw new HlsError("Cancelled");
       if (session.failure && started) throw new HlsError(session.failure);
       const running = session.proc !== null;
       if (!running || n < session.runFrom || n > session.writing + JUMP_AHEAD) {
         if (started && !running) throw new HlsError(session.failure ?? "The conversion stopped");
+        // A newer request moved the run elsewhere: this one is not what the
+        // player wants any more, and restarting for it would undo the seek.
+        if (ask !== session.asked) throw new HlsError("Superseded");
         this.start(session, n);
         started = true;
       }
@@ -361,7 +373,7 @@ export class HlsSessions {
     const session: Session = {
       key, plan, user: who.user, title: who.title, dir,
       done: new Set(), memory: new Map(), memoryBytes: 0, onDisk: new Map(), settling: new Map(),
-      proc: null, runFrom: 0, writing: -1, failure: null, lastWanted: 0, touched: Date.now()
+      proc: null, runFrom: 0, writing: -1, failure: null, lastWanted: 0, asked: 0, touched: Date.now()
     };
     this.sessions.set(key, session);
     return session;
