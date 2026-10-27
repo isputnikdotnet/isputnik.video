@@ -104,7 +104,19 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
   const offset = plan.starts[from] - info.start;
   if (from > 0) args.push("-ss", (offset + (delivery.videoCopy ? 0.05 : 0)).toFixed(3));
   args.push("-i", plan.file, "-copyts", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn");
-  if (info.video) args.push("-map", `0:${info.video.index}`);
+  const burn = info.video ? delivery.burn : null;
+  const shrink = info.video !== null && info.video.height > 1080;
+  if (info.video && burn) {
+    // The subtitle drawn over the picture, its canvas fitted to the picture
+    // first (a 1080p PGS track on a cropped or 720p film).
+    const { width, height } = info.video;
+    const fit = burn.width > 0 && burn.height > 0 && (burn.width !== width || burn.height !== height);
+    const sub = fit ? `[0:${burn.index}]scale=${width}:${height}[sub];` : "";
+    const over = `[0:${info.video.index}]${fit ? "[sub]" : `[0:${burn.index}]`}overlay=eof_action=pass`;
+    args.push("-filter_complex", `${sub}${over}${shrink ? ",scale=-2:1080" : ""}[v]`, "-map", "[v]");
+  } else if (info.video) {
+    args.push("-map", `0:${info.video.index}`);
+  }
   if (delivery.audio) args.push("-map", `0:${delivery.audio.index}`);
 
   if (delivery.videoCopy) {
@@ -112,7 +124,7 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
   } else {
     args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "10M", "-bufsize", "20M",
       "-profile:v", "high", "-pix_fmt", "yuv420p");
-    if (info.video && info.video.height > 1080) args.push("-vf", "scale=-2:1080");
+    if (shrink && !burn) args.push("-vf", "scale=-2:1080");
     // A keyframe on every cut, so every segment starts on one.
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   }
@@ -256,8 +268,9 @@ export class HlsSessions {
   async segment(key: string, plan: HlsPlan, n: number, who: { user: string; title: string } = { user: "", title: "" }): Promise<SegmentData> {
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
     let session = this.sessions.get(key);
-    // Another file under the same id, or another sound track: a new session.
-    if (session && (session.plan.file !== plan.file || session.plan.delivery.audio?.index !== plan.delivery.audio?.index)) {
+    // Another file under the same id, another sound track or other subtitles burned in: a new session.
+    if (session && (session.plan.file !== plan.file || session.plan.delivery.audio?.index !== plan.delivery.audio?.index ||
+      session.plan.delivery.burn?.index !== plan.delivery.burn?.index)) {
       this.stop(key);
       session = undefined;
     }

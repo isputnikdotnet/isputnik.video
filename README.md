@@ -7,12 +7,13 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.4.0, alpha. Catalog, library sync and playback work, with each
+Status: 0.6.0, alpha. Catalog, library sync and playback work, with each
 person's progress (resume, next episode, Continue watching). A file a browser
 plays as it is goes as it is; the rest are converted to HLS as they play — the
 sound to AAC, the picture to H.264 only when a browser can't show it.
-A film with several sound tracks plays the one chosen. Subtitles, posters and
-TMDB come next.
+A film with several sound tracks plays the one chosen; subtitles inside it or
+beside it are offered too (text as WebVTT, images burned in). Posters come
+from beside the files, and from TMDB with the admin's key.
 
 ## The contract, from this side
 
@@ -68,6 +69,7 @@ two minutes is left for the next scan, so a copy in progress is never catalogued
 | `DB_PATH` | `data/video.sqlite` | the catalog (image: `/config/video.sqlite`) |
 | `PORT` / `HOST` | `4300` / `127.0.0.1` | |
 | `TRANSCODE_PATH` | temp folder | where ffmpeg writes segments while someone watches (image: `/transcode`); finished ones move into memory up to the share set on home's Apps → Installed, the rest stay here; emptied on start |
+| `ART_PATH` | `art` beside `DB_PATH` | posters, backdrops and stills fetched from TMDB (image: `/config/art`); not in backups — fetched again |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | on `PATH` | the image installs both; a checkout uses the ffmpeg-static dev dependencies |
 | `LOG_LEVEL` | `info` | |
 | `DEV_USER` | `dev:Developer` | development without a secret: an admin who sees every library |

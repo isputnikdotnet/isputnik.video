@@ -18,7 +18,8 @@ const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec
   start: over.start ?? 0,
   duration: over.duration ?? 60,
   video: { index: 0, codec: over.vcodec ?? "h264", profile: "High", pixelFormat: over.pix ?? "yuv420p", width: 1920, height: 1080 },
-  audio: over.acodec === "" ? [] : [{ index: 1, codec: over.acodec ?? "aac", channels: 6, language: "eng", title: null, default: true }]
+  audio: over.acodec === "" ? [] : [{ index: 1, codec: over.acodec ?? "aac", channels: 6, language: "eng", title: null, default: true }],
+  subtitles: []
 });
 
 describe("how a file plays", () => {

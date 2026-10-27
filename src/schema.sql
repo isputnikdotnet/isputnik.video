@@ -134,3 +134,33 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_at ON events (at DESC);
 CREATE INDEX IF NOT EXISTS events_event ON events (event, at DESC);
+
+-- Posters, backdrops, stills and TMDB's words for each show, movie and episode
+-- (metadata.ts). Apart from what the scan writes, so a rescan never undoes it and
+-- a match fixed by hand (`locked`) stays. Picture columns say where the file is:
+-- 'local:<path under MEDIA_ROOT>' beside the video, 'cache:<file>' in the art
+-- folder; the *_path columns are TMDB's own image paths, to tell when one changed.
+CREATE TABLE IF NOT EXISTS metadata (
+  item_id        TEXT PRIMARY KEY,
+  kind           TEXT NOT NULL CHECK (kind IN ('show', 'movie', 'episode')),
+  tmdb_id        TEXT,
+  locked         INTEGER NOT NULL DEFAULT 0,
+  tmdb_state     TEXT NOT NULL DEFAULT 'none' CHECK (tmdb_state IN ('none', 'matched', 'unmatched', 'error')),
+  title          TEXT,
+  original_title TEXT,
+  plot           TEXT,
+  year           INTEGER,
+  aired          TEXT,
+  genres         TEXT NOT NULL DEFAULT '[]',
+  rating         REAL,
+  status         TEXT,
+  poster         TEXT,
+  backdrop       TEXT,
+  still          TEXT,
+  poster_path    TEXT,
+  backdrop_path  TEXT,
+  still_path     TEXT,
+  checked_at     TEXT,
+  error          TEXT,
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

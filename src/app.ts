@@ -3,6 +3,7 @@
 // for both (home's docs/video-architecture.md). Reached only through home's
 // gateway, under /video, with the person's identity in signed headers.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
@@ -10,13 +11,16 @@ import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./ca
 import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
+import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
+import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type SegmentData } from "./hls.js";
 import { conversionSchema, readConversion, saveConversion } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { openDatabase } from "./db.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
-import { clientIpFrom, devIdentity, forwardedRequestId, identityFrom, rejectionReason, type Identity } from "./identity.js";
+import { canSee, clientIpFrom, devIdentity, forwardedRequestId, identityFrom, rejectionReason, type Identity } from "./identity.js";
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
 import type { LogBuffer } from "./log-buffer.js";
 import { listFolders } from "./media.js";
@@ -51,6 +55,11 @@ export interface AppOptions {
   /** Where segments are made while someone watches (TRANSCODE_PATH); emptied on
    *  start and removed on close. A fresh temporary folder when left out. */
   transcodeDir?: string;
+  /** Where TMDB's posters and backdrops are kept (ART_PATH); a fresh temporary
+   *  folder when left out. */
+  artDir?: string;
+  /** How TMDB is reached; tests hand in their own. */
+  fetch?: Fetch;
   /** Tests settle files at once instead of waiting out a copy. */
   scan?: ScanOptions;
   fastify?: FastifyServerOptions;
@@ -102,11 +111,34 @@ const progressBodySchema = z.object({
   watched: z.boolean().optional()
 });
 
-/** The sound track chosen, by ffprobe stream index. */
-const playQuerySchema = z.object({ audio: z.coerce.number().int().min(0).max(999).optional() });
+const subtitleIdSchema = z.string().regex(/^(s\d{1,3}|x[0-9a-f]{10})$/);
 
-/** The HLS address of one sound track: t<index>, or t- for a silent film. */
-const trackSegment = (delivery: Delivery) => (delivery.audio ? `t${delivery.audio.index}` : "t-");
+/** The sound track chosen, by ffprobe stream index; the subtitle chosen, by track id
+ *  (only an image one changes how the film plays: it is burned in). */
+const playQuerySchema = z.object({
+  audio: z.coerce.number().int().min(0).max(999).optional(),
+  subtitle: subtitleIdSchema.optional()
+});
+
+/** The HLS address of one sound track: t<index>, or t- for a silent film; with
+ *  b<index> after it when an image subtitle is burned in. */
+const trackSegment = (delivery: Delivery) =>
+  `${delivery.audio ? `t${delivery.audio.index}` : "t-"}${delivery.burn ? `b${delivery.burn.index}` : ""}`;
+
+const artKindSchema = z.enum(["poster", "backdrop", "still"]);
+
+const metadataBodySchema = z.object({ tmdbKey: tmdbKeySchema.nullable() });
+
+const matchSearchSchema = z.object({
+  kind: z.enum(["movie", "tv"]),
+  q: z.string().trim().min(1).max(200),
+  year: z.coerce.number().int().min(1800).max(2200).optional(),
+  language: z.string().trim().regex(/^[a-z]{2}(-[A-Za-z]{2})?$/).default("en")
+});
+
+const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable() });
+
+const ART_TYPES: Record<string, string> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
 const continueQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
 
@@ -161,14 +193,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     })
     : null;
   hls?.configure(readConversion(db));
+  const subtitleCache = tools ? new SubtitleCache(tools) : null;
+
+  // Posters and TMDB (metadata.ts): after each scan, one library at a time.
+  const artDir = options.artDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
+  const ownsArtDir = options.artDir === undefined;
+  const metadata = new MetadataRunner({ db, mediaRoot: options.mediaRoot, artDir, fetch: options.fetch, log: { warn: (obj, msg) => app.log.warn(obj, msg) } });
+  let metadataChain: Promise<void> = Promise.resolve();
+  const metadataQueued = new Set<string>();
 
   /** How the file reaches the browser, from what ffprobe finds inside it; null
    *  when ffmpeg is missing or can't read the file. */
-  const deliveryFor = async (item: PlayableItem, file: ProbedFile, audioIndex?: number | null): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
+  const deliveryFor = async (item: PlayableItem, file: ProbedFile, audioIndex?: number | null, burnIndex?: number | null): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
     if (!mediaProbe || !(await toolsReady)) return null;
     try {
       const info = await mediaProbe.info(item.id, file);
-      return { info, delivery: decideDelivery(info, path.extname(item.relative), audioIndex) };
+      return { info, delivery: decideDelivery(info, path.extname(item.relative), audioIndex, burnIndex) };
     } catch (err) {
       app.log.warn({ err, item: item.id }, "ffprobe could not read a video file");
       return null;
@@ -178,13 +218,20 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
   const queued = new Set<string>();
-  app.decorate("scansSettled", () => scanChain);
+  // A scan queues the library's metadata pass, so both are settled once the
+  // scans and then the passes are.
+  app.decorate("scansSettled", async () => {
+    await scanChain;
+    await metadataChain;
+  });
 
   app.addHook("onClose", async () => {
     clearInterval(daily);
     hls?.close();
     await scanChain.catch(() => undefined);
+    await metadataChain.catch(() => undefined);
     db.close();
+    if (ownsArtDir) fs.rmSync(artDir, { recursive: true, force: true });
   });
 
   // Old events and long-detached libraries go on start and once a day after.
@@ -194,6 +241,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
     purgeOrphanProgress(db);
     purgeOrphanProbes(db);
+    purgeOrphanMetadata(db, artDir);
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -281,11 +329,34 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
           libraryId,
           detail: `${summary.titles} title(s), ${summary.episodes} episode(s); ${summary.added} added, ${summary.removed} removed${growing}${unnumbered}`
         });
+        queueMetadata(libraryId, null, false);
       } catch (err) {
         const message = err instanceof ScanError ? err.message : `The scan failed: ${(err as Error).message}`;
         setScanState(db, libraryId, "error", message);
         note(request, "error", "scan.failed", { libraryId, detail: message });
         if (!(err instanceof ScanError)) app.log.error({ err, libraryId }, "Scan failed");
+      }
+    });
+  };
+
+  /** Queue a library's metadata pass; `force` asks TMDB again about every title. */
+  const queueMetadata = (libraryId: string, request: FastifyRequest | null, force: boolean) => {
+    const key = `${libraryId}:${force}`;
+    if (metadataQueued.has(key)) return;
+    metadataQueued.add(key);
+    metadataChain = metadataChain.then(async () => {
+      metadataQueued.delete(key);
+      try {
+        const summary = await metadata.refreshLibrary(libraryId, force);
+        if (!summary) return;
+        const asked = readTmdbKey(db) ? `; TMDB: ${summary.matched} matched, ${summary.unmatched} not found, ${summary.failed} failed` : "; no TMDB key";
+        note(request, summary.error ? "warn" : "info", "metadata.finished", {
+          libraryId,
+          detail: `${summary.titles} title(s), ${summary.posters} with a poster${asked}${summary.error ? ` — ${summary.error}` : ""}`
+        });
+      } catch (err) {
+        note(request, "error", "metadata.failed", { libraryId, detail: (err as Error).message });
+        app.log.error({ err, libraryId }, "Metadata pass failed");
       }
     });
   };
@@ -338,13 +409,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = fileOf(options.mediaRoot, item);
     const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : null;
-    const { audio: audioIndex } = playQuerySchema.parse(request.query ?? {});
+    const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
+    let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
     let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: { limit: number } | null } =
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
-      const decided = await deliveryFor(item, file, audioIndex);
+      const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
+      const tracks = probed ? listSubtitles(probed, file.absolute) : [];
+      const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
+      subtitleTracks = tracks.map((track) => ({
+        ...track,
+        // Text goes to the browser as WebVTT; an image one is burned in when chosen.
+        url: track.kind === "text" ? `${API}/subtitles/${item.id}/${track.id}.vtt` : null,
+        burned: track.kind === "image" && decided?.delivery.burn?.index === Number(track.id.slice(1))
+      }));
       if (decided) {
         const { mode, reasons, videoCopy } = decided.delivery;
         const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
@@ -372,6 +452,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       sizeBytes: file?.size ?? null,
       playback,
       audioTracks,
+      subtitleTracks,
       progress,
       resumeAt: resumeAt(progress),
       next: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title } : null
@@ -424,9 +505,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = item ? fileOf(options.mediaRoot, item) : null;
     if (!item || !file || !hls || !mediaProbe) return null;
     // No track in the address (home 4.40.0): the default sound.
-    const chosen = track === undefined ? null : /^t(\d{1,3})$/.exec(track);
-    if (track !== undefined && track !== "t-" && !chosen) return null;
-    const decided = await deliveryFor(item, file, chosen ? Number(chosen[1]) : null);
+    const chosen = track === undefined ? null : /^t(\d{1,3}|-)(?:b(\d{1,3}))?$/.exec(track);
+    if (track !== undefined && !chosen) return null;
+    const audioIndex = chosen && chosen[1] !== "-" ? Number(chosen[1]) : null;
+    const decided = await deliveryFor(item, file, audioIndex, chosen?.[2] ? Number(chosen[2]) : null);
     if (!decided) return null;
     // An address for a track the file doesn't have is not this film.
     if (track !== undefined && trackSegment(decided.delivery) !== track) return null;
@@ -483,6 +565,49 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const id = itemIdSchema.parse((request.params as { id: string }).id);
     hls?.stop(`${request.identity!.id}:${id}`);
     return reply.code(204).send();
+  });
+
+  // A poster, backdrop or episode still (metadata.ts): from beside the video, or
+  // TMDB's kept in the art folder. Only for someone who may see the title.
+  app.get(`${API}/art/:id/:kind`, { preHandler: requireIdentity }, async (request, reply) => {
+    const { id, kind } = request.params as { id: string; kind: string };
+    const itemId = itemIdSchema.parse(id);
+    const artKind = artKindSchema.safeParse(kind);
+    const owner = db.prepare(`
+      SELECT library_id FROM shows WHERE id = @id
+      UNION ALL SELECT library_id FROM movies WHERE id = @id
+      UNION ALL SELECT s.library_id FROM episodes e JOIN shows s ON s.id = e.show_id WHERE e.id = @id
+    `).get({ id: itemId }) as { library_id: string } | undefined;
+    const library = owner ? getLibrary(db, owner.library_id) : null;
+    if (!artKind.success || !library || library.state !== "active" || !canSee(request.identity!, library.id)) return reply.code(404).send({ error: "Not found" });
+    const file = artFile(metaFor(db, [itemId]).get(itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
+    if (!file) return reply.code(404).send({ error: "Not found" });
+    const type = ART_TYPES[path.extname(file).toLowerCase()];
+    if (!type) return reply.code(404).send({ error: "Not found" });
+    // The address carries a version, so it can be kept a while.
+    return reply.header("Content-Type", type).header("Cache-Control", "private, max-age=86400").send(await fs.promises.readFile(file));
+  });
+
+  // A text subtitle as WebVTT, from inside the file or beside it (subtitles.ts).
+  app.get(`${API}/subtitles/:id/:name`, { preHandler: requireIdentity }, async (request, reply) => {
+    const { id, name } = request.params as { id: string; name: string };
+    const parsedId = subtitleIdSchema.safeParse(/^(.+)\.vtt$/.exec(name)?.[1]);
+    const item = findItem(db, request.identity!, itemIdSchema.parse(id));
+    const file = item ? fileOf(options.mediaRoot, item) : null;
+    if (!parsedId.success || !item || !file || !subtitleCache || !mediaProbe || !(await toolsReady)) return reply.code(404).send({ error: "Not found" });
+    let vtt: string | null;
+    try {
+      vtt = await subtitleCache.webVtt(await mediaProbe.info(item.id, file), file, parsedId.data);
+    } catch (err) {
+      request.log.warn({ err, item: item.id, track: parsedId.data }, "A subtitle could not be converted");
+      return reply.code(422).send({ error: "This subtitle could not be read" });
+    }
+    if (vtt === null) return reply.code(404).send({ error: "Not found" });
+    return reply
+      .header("Content-Type", "text/vtt; charset=utf-8")
+      .header("Cache-Control", "private, max-age=600")
+      .header("X-Content-Type-Options", "nosniff")
+      .send(vtt);
   });
 
   // How far the person got; the player sends it every few seconds and on pause.
@@ -564,6 +689,84 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return conversion();
   });
 
+
+  // TMDB (metadata.ts): the admin's key — never sent back, only whether there
+  // is one and its last characters — and what the engine made of it.
+  const metadataState = () => {
+    const key = readTmdbKey(db);
+    return { hasKey: Boolean(key), keyHint: keyHint(key) };
+  };
+
+  app.get(`${API}/admin/metadata`, { preHandler: requireAdmin }, async () => metadataState());
+
+  app.put(`${API}/admin/metadata`, { preHandler: requireAdmin }, async (request, reply) => {
+    const { tmdbKey } = metadataBodySchema.parse(request.body);
+    if (tmdbKey) {
+      try {
+        await new Tmdb(tmdbKey, options.fetch).check();
+      } catch (err) {
+        const refused = err instanceof TmdbError && err.status === 401;
+        return reply.code(refused ? 400 : 502).send({ error: refused ? "TMDB refused this key" : (err as Error).message, code: refused ? "video.tmdb_refused" : "video.tmdb_unreachable" });
+      }
+    }
+    saveTmdbKey(db, tmdbKey);
+    note(request, "info", "metadata.key", { detail: tmdbKey ? `TMDB key set (${keyHint(tmdbKey)})` : "TMDB key removed" });
+    // Titles never asked of TMDB are now due.
+    if (tmdbKey) for (const library of listLibraries(db)) if (library.state === "active") queueMetadata(library.id, request, false);
+    return metadataState();
+  });
+
+  // Fix match: TMDB's candidates for a title, with their posters through here.
+  app.get(`${API}/admin/metadata/search`, { preHandler: requireAdmin }, async (request, reply) => {
+    const query = matchSearchSchema.parse(request.query ?? {});
+    const key = readTmdbKey(db);
+    if (!key) return reply.code(409).send({ error: "No TMDB key", code: "video.tmdb_no_key" });
+    try {
+      const results = await new Tmdb(key, options.fetch).search(query.kind, query.q, query.year ?? null, query.language);
+      return {
+        results: results.map(({ posterPath, ...result }) => ({
+          ...result,
+          poster: posterPath && imagePathSchema.safeParse(posterPath).success ? `${API}/admin/metadata/image${posterPath}` : null
+        }))
+      };
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  app.get(`${API}/admin/metadata/image/:file`, { preHandler: requireAdmin }, async (request, reply) => {
+    const imagePath = `/${(request.params as { file: string }).file}`;
+    const key = readTmdbKey(db);
+    if (!key || !imagePathSchema.safeParse(imagePath).success) return reply.code(404).send({ error: "Not found" });
+    try {
+      const bytes = await new Tmdb(key, options.fetch).image(imagePath, IMAGE_SIZES.thumb);
+      return reply.header("Content-Type", ART_TYPES[path.extname(imagePath).toLowerCase()]).header("Cache-Control", "private, max-age=86400").send(bytes);
+    } catch {
+      return reply.code(404).send({ error: "Not found" });
+    }
+  });
+
+  // A match fixed by hand (a TMDB id), or handed back to the automatic one (null):
+  // asked of TMDB at once, and the title answered as the family now sees it.
+  app.put(`${API}/admin/metadata/items/:id`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const { tmdbId } = matchBodySchema.parse(request.body);
+    const show = db.prepare("SELECT title, library_id FROM shows WHERE id = ?").get(id) as { title: string; library_id: string } | undefined;
+    const movie = show ? undefined : db.prepare("SELECT title, library_id FROM movies WHERE id = ?").get(id) as { title: string; library_id: string } | undefined;
+    const found = show ?? movie;
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    setMatch(db, id, show ? "show" : "movie", tmdbId);
+    await metadata.refreshOne(id);
+    note(request, "info", "metadata.matched", { libraryId: found.library_id, detail: tmdbId ? `${found.title} matched by hand to TMDB ${tmdbId}` : `${found.title} matched automatically again` });
+    return show ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
+  });
+
+  app.post(`${API}/admin/libraries/:id/metadata`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = libraryIdSchema.parse((request.params as { id: string }).id);
+    if (!getLibrary(db, id)) return reply.code(404).send({ error: "No such library" });
+    queueMetadata(id, request, true);
+    return reply.code(202).send({ library: getLibrary(db, id) });
+  });
 
   app.get(`${API}/admin/events`, { preHandler: requireAdmin }, async (request) => {
     const query = eventsQuerySchema.parse(request.query ?? {});

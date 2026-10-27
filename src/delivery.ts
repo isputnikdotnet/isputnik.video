@@ -10,18 +10,21 @@
 //
 // HLS segments are MPEG-TS, which Safari plays natively and every other browser
 // through hls.js — so the picture that goes in as is must be 8-bit H.264.
-import type { AudioStream, MediaInfo } from "./ffmpeg.js";
+import type { AudioStream, MediaInfo, SubtitleStream } from "./ffmpeg.js";
+import { isImageSubtitle } from "./subtitles.js";
 
 export type DeliveryMode = "direct" | "remux" | "transcode";
 
 /** Why the file is not sent as it is. */
-export type DeliveryReason = "container" | "audio" | "video";
+export type DeliveryReason = "container" | "audio" | "video" | "subtitles";
 
 export interface Delivery {
   mode: DeliveryMode;
   reasons: DeliveryReason[];
   /** The audio stream played, by ffprobe index; null for a silent file. */
   audio: AudioStream | null;
+  /** An image subtitle drawn onto the picture (which is then re-encoded). */
+  burn: SubtitleStream | null;
   /** HLS only: whether the sound is converted, and the picture. */
   audioCopy: boolean;
   videoCopy: boolean;
@@ -46,9 +49,13 @@ export function chooseAudio(info: MediaInfo): AudioStream | null {
 }
 
 /** `audioIndex`: the sound the person chose (ffprobe's stream index); the default
- *  one when it is left out or isn't in the file. */
-export function decideDelivery(info: MediaInfo, extension: string, audioIndex?: number | null): Delivery {
+ *  one when it is left out or isn't in the file. `burnIndex`: an image subtitle
+ *  to draw onto the picture — a browser can't show PGS or DVD subtitles itself,
+ *  so the picture is re-encoded with them on it. */
+export function decideDelivery(info: MediaInfo, extension: string, audioIndex?: number | null, burnIndex?: number | null): Delivery {
   const audio = info.audio.find((stream) => stream.index === audioIndex) ?? chooseAudio(info);
+  const burnable = info.video ? (info.subtitles ?? []).find((stream) => stream.index === burnIndex && isImageSubtitle(stream.codec)) : undefined;
+  const burn = burnable ?? null;
   const reasons: DeliveryReason[] = [];
   const ext = extension.toLowerCase();
 
@@ -58,14 +65,15 @@ export function decideDelivery(info: MediaInfo, extension: string, audioIndex?: 
   // With more than one sound track the browser picks which it plays, and no
   // browser lets a page choose reliably: those go as HLS, with the one chosen.
   const directAudio = !audio || (DIRECT_AUDIO.has(audio.codec) && info.audio.length <= 1);
-  if (directContainer && directVideo && directAudio) {
-    return { mode: "direct", reasons, audio, audioCopy: true, videoCopy: true };
+  if (directContainer && directVideo && directAudio && !burn) {
+    return { mode: "direct", reasons, audio, burn, audioCopy: true, videoCopy: true };
   }
 
   if (!directContainer) reasons.push("container");
-  const videoCopy = !info.video || browserH264(info);
+  const videoCopy = (!info.video || browserH264(info)) && !burn;
   const audioCopy = !audio || SEGMENT_AUDIO.has(audio.codec);
   if (!audioCopy || !directAudio) reasons.push("audio");
-  if (!videoCopy) reasons.push("video");
-  return { mode: videoCopy ? "remux" : "transcode", reasons: [...new Set(reasons)], audio, audioCopy, videoCopy };
+  if (info.video && !browserH264(info)) reasons.push("video");
+  if (burn) reasons.push("subtitles");
+  return { mode: videoCopy ? "remux" : "transcode", reasons: [...new Set(reasons)], audio, burn, audioCopy, videoCopy };
 }

@@ -1,7 +1,7 @@
 {
   "name": "isputnik-video",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "stage": "alpha",
   "description": "The video engine for isputnik.home: TV shows and movies, scanned, described and played behind the home server.",
   "license": "AGPL-3.0-only",

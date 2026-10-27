@@ -29,12 +29,13 @@ export function findTools(env: NodeJS.ProcessEnv = process.env): Tools {
   };
 }
 
-function run(binary: string, args: string[], timeoutMs: number): Promise<string> {
+function run(binary: string, args: string[], timeoutMs: number, input?: Buffer): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(binary, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+    const child = execFile(binary, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
       if (err) reject(new Error(`${String(stderr).trim().split("\n").pop() || err.message}`));
       else resolve(stdout);
     });
+    if (input) child.stdin?.end(input);
   });
 }
 
@@ -67,6 +68,18 @@ export interface AudioStream {
   default: boolean;
 }
 
+export interface SubtitleStream {
+  index: number;
+  codec: string;
+  language: string | null;
+  title: string | null;
+  default: boolean;
+  forced: boolean;
+  /** An image subtitle's canvas (PGS, DVD); 0 when the file doesn't say. */
+  width: number;
+  height: number;
+}
+
 export interface MediaInfo {
   /** ffprobe's format names, e.g. "matroska,webm" or "mov,mp4,m4a,3gp,3g2,mj2". */
   container: string;
@@ -75,6 +88,7 @@ export interface MediaInfo {
   duration: number;
   video: VideoStream | null;
   audio: AudioStream[];
+  subtitles: SubtitleStream[];
 }
 
 interface ProbeStream {
@@ -87,7 +101,7 @@ interface ProbeStream {
   height?: number;
   channels?: number;
   tags?: Record<string, string>;
-  disposition?: { default?: number; attached_pic?: number };
+  disposition?: { default?: number; forced?: number; attached_pic?: number };
   duration?: string;
 }
 
@@ -119,8 +133,30 @@ export async function probe(tools: Tools, file: string): Promise<MediaInfo> {
       language: stream.tags?.language ?? null,
       title: stream.tags?.title ?? null,
       default: stream.disposition?.default === 1
+    })),
+    subtitles: streams.filter((stream) => stream.codec_type === "subtitle").map((stream) => ({
+      index: stream.index,
+      codec: stream.codec_name ?? "",
+      language: stream.tags?.language ?? null,
+      title: stream.tags?.title ?? null,
+      default: stream.disposition?.default === 1,
+      forced: stream.disposition?.forced === 1,
+      width: stream.width ?? 0,
+      height: stream.height ?? 0
     }))
   };
+}
+
+/** A subtitle as WebVTT: stream `index` of a video file, or the text of a
+ *  subtitle file (UTF-8 already) in ffmpeg's `format` (srt, ass, webvtt). Times
+ *  count from the start of the file, as the player's do. */
+export function toWebVtt(tools: Tools, source: { file: string; index: number } | { text: Buffer; format: string }): Promise<string> {
+  const args = ["-hide_banner", "-v", "error"];
+  if ("file" in source) args.push("-nostdin", "-i", source.file, "-map", `0:${source.index}`);
+  else args.push("-f", source.format, "-i", "pipe:0");
+  args.push("-c:s", "webvtt", "-f", "webvtt", "pipe:1");
+  // An embedded track is read out of the whole file: a film on a slow disk takes a while.
+  return run(tools.ffmpeg, args, 10 * 60_000, "text" in source ? source.text : undefined);
 }
 
 /** Where the video's keyframes are, in seconds. Reads the whole file (packets
