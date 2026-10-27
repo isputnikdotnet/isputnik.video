@@ -14,7 +14,7 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
-import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type SegmentData } from "./hls.js";
+import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
 import { conversionSchema, readConversion, saveConversion } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
@@ -413,7 +413,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const stream = `${API}/stream/${item.id}`;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
-    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: { limit: number } | null } =
+    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null } =
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
@@ -429,7 +429,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         const { mode, reasons, videoCopy } = decided.delivery;
         const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
         // Every place to watch converted video taken: the player says so instead.
-        const busy = mode !== "direct" && hls && !hls.canStart(`${identity.id}:${item.id}`) ? { limit: hls.limit } : null;
+        const busy = mode !== "direct" && hls ? hls.refusal(`${identity.id}:${item.id}`) : null;
         playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null, busy };
         audioTracks = decided.info.audio.map((track) => ({ ...track, selected: track.index === decided.delivery.audio?.index }));
         // The playlist of a picture copied as it is needs its keyframes: start
@@ -528,7 +528,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const found = await planFor(request);
     if (!found) return reply.code(404).send({ error: "Not found" });
     // Every place taken: refused before the player waits on a segment.
-    if (!hls!.canStart(found.key)) return busyReply(reply, hls!.limit);
+    const refused = hls!.refusal(found.key);
+    if (refused) return busyReply(reply, refused);
     if (!segment) {
       return reply.header("Content-Type", "application/vnd.apple.mpegurl").header("Cache-Control", "private, no-store").send(playlist(found.plan));
     }
@@ -542,7 +543,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     try {
       made = await hls!.segment(found.key, found.plan, n, { who: found.who, signal: hungUp.signal });
     } catch (err) {
-      if (err instanceof HlsBusyError) return busyReply(reply, err.limit);
+      if (err instanceof HlsBusyError) return busyReply(reply, err.refusal);
       if (!(err instanceof HlsError)) throw err;
       return reply.code(503).header("Retry-After", "2").send({ error: err.message });
     }
@@ -557,9 +558,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
   };
-  /** Every place to watch converted video is taken. */
-  const busyReply = (reply: FastifyReply, limit: number) =>
-    reply.code(503).send({ error: `${limit} ${limit === 1 ? "person is" : "people are"} already watching converted video`, code: "busy", limit });
+  /** Every place to watch converted video is taken, or this person converts another film. */
+  const busyReply = (reply: FastifyReply, refusal: HlsRefusal) =>
+    reply.code(503).send({ error: new HlsBusyError(refusal).message, code: "busy", ...refusal });
 
   app.get(`${API}/hls/:id/:track/:name`, { preHandler: requireIdentity }, serveHls);
   app.get(`${API}/hls/:id/:name`, { preHandler: requireIdentity }, serveHls);
@@ -635,9 +636,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.put(`${API}/admin/libraries/:id`, { preHandler: requireAdmin }, async (request, reply) => {
     const id = libraryIdSchema.parse((request.params as { id: string }).id);
     const body = libraryBodySchema.parse(request.body);
-    const { created, rescan } = putLibrary(db, options.mediaRoot, id, body);
-    note(request, "info", created ? "library.added" : "library.changed", { libraryId: id, detail: `${body.name} (${body.kind}) at "${body.folder}"` });
+    const { created, rescan, relanguage } = putLibrary(db, options.mediaRoot, id, body);
+    note(request, "info", created ? "library.added" : "library.changed", { libraryId: id, detail: `${body.name} (${body.kind}) at "${body.folder}", ${body.language}` });
     if (rescan) queueScan(id, request);
+    // Every title's words again, in the new language.
+    if (relanguage) queueMetadata(id, request, true);
     return reply.code(created ? 201 : 200).send({ library: getLibrary(db, id) });
   });
 

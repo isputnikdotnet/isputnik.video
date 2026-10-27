@@ -54,12 +54,13 @@ export class LibraryError extends Error {
   }
 }
 
-/** Create or change a library. Says whether its contents need a (re)scan. */
-export function putLibrary(db: Db, mediaRoot: string, id: string, input: LibraryInput): { created: boolean; rescan: boolean } {
+/** Create or change a library. Says whether its contents need a (re)scan, and
+ *  whether TMDB must be asked again (its words are in the library's language). */
+export function putLibrary(db: Db, mediaRoot: string, id: string, input: LibraryInput): { created: boolean; rescan: boolean; relanguage: boolean } {
   const folder = normalizeRelative(input.folder);
   const dir = resolveInside(mediaRoot, folder);
   if (!dir || !fs.statSync(dir).isDirectory()) throw new LibraryError(`The folder "${folder}" is not there on the video app`, 422);
-  const existing = db.prepare("SELECT kind, folder, state FROM libraries WHERE id = ?").get(id) as Pick<Row, "kind" | "folder" | "state"> | undefined;
+  const existing = db.prepare("SELECT kind, folder, state, language FROM libraries WHERE id = ?").get(id) as Pick<Row, "kind" | "folder" | "state" | "language"> | undefined;
   if (existing && existing.kind !== input.kind) {
     // Shows and movies are read differently; a library keeps the kind it was made with.
     throw new LibraryError("A library's kind cannot change; make a new library instead", 409);
@@ -71,7 +72,11 @@ export function putLibrary(db: Db, mediaRoot: string, id: string, input: Library
       name = excluded.name, folder = excluded.folder, language = excluded.language,
       state = 'active', detached_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `).run({ id, name: input.name, kind: input.kind, folder, language: input.language });
-  return { created: !existing, rescan: !existing || existing.folder !== folder || existing.state === "detached" };
+  return {
+    created: !existing,
+    rescan: !existing || existing.folder !== folder || existing.state === "detached",
+    relanguage: Boolean(existing) && existing!.language !== input.language
+  };
 }
 
 /** Delete a library and everything catalogued in it: home deleted it. */

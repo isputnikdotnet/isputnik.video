@@ -48,9 +48,13 @@ function scope(db: Db, identity: Identity, kind: "shows" | "movies", query: List
 function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: string[], query: ListQuery, map: (row: Record<string, unknown>, meta: MetaRow | undefined) => T) {
   if (libraries.length === 0) return { items: [] as T[], total: 0, page: 1, pageSize: query.pageSize };
   const marks = libraries.map(() => "?").join(", ");
-  const search = query.q?.trim() ? "AND (title LIKE ? OR original_title LIKE ?)" : "";
+  // The scan's title or TMDB's, either in the original too: a show filed as
+  // «Радар» is found by "Radar".
+  const search = query.q?.trim()
+    ? `AND (title LIKE ? OR original_title LIKE ? OR id IN (SELECT m.item_id FROM metadata m WHERE m.title LIKE ? OR m.original_title LIKE ?))`
+    : "";
   const params: (string | number)[] = [...libraries];
-  if (search) params.push(`%${query.q!.trim()}%`, `%${query.q!.trim()}%`);
+  if (search) params.push(...Array(4).fill(`%${query.q!.trim()}%`));
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE library_id IN (${marks}) ${search}`).get(...params) as { n: number }).n;
   const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE library_id IN (${marks}) ${search} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
     .all(...params, query.pageSize, (query.page - 1) * query.pageSize) as Record<string, unknown>[];

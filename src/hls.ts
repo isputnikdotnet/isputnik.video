@@ -208,11 +208,27 @@ interface Session {
 export class HlsError extends Error {}
 
 /** Everyone the admin allows is already watching something converted. */
+/** Why someone may not start converting a film now: every place the admin
+ *  allows is taken ("household"), or they are converting another film already
+ *  ("person" — on another screen, or a tab left open; it lets go within a
+ *  minute of nobody asking). */
+export interface HlsRefusal {
+  reason: "household" | "person";
+  limit: number;
+  /** "person": the film they are watching. */
+  title?: string;
+}
+
 export class HlsBusyError extends HlsError {
-  constructor(readonly limit: number) {
-    super(`${limit} ${limit === 1 ? "person is" : "people are"} already watching converted video`);
+  constructor(readonly refusal: HlsRefusal) {
+    super(refusal.reason === "person"
+      ? `Already watching ${refusal.title ? `"${refusal.title}"` : "another film"} converted`
+      : `${refusal.limit} ${refusal.limit === 1 ? "person is" : "people are"} already watching converted video`);
   }
 }
+
+/** Whose a session is: the person in "<person>:<item>". */
+const personOf = (key: string) => key.slice(0, key.lastIndexOf(":"));
 
 /** Empties the folder and checks it can be written to; null when it can't. Only
  *  what is inside goes: the folder itself is often a mount point (/transcode in
@@ -262,9 +278,21 @@ export class HlsSessions {
     return this.settings.maxViewers;
   }
 
-  /** Whether `key` may watch now: already converting, or a place is free. */
+  /** Why `key` may not watch now; null when it may: already converting this
+   *  film, or a place is free and this person converts nothing else. One film
+   *  at a time per person, refused rather than taken over, so two screens on
+   *  one account don't stop each other's conversion turn about. */
+  refusal(key: string): HlsRefusal | null {
+    if (this.sessions.has(key)) return null;
+    const person = personOf(key);
+    const other = [...this.sessions.values()].find((session) => personOf(session.key) === person);
+    if (other) return { reason: "person", limit: this.settings.maxViewers, title: other.title };
+    if (this.sessions.size >= this.settings.maxViewers) return { reason: "household", limit: this.settings.maxViewers };
+    return null;
+  }
+
   canStart(key: string): boolean {
-    return this.sessions.has(key) || this.sessions.size < this.settings.maxViewers;
+    return this.refusal(key) === null;
   }
 
   /** Segment `n`, made if it isn't there yet. `who` names the session for the
@@ -282,7 +310,8 @@ export class HlsSessions {
       session = undefined;
     }
     if (!session) {
-      if (!this.canStart(key)) throw new HlsBusyError(this.settings.maxViewers);
+      const refused = this.refusal(key);
+      if (refused) throw new HlsBusyError(refused);
       session = this.open(key, plan, who);
     }
     session.touched = Date.now();

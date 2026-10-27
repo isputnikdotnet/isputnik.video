@@ -187,4 +187,29 @@ describe("with a TMDB key", () => {
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=metadata.matched", headers: admin })).json();
     expect(events.events.map((event: { detail: string }) => event.detail)).toEqual(["Loose Film matched automatically again", "Loose Film matched by hand to TMDB 404"]);
   });
+
+  it("finds a title by TMDB's name too", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    // Filed as «Радар» (its .nfo); TMDB knows it as "Radar".
+    const found = (await app.inject({ method: "GET", url: "/video/api/shows?q=radar", headers: mum })).json();
+    expect(found.items.map((show: { title: string }) => show.title)).toEqual(["Радар"]);
+    expect(found.total).toBe(1);
+    expect((await app.inject({ method: "GET", url: "/video/api/shows?q=nothing-like-it", headers: mum })).json().total).toBe(0);
+  });
+
+  it("asks TMDB again, in the new language, when a library's language changes", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const before = tmdb.asked.length;
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films", kind: "movies", folder: "Movies", language: "ru" } });
+    await app.scansSettled();
+    const again = tmdb.asked.slice(before);
+    expect(again.filter((request) => request.startsWith("/3/movie/101"))).toEqual([expect.stringContaining("language=ru")]);
+    // Same language: nothing is asked.
+    const now = tmdb.asked.length;
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films renamed", kind: "movies", folder: "Movies", language: "ru" } });
+    await app.scansSettled();
+    expect(tmdb.asked.length).toBe(now);
+  });
 });

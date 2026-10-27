@@ -178,6 +178,7 @@ describe("real segments", () => {
   let fixture: Fixture;
   let app: FastifyInstance;
   let filmId: string;
+  let secondId: string;
 
   beforeAll(async () => {
     fixture = makeFixture();
@@ -192,12 +193,18 @@ describe("real segments", () => {
       "-metadata:s:a:1", "title=Дубляж", "-disposition:a:0", "default", "-disposition:a:1", "0", film]);
     const hourAgo = new Date(Date.now() - 3600_000);
     fs.utimesSync(film, hourAgo, hourAgo);
+    // The same again under another name: a second film to convert.
+    const second = path.join(fixture.root, "Movies", "Second Film (2021)", "Second Film (2021).mkv");
+    fs.mkdirSync(path.dirname(second), { recursive: true });
+    fs.copyFileSync(film, second);
+    fs.utimesSync(second, hourAgo, hourAgo);
 
     app = await buildApp({ gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null, fastify: { logger: false } });
     await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: { ...headers, "x-isputnik-user-role": "admin" }, payload: { name: "Films", kind: "movies", folder: "Movies" } });
     await app.scansSettled();
     const films = (await app.inject({ method: "GET", url: "/video/api/movies", headers })).json().items as { id: string; title: string }[];
     filmId = films.find((film) => film.title === "Loud Film")!.id;
+    secondId = films.find((film) => film.title === "Second Film")!.id;
   }, 60_000);
 
   afterAll(async () => {
@@ -294,10 +301,10 @@ describe("real segments", () => {
     const dad = { ...headers, "x-isputnik-user-id": "dad", "x-isputnik-user-name": "Dad" };
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
 
-    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: dad })).json().playback.busy).toEqual({ limit: 1 });
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: dad })).json().playback.busy).toEqual({ reason: "household", limit: 1 });
     const refused = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/index.m3u8`, headers: dad });
     expect(refused.statusCode).toBe(503);
-    expect(refused.json()).toMatchObject({ code: "busy", limit: 1 });
+    expect(refused.json()).toMatchObject({ code: "busy", reason: "household", limit: 1 });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).json().code).toBe("busy");
     // Mum, already watching, carries on.
     expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers })).json().playback.busy).toBeNull();
@@ -307,6 +314,25 @@ describe("real segments", () => {
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).statusCode).toBe(200);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers: dad });
     await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+  }, 60_000);
+
+  it("converts one film at a time for each person, refusing a second rather than taking over the first", async () => {
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
+    // Places are free, but Mum is converting Loud Film already (another screen, a tab left open).
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${secondId}`, headers })).json().playback.busy)
+      .toEqual({ reason: "person", limit: 3, title: "Loud Film" });
+    const refused = await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/0.ts`, headers });
+    expect(refused.statusCode).toBe(503);
+    expect(refused.json()).toMatchObject({ code: "busy", reason: "person", error: "Already watching \"Loud Film\" converted" });
+    // The first carries on; someone else may convert the second.
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers })).statusCode).toBe(200);
+    const dad = { ...headers, "x-isputnik-user-id": "dad", "x-isputnik-user-name": "Dad" };
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/0.ts`, headers: dad })).statusCode).toBe(200);
+    // Once Mum leaves the first, the second is hers to watch.
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/0.ts`, headers })).statusCode).toBe(200);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${secondId}`, headers });
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${secondId}`, headers: dad });
   }, 60_000);
 
   it("keeps the admin's settings, refuses ones out of range, and lets only an admin near them", async () => {
