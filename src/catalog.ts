@@ -26,6 +26,21 @@ export interface ListQuery {
   pageSize: number;
   /** Rows to skip, instead of whole pages: Stremio asks with skip=<how many it has>. */
   offset?: number;
+  /** Only titles of this genre, as the card shows them (the scan's, else TMDB's). */
+  genre?: string;
+}
+
+/** A title's genres as its card shows them: the scan's own, TMDB's when it had none. */
+const effectiveGenres = (table: "shows" | "movies") =>
+  `(CASE WHEN ${table}.genres != '[]' THEN ${table}.genres ELSE COALESCE((SELECT m.genres FROM metadata m WHERE m.item_id = ${table}.id), '[]') END)`;
+
+/** Every genre in a library, for Stremio's genre filter. */
+export function libraryGenres(db: Db, libraryId: string, kind: "shows" | "movies"): string[] {
+  return (db.prepare(`
+    SELECT DISTINCT g.value AS genre FROM ${kind}, json_each(${effectiveGenres(kind)}) g
+    WHERE ${kind}.library_id = ? AND g.type = 'text' AND trim(g.value) != ''
+    ORDER BY g.value COLLATE NOCASE
+  `).all(libraryId) as { genre: string }[]).map((row) => row.genre);
 }
 
 /** The ids of the active libraries of a kind this person may see. */
@@ -55,10 +70,14 @@ function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: 
   const search = query.q?.trim()
     ? `AND (title LIKE ? OR original_title LIKE ? OR id IN (SELECT m.item_id FROM metadata m WHERE m.title LIKE ? OR m.original_title LIKE ?))`
     : "";
+  const genre = query.genre?.trim()
+    ? `AND EXISTS (SELECT 1 FROM json_each(${effectiveGenres(table)}) g WHERE g.value = ?)`
+    : "";
   const params: (string | number)[] = [...libraries];
   if (search) params.push(...Array(4).fill(`%${query.q!.trim()}%`));
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE library_id IN (${marks}) ${search}`).get(...params) as { n: number }).n;
-  const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE library_id IN (${marks}) ${search} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
+  if (genre) params.push(query.genre!.trim());
+  const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE library_id IN (${marks}) ${search} ${genre}`).get(...params) as { n: number }).n;
+  const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE library_id IN (${marks}) ${search} ${genre} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
     .all(...params, query.pageSize, query.offset ?? (query.page - 1) * query.pageSize) as Record<string, unknown>[];
   const meta = metaFor(db, rows.map((row) => row.id as string));
   return { items: rows.map((row) => map(row, meta.get(row.id as string))), total, page: query.page, pageSize: query.pageSize };

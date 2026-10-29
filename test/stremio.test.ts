@@ -69,13 +69,17 @@ describe("the manifest", () => {
       types: ["movie", "series"],
       catalogs: [
         { type: "movie", id: "isp-continue" },
+        { type: "series", id: "isp-continue" },
         { type: "movie", id: "isp-lib-lib_films", name: "Family films" },
         { type: "series", id: "isp-lib-lib_tv", name: "TV" }
       ]
     });
+    // Each library offers its own genres to filter by (the .nfo's here).
+    const tv = res.json().catalogs.find((c: { id: string }) => c.id === "isp-lib-lib_tv");
+    expect(tv.extra).toContainEqual({ name: "genre", options: ["Драма", "Фантастика"] });
 
     const filmsOnly = (await get(`${ROOT}/manifest.json`, as("kid", ["lib_films"]))).json();
-    expect(filmsOnly.catalogs.map((c: { id: string }) => c.id)).toEqual(["isp-continue", "isp-lib-lib_films"]);
+    expect(filmsOnly.catalogs.map((c: { type: string; id: string }) => `${c.type}:${c.id}`)).toEqual(["movie:isp-continue", "movie:isp-lib-lib_films"]);
     const nothing = (await get(`${ROOT}/manifest.json`, as("guest", []))).json();
     expect(nothing.catalogs).toEqual([]);
   });
@@ -94,6 +98,23 @@ describe("catalogs", () => {
     const skipped = await catalog("movie", "isp-lib-lib_films", "skip=1");
     expect(skipped.map((film) => film.name)).toEqual(["Some Film"]);
     expect(CATALOG_PAGE).toBe(100);
+  });
+
+  it("filters by genre", async () => {
+    expect((await catalog("movie", "isp-lib-lib_films", "genre=Comedy")).map((film) => film.name)).toEqual(["Some Film"]);
+    expect((await catalog("series", "isp-lib-lib_tv", `genre=${encodeURIComponent("Драма")}`)).map((show) => show.name)).toEqual(["Радар"]);
+    expect(await catalog("movie", "isp-lib-lib_films", "genre=Horror")).toEqual([]);
+  });
+
+  it("keeps Continue watching to the type of its row", async () => {
+    const some = (await catalog("movie", "isp-lib-lib_films")).find((film) => film.name === "Some Film")!;
+    const radar = (await catalog("series", "isp-lib-lib_tv")).find((show) => show.name === "Радар")!;
+    const firstEpisode = ((await get(`${ROOT}/meta/series/${radar.id}.json`)).json().meta as Meta).videos![0].id;
+    for (const id of [some.id, firstEpisode]) {
+      await app.inject({ method: "PUT", url: `/video/api/progress/${id.slice("isp-site42:".length)}`, headers: as("mum", ["lib_tv", "lib_films"], false), payload: { position: 120, duration: 3000 } });
+    }
+    expect((await catalog("movie", "isp-continue")).map((meta) => meta.name)).toEqual(["Some Film"]);
+    expect((await catalog("series", "isp-continue")).map((meta) => meta.name)).toEqual(["Радар"]);
   });
 
   it("searches, and never shows a library the member may not see", async () => {

@@ -16,7 +16,7 @@ import path from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest, RouteHandlerMethod } from "fastify";
 import { z } from "zod";
 import type { Db } from "./db.js";
-import { listMovies, listShows, getMovie, getShow, visibleLibraries } from "./catalog.js";
+import { libraryGenres, listMovies, listShows, getMovie, getShow, visibleLibraries } from "./catalog.js";
 import { BASE_PATH } from "./config.js";
 import { decideDelivery, type Delivery } from "./delivery.js";
 import type { MediaInfo } from "./ffmpeg.js";
@@ -125,6 +125,7 @@ export function stremioLanguage(language: string | null): string {
 
 const extraSchema = z.object({
   search: z.string().trim().max(200).optional(),
+  genre: z.string().trim().max(100).optional(),
   skip: z.coerce.number().int().min(0).max(100_000).default(0)
 });
 
@@ -182,7 +183,7 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
     if (!found) return;
     const { identity, site } = found;
     const libraries = visibleLibraries(db, identity);
-    const searchable = [{ name: "search" }, { name: "skip" }];
+    const kinds = new Set(libraries.map((library) => library.kind));
     return {
       id: `net.isputnik.home.${site.id}`,
       version: deps.version.replace(/[^0-9.]/g, "") || "0.0.0",
@@ -192,13 +193,18 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
       types: ["movie", "series"],
       idPrefixes: [prefixOf(site)],
       catalogs: [
-        ...(libraries.length > 0 ? [{ type: "movie", id: CONTINUE_CATALOG, name: "Continue watching" }] : []),
-        ...libraries.map((library) => ({
-          type: library.kind === "movies" ? "movie" : "series",
-          id: `${LIBRARY_CATALOG}${library.id}`,
-          name: library.name,
-          extra: searchable
-        }))
+        // One row per kind the member has, so each holds what its type says.
+        ...(kinds.has("movies") ? [{ type: "movie", id: CONTINUE_CATALOG, name: "Continue watching" }] : []),
+        ...(kinds.has("shows") ? [{ type: "series", id: CONTINUE_CATALOG, name: "Continue watching" }] : []),
+        ...libraries.map((library) => {
+          const genres = libraryGenres(db, library.id, library.kind);
+          return {
+            type: library.kind === "movies" ? "movie" : "series",
+            id: `${LIBRARY_CATALOG}${library.id}`,
+            name: library.name,
+            extra: [{ name: "search" }, { name: "skip" }, ...(genres.length > 0 ? [{ name: "genre", options: genres }] : [])]
+          };
+        })
       ],
       behaviorHints: { configurable: false, configurationRequired: false }
     };
@@ -216,6 +222,7 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
       if (extra.skip > 0 || extra.search) return { metas: [] };
       const seen = new Set<string>();
       const metas = continueWatching(db, identity, 20).flatMap((item) => {
+        if ((type === "series") !== Boolean(item.show)) return [];
         const id = item.show ? item.show.id : item.id;
         if (seen.has(id)) return [];
         seen.add(id);
@@ -227,7 +234,7 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
     const libraryId = catalogId?.startsWith(LIBRARY_CATALOG) ? catalogId.slice(LIBRARY_CATALOG.length) : null;
     const library = libraryId ? visibleLibraries(db, identity).find((candidate) => candidate.id === libraryId) : undefined;
     if (!library || type !== (library.kind === "movies" ? "movie" : "series")) return { metas: [] };
-    const query = { library: library.id, q: extra.search, sort: "title" as const, page: 1, pageSize: CATALOG_PAGE, offset: extra.skip };
+    const query = { library: library.id, q: extra.search, genre: extra.genre, sort: "title" as const, page: 1, pageSize: CATALOG_PAGE, offset: extra.skip };
     const listed = library.kind === "movies" ? listMovies(db, identity, query) : listShows(db, identity, query);
     return {
       metas: listed.items.map((item) => ({
