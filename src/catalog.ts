@@ -24,6 +24,8 @@ export interface ListQuery {
   sort: "title" | "year" | "added";
   page: number;
   pageSize: number;
+  /** Rows to skip, instead of whole pages: Stremio asks with skip=<how many it has>. */
+  offset?: number;
 }
 
 /** The ids of the active libraries of a kind this person may see. */
@@ -57,7 +59,7 @@ function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: 
   if (search) params.push(...Array(4).fill(`%${query.q!.trim()}%`));
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE library_id IN (${marks}) ${search}`).get(...params) as { n: number }).n;
   const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE library_id IN (${marks}) ${search} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
-    .all(...params, query.pageSize, (query.page - 1) * query.pageSize) as Record<string, unknown>[];
+    .all(...params, query.pageSize, query.offset ?? (query.page - 1) * query.pageSize) as Record<string, unknown>[];
   const meta = metaFor(db, rows.map((row) => row.id as string));
   return { items: rows.map((row) => map(row, meta.get(row.id as string))), total, page: query.page, pageSize: query.pageSize };
 }

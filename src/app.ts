@@ -18,6 +18,7 @@ import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan,
 import { conversionSchema, readConversion, saveConversion } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
+import { registerStremio } from "./stremio.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase } from "./db.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
@@ -462,7 +463,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // The file itself, with byte ranges so the player can seek. Streamed straight
   // from disk; the reply is written by hand so nothing buffers a film.
-  app.get(`${API}/stream/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+  const serveStream = async (request: FastifyRequest, reply: FastifyReply) => {
     const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
     const file = item ? fileOf(options.mediaRoot, item) : null;
     if (!item || !file) return reply.code(404).send({ error: "Not found" });
@@ -495,7 +496,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // A player that seeks closes the connection: stop reading the disk too.
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
-  });
+  };
+  app.get(`${API}/stream/:id`, { preHandler: requireIdentity }, serveStream);
 
   // HLS, for what the browser can't play as it is: the playlist of the whole
   // film, then each segment, made as it is asked for (hls.ts).
@@ -575,7 +577,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // A poster, backdrop or episode still (metadata.ts): from beside the video, or
   // TMDB's kept in the art folder. Only for someone who may see the title.
-  app.get(`${API}/art/:id/:kind`, { preHandler: requireIdentity }, async (request, reply) => {
+  const serveArt = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id, kind } = request.params as { id: string; kind: string };
     const itemId = itemIdSchema.parse(id);
     const artKind = artKindSchema.safeParse(kind);
@@ -592,10 +594,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!type) return reply.code(404).send({ error: "Not found" });
     // The address carries a version, so it can be kept a while.
     return reply.header("Content-Type", type).header("Cache-Control", "private, max-age=86400").send(await fs.promises.readFile(file));
-  });
+  };
+  app.get(`${API}/art/:id/:kind`, { preHandler: requireIdentity }, serveArt);
 
   // A text subtitle as WebVTT, from inside the file or beside it (subtitles.ts).
-  app.get(`${API}/subtitles/:id/:name`, { preHandler: requireIdentity }, async (request, reply) => {
+  const serveSubtitle = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id, name } = request.params as { id: string; name: string };
     const parsedId = subtitleIdSchema.safeParse(/^(.+)\.vtt$/.exec(name)?.[1]);
     const item = findItem(db, request.identity!, itemIdSchema.parse(id));
@@ -614,6 +617,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       .header("Cache-Control", "private, max-age=600")
       .header("X-Content-Type-Options", "nosniff")
       .send(vtt);
+  };
+  app.get(`${API}/subtitles/:id/:name`, { preHandler: requireIdentity }, serveSubtitle);
+
+  // Stremio on a TV (stremio.ts): the same catalog and the same bytes, in the
+  // add-on protocol, under the member's link home's gateway admitted.
+  registerStremio(app, {
+    db,
+    secret,
+    mediaRoot: options.mediaRoot,
+    version: options.version,
+    probe: async () => (mediaProbe && (await toolsReady) ? mediaProbe : null),
+    canConvert: Boolean(hls),
+    requireIdentity,
+    handlers: { stream: serveStream, hls: serveHls, art: serveArt, subtitle: serveSubtitle },
+    trackSegment
   });
 
   // How far the person got; the player sends it every few seconds and on pause.
