@@ -63,7 +63,7 @@ describe("the gateway check", () => {
 
 describe("admin routes", () => {
   it("answer an admin only", async () => {
-    for (const url of ["/video/api/admin/libraries", "/video/api/admin/folders", "/video/api/admin/events", "/video/api/admin/log", "/video/api/admin/backup"]) {
+    for (const url of ["/video/api/admin/libraries", "/video/api/admin/folders", "/video/api/admin/events", "/video/api/admin/log", "/video/api/admin/backup", "/video/api/admin/disks"]) {
       expect((await get(url, mum)).statusCode, url).toBe(403);
       expect((await get(url, admin)).statusCode, url).toBe(200);
     }
@@ -79,6 +79,29 @@ describe("admin routes", () => {
     ]);
     expect((await get("/video/api/admin/folders?path=..", admin)).statusCode).toBe(404);
     expect((await get("/video/api/admin/folders?path=Shows/../..", admin)).statusCode).toBe(404);
+  });
+
+  it("say which disks the libraries, posters and catalog sit on, for home's Dashboard", async () => {
+    const put = await app.inject({
+      method: "PUT", url: "/video/api/admin/libraries/tv", headers: admin,
+      payload: { name: "TV Shows", kind: "shows", folder: "Shows", language: "en" }
+    });
+    expect(put.statusCode).toBeLessThan(300);
+    const { disks } = (await get("/video/api/admin/disks", admin)).json() as {
+      disks: { mount: string; filesystem: string; freeBytes: number; totalBytes: number; holds: { kind: string; name?: string; path: string }[]; sharesWith: string[] }[];
+    };
+    const holds = disks.flatMap((disk) => disk.holds);
+    const library = holds.find((hold) => hold.kind === "library");
+    expect(library).toMatchObject({ name: "TV Shows" });
+    expect(library?.path.endsWith("Shows")).toBe(true);
+    expect(holds.some((hold) => hold.kind === "artwork")).toBe(true);
+    // An in-memory catalog has no file to measure.
+    expect(holds.some((hold) => hold.kind === "database")).toBe(false);
+    for (const disk of disks) {
+      expect(disk.totalBytes).toBeGreaterThan(0);
+      expect(disk.freeBytes).toBeLessThanOrEqual(disk.totalBytes);
+      expect(disk.sharesWith).not.toContain(disk.mount);
+    }
   });
 
   it("hand the catalog over for home's backup as a real database", async () => {

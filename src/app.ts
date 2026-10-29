@@ -18,12 +18,13 @@ import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan,
 import { conversionSchema, readConversion, saveConversion } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
+import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase } from "./db.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
 import { canSee, clientIpFrom, devIdentity, forwardedRequestId, identityFrom, rejectionReason, type Identity } from "./identity.js";
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
 import type { LogBuffer } from "./log-buffer.js";
-import { listFolders } from "./media.js";
+import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 
 declare module "fastify" {
@@ -632,6 +633,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // ── Libraries, as home manages them (home's server calls these) ─────────
 
   app.get(`${API}/admin/libraries`, { preHandler: requireAdmin }, async () => ({ libraries: listLibraries(db) }));
+
+  // The disks this engine's files sit on, for home's Dashboard (disks.ts): each
+  // library folder, the catalog, the posters and the conversion folder.
+  app.get(`${API}/admin/disks`, { preHandler: requireAdmin }, async () => {
+    const holds: DiskHolding[] = listLibraries(db)
+      .filter((library) => library.state === "active")
+      .flatMap((library) => {
+        const dir = resolveInside(options.mediaRoot, library.folder);
+        return dir ? [{ kind: "library" as const, name: library.name, path: dir }] : [];
+      });
+    if (options.dbPath !== ":memory:") holds.push({ kind: "database", path: path.dirname(path.resolve(options.dbPath)) });
+    holds.push({ kind: "artwork", path: artDir });
+    if (hls) holds.push({ kind: "transcode", path: hls.folder });
+    return { disks: groupByDisk(holds) };
+  });
 
   app.put(`${API}/admin/libraries/:id`, { preHandler: requireAdmin }, async (request, reply) => {
     const id = libraryIdSchema.parse((request.params as { id: string }).id);

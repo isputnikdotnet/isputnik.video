@@ -48,6 +48,7 @@ from beside the files, and from TMDB with the admin's key.
 | `GET /video/api/admin/folders?path=` | admin | folders under `MEDIA_ROOT`, for the picker |
 | `GET /video/api/admin/events`, `/log` | admin | the admin's window |
 | `GET /video/api/admin/backup` | admin | the whole catalog as one SQLite copy |
+| `GET /video/api/admin/disks` | admin | the disks the libraries, catalog, posters and conversion folder sit on, one per mounted folder (home's Dashboard) |
 
 ## Library layout
 

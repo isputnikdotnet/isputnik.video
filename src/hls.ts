@@ -255,6 +255,11 @@ export class HlsSessions {
   private sessions = new Map<string, Session>();
   private sweeper: NodeJS.Timeout;
   private root: string;
+
+  /** Where segments are made: for the Disks answer home's Dashboard reads. */
+  get folder(): string {
+    return this.root;
+  }
   /** A folder made here (no TRANSCODE_PATH, or it was unusable): removed on close. */
   private ownsRoot: boolean;
   private settings: ConversionSettings = { ...DEFAULT_CONVERSION };
