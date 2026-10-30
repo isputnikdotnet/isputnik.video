@@ -7,7 +7,7 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.10.0, alpha. Catalog, library sync and playback work, with each
+Status: 0.11.0, alpha. Catalog, library sync and playback work, with each
 person's progress (resume, next episode, Continue watching). A file a browser
 plays as it is goes as it is; the rest are converted to HLS as they play — the
 sound to AAC, the picture to H.264 only when a browser can't show it.
