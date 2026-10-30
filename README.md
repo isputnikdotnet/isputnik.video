@@ -49,6 +49,8 @@ together are grouped into sets, from the .nfo files or TMDB's collections.
 | `GET /video/api/admin/folders?path=` | admin | folders under `MEDIA_ROOT`, for the picker |
 | `GET /video/api/admin/events`, `/log` | admin | the admin's window |
 | `GET /video/api/admin/backup` | admin | the whole catalog as one SQLite copy |
+| `POST /video/api/admin/restore` | admin | puts a copy home holds back, at once, in one transaction (`application/vnd.sqlite3`, `X-Isputnik-Backup-Version`); a newer copy is refused, and so is any restore while a scan or metadata pass runs. Home's gateway refuses this path: only its Backup page calls it |
+| `GET`, `POST /video/api/admin/restore/undo` | admin | describes the catalog the last restore replaced (`<db>.pre-restore`), and puts it back once |
 | `GET /video/stremio/<token>/manifest.json`, `/catalog/…`, `/meta/…`, `/stream/…`, `/subtitles/…` | signed, `X-Isputnik-Site-*` and `-Base-Url` | the Stremio add-on (home's `docs/stremio-plan.md`): this install's add-on, a catalog per library, the original file and, for formats TVs refuse, a converted stream first; the token is home's to check and is masked in the log |
 | `GET /video/stremio/<token>/play/:id`, `/hls/…`, `/art/…`, `/subs/…` | signed | the same bytes as the player's routes, under the add-on's address |
 | `GET /video/api/admin/disks` | admin | the disks the libraries, catalog, posters and conversion folder sit on, one per mounted folder (home's Dashboard) |

@@ -14,9 +14,15 @@ export function openDatabase(file: string): Database.Database {
   const db = new Database(file);
   db.pragma("foreign_keys = ON");
   if (file !== ":memory:") db.pragma("journal_mode = WAL");
+  upgradeDatabase(db);
+  return db;
+}
+
+/** This version's schema on a database of any older one: what opening does, and
+ *  what a backup goes through before it is restored (restore.ts). */
+export function upgradeDatabase(db: Database.Database): void {
   addColumns(db);
   db.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
-  return db;
 }
 
 /** Columns added after a table was first made: added to an older file before

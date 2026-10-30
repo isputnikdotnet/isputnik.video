@@ -20,7 +20,8 @@ import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js
 import { BASE_PATH } from "./config.js";
 import { registerStremio } from "./stremio.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
-import { openDatabase } from "./db.js";
+import { openDatabase, upgradeDatabase } from "./db.js";
+import { RESTORE_BODY_LIMIT, RestoreError, SQLITE_CONTENT_TYPE, restoreDatabase, undoInfo, undoRestore, type RestoreTarget } from "./restore.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
 import { canSee, clientIpFrom, devIdentity, forwardedRequestId, identityFrom, rejectionReason, type Identity } from "./identity.js";
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
@@ -228,6 +229,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
   const queued = new Set<string>();
+  // Scans and metadata passes queued or running. A restore waits for none: it is
+  // refused while there are any, since they would carry on writing into a catalog
+  // that had just been replaced under them.
+  let catalogWork = 0;
   // A scan queues the library's metadata pass, so both are settled once the
   // scans and then the passes are.
   app.decorate("scansSettled", async () => {
@@ -292,6 +297,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof LibraryError) return reply.code(error.status).send({ error: error.message });
+    if (error instanceof RestoreError) {
+      note(request, "warn", "restore.refused", { detail: error.message });
+      return reply.code(error.status).send({ error: error.message });
+    }
     if (error instanceof z.ZodError) {
       const fields = [...new Set(error.issues.map((issue) => issue.path.join(".") || "(body)"))].join(", ");
       note(request, "warn", "request.invalid", { detail: `${request.method} ${pathOf(request)}: ${fields}` });
@@ -325,6 +334,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (queued.has(libraryId)) return;
     queued.add(libraryId);
     setScanState(db, libraryId, "queued");
+    catalogWork += 1;
     scanChain = scanChain.then(async () => {
       queued.delete(libraryId);
       if (!getLibrary(db, libraryId)) return;
@@ -349,7 +359,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         note(request, "error", "scan.failed", { libraryId, detail: message });
         if (!(err instanceof ScanError)) app.log.error({ err, libraryId }, "Scan failed");
       }
-    });
+    }).finally(() => { catalogWork -= 1; });
   };
 
   /** Queue a library's metadata pass; `force` asks TMDB again about every title. */
@@ -357,6 +367,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const key = `${libraryId}:${force}`;
     if (metadataQueued.has(key)) return;
     metadataQueued.add(key);
+    catalogWork += 1;
     metadataChain = metadataChain.then(async () => {
       metadataQueued.delete(key);
       try {
@@ -371,7 +382,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         note(request, "error", "metadata.failed", { libraryId, detail: (err as Error).message });
         app.log.error({ err, libraryId }, "Metadata pass failed");
       }
-    });
+    }).finally(() => { catalogWork -= 1; });
   };
 
   // ── Open to the gateway's probes ─────────────────────────────────────────
@@ -859,6 +870,50 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       .header("Cache-Control", "no-store")
       .header("X-Isputnik-Backup-Version", options.version)
       .send(bytes);
+  });
+
+  // And back (restore.ts): home sends a backup it holds, and it is in place when
+  // this answers. onRequest, so nobody but an admin gets as far as sending a file.
+  const restoreTarget: RestoreTarget = {
+    db,
+    dbPath: options.dbPath,
+    version: options.version,
+    tables: ["libraries", "shows", "movies"],
+    name: "the video catalog",
+    upgrade: upgradeDatabase
+  };
+  const refuseWhileWorking = () => {
+    if (catalogWork > 0) throw new RestoreError(409, "A scan or a metadata pass is running. Try again when it has finished.");
+  };
+  /** What the restored rows say that only this process can know the truth of. */
+  const afterRestore = () => {
+    // A copy taken during a scan says it is scanning, and nothing here is.
+    db.prepare("UPDATE libraries SET scan_state = 'idle' WHERE scan_state IN ('queued', 'scanning')").run();
+    hls?.configure(readConversion(db));
+  };
+  app.addContentTypeParser(SQLITE_CONTENT_TYPE, { parseAs: "buffer", bodyLimit: RESTORE_BODY_LIMIT }, (_request, body, done) => done(null, body));
+
+  app.post(`${API}/admin/restore`, { onRequest: requireAdmin, bodyLimit: RESTORE_BODY_LIMIT }, async (request) => {
+    if (!Buffer.isBuffer(request.body)) throw new RestoreError(400, "Send the database itself.");
+    refuseWhileWorking();
+    const from = request.headers["x-isputnik-backup-version"];
+    const fromVersion = typeof from === "string" && from ? from : null;
+    const { kept } = restoreDatabase(restoreTarget, request.body, fromVersion);
+    afterRestore();
+    note(request, "info", "backup.restored", {
+      detail: `Catalog restored from a backup${fromVersion ? ` of version ${fromVersion}` : ""} (${request.body.length} bytes)${kept ? "; the one it replaced is kept to undo this" : ""}`
+    });
+    return { restored: true, version: options.version };
+  });
+
+  app.get(`${API}/admin/restore/undo`, { preHandler: requireAdmin }, async () => ({ undo: undoInfo(restoreTarget) }));
+
+  app.post(`${API}/admin/restore/undo`, { preHandler: requireAdmin }, async (request) => {
+    refuseWhileWorking();
+    undoRestore(restoreTarget);
+    afterRestore();
+    note(request, "info", "backup.undone", { detail: "The last restore was undone: the catalog it replaced is back" });
+    return { undone: true, version: options.version };
   });
 
   // Everything else under the prefix is this API's own 404, never a page.
