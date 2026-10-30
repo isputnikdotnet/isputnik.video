@@ -6,6 +6,7 @@ import { canSee, type Identity } from "./identity.js";
 import { browserPlayability, nextUp, progressFor, resumeAt } from "./playback.js";
 import { BASE_PATH } from "./config.js";
 import { artUrl, metaFor, metaGenres, type MetaRow } from "./metadata.js";
+import { setOfMovie } from "./sets.js";
 
 const API = `${BASE_PATH}/api`;
 
@@ -204,6 +205,8 @@ export function getMovie(db: Db, identity: Identity, id: string) {
     backdrop: artUrl(API, meta, "backdrop"),
     ...matchOf(meta),
     direct: browserPlayability(movie.file as string).direct,
-    progress: progressFor(db, identity.id, [movie.id as string]).get(movie.id as string) ?? null
+    progress: progressFor(db, identity.id, [movie.id as string]).get(movie.id as string) ?? null,
+    /** The set it is in, with the films of it this person may see. */
+    set: setOfMovie(db, identity, movie.id as string)
   };
 }

@@ -30,6 +30,26 @@ export interface NfoFacts {
   episode: number | null;
   imdbId: string | null;
   tmdbId: string | null;
+  /** The film's set (<set>), as Kodi and Emby write it; null when it has none. */
+  set: { name: string; overview: string | null; tmdbId: string | null } | null;
+}
+
+const TMDB_ID = /^\d{1,10}$/;
+
+/** <set>Name</set>, <set tmdbcolid="119">Name</set> or <set><name>…</name><overview>…</overview></set>,
+ *  with TMDB's collection id from the set itself or the film's own tags. */
+function setOf(node: Record<string, unknown>, idOf: (type: string) => string | null): NfoFacts["set"] {
+  const raw = node.set;
+  if (raw === undefined || raw === null) return null;
+  const inner = typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+  const name = inner && inner.name !== undefined ? text(inner.name) : text(raw);
+  if (!name) return null;
+  const tmdbId = (inner ? text(inner["@tmdbcolid"]) : null) ?? text(node.tmdbcollectionid) ?? idOf("tmdbcol") ?? idOf("tmdbcollection") ?? idOf("tmdbset");
+  return {
+    name,
+    overview: inner ? text(inner.overview) : null,
+    tmdbId: tmdbId && TMDB_ID.test(tmdbId) ? tmdbId : null
+  };
 }
 
 function text(value: unknown): string | null {
@@ -97,6 +117,7 @@ export function readNfo(file: string, root: "tvshow" | "episodedetails" | "movie
     season: int(node.season),
     episode: int(node.episode),
     imdbId: imdb && /^tt\d{5,10}$/.test(imdb) ? imdb : null,
-    tmdbId: tmdb && /^\d{1,10}$/.test(tmdb) ? tmdb : null
+    tmdbId: tmdb && TMDB_ID.test(tmdb) ? tmdb : null,
+    set: root === "movie" ? setOf(node, idOf) : null
   };
 }

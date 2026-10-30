@@ -51,7 +51,17 @@ const movieSchema = z.object({
   vote_average: z.number().nullable().optional(),
   runtime: z.number().nullable().optional(),
   poster_path: z.string().nullable().optional(),
-  backdrop_path: z.string().nullable().optional()
+  backdrop_path: z.string().nullable().optional(),
+  belongs_to_collection: z.object({ id: z.number(), name: z.string().optional() }).passthrough().nullable().optional()
+}).passthrough();
+
+const collectionSchema = z.object({
+  id: z.number(),
+  name: z.string().optional(),
+  overview: z.string().nullable().optional(),
+  poster_path: z.string().nullable().optional(),
+  backdrop_path: z.string().nullable().optional(),
+  parts: z.array(z.object({ id: z.number(), release_date: z.string().nullable().optional() }).passthrough()).default([])
 }).passthrough();
 
 const showSchema = z.object({
@@ -106,6 +116,18 @@ export interface TmdbDetails {
   status: string | null;
   posterPath: string | null;
   backdropPath: string | null;
+  /** The collection a film belongs to (sets.ts); always null for a show. */
+  collection: { tmdbId: string; name: string | null } | null;
+}
+
+export interface TmdbCollection {
+  tmdbId: string;
+  name: string | null;
+  overview: string | null;
+  posterPath: string | null;
+  backdropPath: string | null;
+  /** Every film of it, with its release date: the set's order. */
+  parts: { tmdbId: string; released: string | null }[];
 }
 
 export interface TmdbEpisode {
@@ -186,7 +208,10 @@ export class Tmdb {
         rating: movie.vote_average ?? null,
         status: null,
         posterPath: movie.poster_path ?? null,
-        backdropPath: movie.backdrop_path ?? null
+        backdropPath: movie.backdrop_path ?? null,
+        collection: movie.belongs_to_collection
+          ? { tmdbId: String(movie.belongs_to_collection.id), name: text(movie.belongs_to_collection.name) }
+          : null
       };
     }
     const show = await this.get(`/tv/${encodeURIComponent(tmdbId)}`, { language }, showSchema);
@@ -201,7 +226,21 @@ export class Tmdb {
       rating: show.vote_average ?? null,
       status: text(show.status),
       posterPath: show.poster_path ?? null,
-      backdropPath: show.backdrop_path ?? null
+      backdropPath: show.backdrop_path ?? null,
+      collection: null
+    };
+  }
+
+  /** A collection of films: its words, its art and its parts. */
+  async collection(tmdbId: string, language: string): Promise<TmdbCollection> {
+    const found = await this.get(`/collection/${encodeURIComponent(tmdbId)}`, { language }, collectionSchema);
+    return {
+      tmdbId: String(found.id),
+      name: text(found.name),
+      overview: text(found.overview),
+      posterPath: found.poster_path ?? null,
+      backdropPath: found.backdrop_path ?? null,
+      parts: found.parts.map((part) => ({ tmdbId: String(part.id), released: text(part.release_date) }))
     };
   }
 

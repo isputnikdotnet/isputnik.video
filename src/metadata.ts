@@ -23,6 +23,7 @@ import { z } from "zod";
 import type { Db } from "./db.js";
 import { resolveInside } from "./media.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, type Fetch, type TmdbKind } from "./tmdb.js";
+import { countSets, markSetChecked, rebuildSets, saveSetTmdb, setsDueForTmdb } from "./sets.js";
 
 export type MetaKind = "show" | "movie" | "episode";
 export type ArtKind = "poster" | "backdrop" | "still";
@@ -50,6 +51,9 @@ export interface MetaRow {
   still_path: string | null;
   checked_at: string | null;
   error: string | null;
+  set_tmdb_id: string | null;
+  set_name: string | null;
+  set_checked: number;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -113,16 +117,21 @@ export const metaGenres = (row: MetaRow | undefined): string[] => {
   }
 };
 
-/** Where an item's picture is served, with a version so a new one isn't cached as the old; null for none. */
+/** Where a picture is served, with a version so a new one isn't cached as the old. */
+export function versionedArtUrl(api: string, id: string, kind: ArtKind, source: string): string {
+  const version = crypto.createHash("sha1").update(source).digest("hex").slice(0, 8);
+  return `${api}/art/${id}/${kind}?v=${version}`;
+}
+
+/** Where an item's picture is served; null for none. */
 export function artUrl(api: string, row: MetaRow | undefined, kind: ArtKind): string | null {
   const source = row?.[kind];
   if (!row || !source) return null;
-  const version = crypto.createHash("sha1").update(source).digest("hex").slice(0, 8);
-  return `${api}/art/${row.item_id}/${kind}?v=${version}`;
+  return versionedArtUrl(api, row.item_id, kind, source);
 }
 
 /** The file behind an item's picture: beside the video, or in the art folder. */
-export function artFile(row: MetaRow | undefined, kind: ArtKind, mediaRoot: string, artDir: string): string | null {
+export function artFile(row: Partial<Record<ArtKind, string | null>> | undefined | null, kind: ArtKind, mediaRoot: string, artDir: string): string | null {
   const source = row?.[kind];
   if (!source) return null;
   if (source.startsWith("local:")) return resolveInside(mediaRoot, source.slice(6));
@@ -152,6 +161,8 @@ export interface MetadataSummary {
   failed: number;
   /** Titles with a poster, from beside the files or from TMDB. */
   posters: number;
+  /** Film sets with two or more films (sets.ts), after the pass. */
+  sets: number;
   /** The first failure, for the event. */
   error: string | null;
 }
@@ -187,21 +198,23 @@ function emptyRow(itemId: string, kind: MetaKind): MetaRow {
   return {
     item_id: itemId, kind, tmdb_id: null, locked: 0, tmdb_state: "none", title: null, original_title: null, plot: null,
     year: null, aired: null, genres: "[]", rating: null, status: null, poster: null, backdrop: null, still: null,
-    poster_path: null, backdrop_path: null, still_path: null, checked_at: null, error: null
+    poster_path: null, backdrop_path: null, still_path: null, checked_at: null, error: null,
+    set_tmdb_id: null, set_name: null, set_checked: 0
   };
 }
 
 function saveRow(db: Db, row: MetaRow): void {
   db.prepare(`
     INSERT INTO metadata (item_id, kind, tmdb_id, locked, tmdb_state, title, original_title, plot, year, aired, genres, rating, status,
-      poster, backdrop, still, poster_path, backdrop_path, still_path, checked_at, error)
+      poster, backdrop, still, poster_path, backdrop_path, still_path, checked_at, error, set_tmdb_id, set_name, set_checked)
     VALUES (@item_id, @kind, @tmdb_id, @locked, @tmdb_state, @title, @original_title, @plot, @year, @aired, @genres, @rating, @status,
-      @poster, @backdrop, @still, @poster_path, @backdrop_path, @still_path, @checked_at, @error)
+      @poster, @backdrop, @still, @poster_path, @backdrop_path, @still_path, @checked_at, @error, @set_tmdb_id, @set_name, @set_checked)
     ON CONFLICT (item_id) DO UPDATE SET kind = excluded.kind, tmdb_id = excluded.tmdb_id, locked = excluded.locked,
       tmdb_state = excluded.tmdb_state, title = excluded.title, original_title = excluded.original_title, plot = excluded.plot,
       year = excluded.year, aired = excluded.aired, genres = excluded.genres, rating = excluded.rating, status = excluded.status,
       poster = excluded.poster, backdrop = excluded.backdrop, still = excluded.still, poster_path = excluded.poster_path,
       backdrop_path = excluded.backdrop_path, still_path = excluded.still_path, checked_at = excluded.checked_at, error = excluded.error,
+      set_tmdb_id = excluded.set_tmdb_id, set_name = excluded.set_name, set_checked = excluded.set_checked,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).run(row);
 }
@@ -217,7 +230,8 @@ function due(row: MetaRow | undefined, now: number, force: boolean): boolean {
     case "unmatched":
       return age > RECHECK_UNMATCHED;
     case "matched":
-      return age > RECHECK_MATCHED;
+      // A film matched before sets came in: asked once more for its collection.
+      return age > RECHECK_MATCHED || (row.kind === "movie" && !row.set_checked);
   }
 }
 
@@ -307,10 +321,11 @@ export class MetadataRunner {
           Object.assign(row, {
             tmdb_id: details.tmdbId, tmdb_state: "matched", title: details.title, original_title: details.originalTitle, plot: details.plot,
             year: details.year, aired: details.aired, genres: JSON.stringify(details.genres), rating: details.rating, status: details.status,
-            poster_path: details.posterPath, backdrop_path: details.backdropPath, error: null
+            poster_path: details.posterPath, backdrop_path: details.backdropPath, error: null,
+            set_tmdb_id: details.collection?.tmdbId ?? null, set_name: details.collection?.name ?? null, set_checked: 1
           });
         } else {
-          Object.assign(row, { tmdb_state: "unmatched", error: null });
+          Object.assign(row, { tmdb_state: "unmatched", error: null, set_tmdb_id: null, set_name: null, set_checked: 1 });
         }
       } catch (err) {
         const message = err instanceof TmdbError ? err.message : (err as Error).message;
@@ -365,10 +380,11 @@ export class MetadataRunner {
     const library = db.prepare("SELECT id, kind, folder, language FROM libraries WHERE id = ? AND state = 'active'").get(libraryId) as Library | undefined;
     if (!library) return null;
     const tmdb = this.tmdb();
-    const summary: MetadataSummary = { titles: 0, matched: 0, unmatched: 0, failed: 0, posters: 0, error: null };
+    const summary: MetadataSummary = { titles: 0, matched: 0, unmatched: 0, failed: 0, posters: 0, sets: 0, error: null };
     const titles = library.kind === "shows"
       ? db.prepare("SELECT id, folder, NULL AS file, title, original_title, year, imdb_id, tmdb_id FROM shows WHERE library_id = ? ORDER BY sort_title").all(library.id) as TitleRow[]
       : db.prepare("SELECT id, folder, file, title, original_title, year, imdb_id, tmdb_id FROM movies WHERE library_id = ? ORDER BY sort_title").all(library.id) as TitleRow[];
+    let refused = false;
     for (const title of titles) {
       const episodes = library.kind === "shows"
         ? db.prepare("SELECT id, season, episode, file FROM episodes WHERE show_id = ? ORDER BY season, episode").all(title.id) as EpisodeRow[]
@@ -379,12 +395,60 @@ export class MetadataRunner {
       } catch (err) {
         if (err instanceof TmdbError && err.status === 401) {
           summary.error = "TMDB refused the key; nothing more was asked";
+          refused = true;
           break;
         }
         throw err;
       }
     }
+    if (library.kind === "movies") {
+      try {
+        await this.refreshSets(refused ? null : tmdb, force, summary);
+      } catch (err) {
+        summary.error ??= err instanceof TmdbError && err.status === 401 ? "TMDB refused the key; nothing more was asked" : `Sets: ${(err as Error).message}`;
+      }
+    }
     return summary;
+  }
+
+  /** Every film's set worked out again; then TMDB's words, art and order for the sets that are due. */
+  async refreshSets(tmdb: Tmdb | null, force: boolean, summary?: MetadataSummary): Promise<void> {
+    const { db, artDir } = this.ctx;
+    rebuildSets(db, artDir);
+    if (tmdb) {
+      const now = Date.now();
+      for (const set of setsDueForTmdb(db, now, force)) {
+        const checkedAt = new Date(now).toISOString();
+        try {
+          const found = await tmdb.collection(set.tmdb_id!, set.language);
+          await sleep(PAUSE_MS);
+          const keep = async (kind: "poster" | "backdrop", imagePath: string | null) => {
+            const current = set[kind];
+            if (!imagePath) return null;
+            if (current && set[`${kind}_path`] === imagePath && artFile(set, kind, this.ctx.mediaRoot, artDir)) return current;
+            return this.download(tmdb, imagePath, kind === "poster" ? IMAGE_SIZES.poster : IMAGE_SIZES.backdrop, `${set.id}-${kind}`, current);
+          };
+          saveSetTmdb(db, set.id, {
+            tmdb_name: found.name,
+            tmdb_overview: found.overview,
+            parts: JSON.stringify(found.parts),
+            poster: await keep("poster", found.posterPath),
+            backdrop: await keep("backdrop", found.backdropPath),
+            poster_path: found.posterPath,
+            backdrop_path: found.backdropPath,
+            checked_at: checkedAt
+          });
+        } catch (err) {
+          if (err instanceof TmdbError && err.status === 401) throw err;
+          markSetChecked(db, set.id, checkedAt);
+          if (summary) summary.error ??= `${set.name}: ${(err as Error).message}`;
+          this.ctx.log.warn({ err, set: set.id }, "TMDB collection lookup failed");
+        }
+      }
+      // TMDB's names and release dates in place: once more, so they show.
+      rebuildSets(db, artDir);
+    }
+    if (summary) summary.sets = countSets(db);
   }
 
   /** One show or movie, asked of TMDB again at once (after a match fixed by hand). */
@@ -396,8 +460,10 @@ export class MetadataRunner {
     if (!title) return false;
     const library = db.prepare("SELECT id, kind, folder, language FROM libraries WHERE id = ?").get(title.library_id) as Library;
     const episodes = show ? db.prepare("SELECT id, season, episode, file FROM episodes WHERE show_id = ? ORDER BY season, episode").all(itemId) as EpisodeRow[] : [];
-    const summary: MetadataSummary = { titles: 1, matched: 0, unmatched: 0, failed: 0, posters: 0, error: null };
-    await this.refreshTitle(this.tmdb(), library, { ...title, file: title.file ?? undefined }, episodes, true, summary);
+    const summary: MetadataSummary = { titles: 1, matched: 0, unmatched: 0, failed: 0, posters: 0, sets: 0, error: null };
+    const tmdb = this.tmdb();
+    await this.refreshTitle(tmdb, library, { ...title, file: title.file ?? undefined }, episodes, true, summary);
+    if (movie) await this.refreshSets(tmdb, false);
     return true;
   }
 }

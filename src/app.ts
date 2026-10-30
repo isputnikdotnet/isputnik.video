@@ -27,6 +27,7 @@ import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, p
 import type { LogBuffer } from "./log-buffer.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
+import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -106,6 +107,13 @@ const listQuerySchema = z.object({
 });
 
 const itemIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+
+const setListQuerySchema = z.object({
+  library: libraryIdSchema.optional(),
+  q: z.string().max(200).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(200).default(60)
+});
 
 const progressBodySchema = z.object({
   position: z.number().min(0).max(1e6),
@@ -244,6 +252,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     purgeOrphanProgress(db);
     purgeOrphanProbes(db);
     purgeOrphanMetadata(db, artDir);
+    rebuildSets(db, artDir);
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -324,6 +333,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       await new Promise((resolve) => setImmediate(resolve));
       try {
         const summary = scanLibrary(db, options.mediaRoot, libraryId, options.scan);
+        // Sets the .nfo files name show at once; TMDB's follow with the metadata pass.
+        rebuildSets(db, artDir);
         setScanState(db, libraryId, "idle");
         const growing = summary.growing > 0 ? `, ${summary.growing} file(s) still being copied left for later` : "";
         const unnumbered = summary.unnumbered > 0 ? `, ${summary.unnumbered} file(s) without a season and episode in the name` : "";
@@ -354,7 +365,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         const asked = readTmdbKey(db) ? `; TMDB: ${summary.matched} matched, ${summary.unmatched} not found, ${summary.failed} failed` : "; no TMDB key";
         note(request, summary.error ? "warn" : "info", "metadata.finished", {
           libraryId,
-          detail: `${summary.titles} title(s), ${summary.posters} with a poster${asked}${summary.error ? ` — ${summary.error}` : ""}`
+          detail: `${summary.titles} title(s), ${summary.posters} with a poster${summary.sets > 0 ? `, ${summary.sets} set(s)` : ""}${asked}${summary.error ? ` — ${summary.error}` : ""}`
         });
       } catch (err) {
         note(request, "error", "metadata.failed", { libraryId, detail: (err as Error).message });
@@ -399,6 +410,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return movie ?? reply.code(404).send({ error: "No such movie" });
   });
 
+  // Film sets (sets.ts): those the person sees two or more films of, and one set in order.
+  app.get(`${API}/sets`, { preHandler: requireIdentity }, async (request) => listSets(db, request.identity!, setListQuerySchema.parse(request.query ?? {})));
+
+  app.get(`${API}/sets/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const set = getSet(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
+    return set ?? reply.code(404).send({ error: "No such set" });
+  });
+
   // ── Watching ─────────────────────────────────────────────────────────────
 
   // What home's player needs to start: the item, how it plays (with the sound
@@ -410,7 +429,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!item) return reply.code(404).send({ error: "Not found" });
     const file = fileOf(options.mediaRoot, item);
     const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
-    const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : null;
+    // After an episode the next one; after a film the next of its set.
+    const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextInSet(db, identity, item.id);
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
@@ -457,7 +477,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       subtitleTracks,
       progress,
       resumeAt: resumeAt(progress),
-      next: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title } : null
+      next: next ? { id: next.id, season: "season" in next ? next.season : null, episode: "episode" in next ? next.episode : null, title: next.title } : null
     };
   });
 
@@ -587,8 +607,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       UNION ALL SELECT s.library_id FROM episodes e JOIN shows s ON s.id = e.show_id WHERE e.id = @id
     `).get({ id: itemId }) as { library_id: string } | undefined;
     const library = owner ? getLibrary(db, owner.library_id) : null;
-    if (!artKind.success || !library || library.state !== "active" || !canSee(request.identity!, library.id)) return reply.code(404).send({ error: "Not found" });
-    const file = artFile(metaFor(db, [itemId]).get(itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
+    // Not a title: a set's own picture, for someone who sees one of its films.
+    const set = owner ? null : setArtRow(db, request.identity!, itemId);
+    if (!artKind.success || (!set && (!library || library.state !== "active" || !canSee(request.identity!, library.id)))) return reply.code(404).send({ error: "Not found" });
+    const file = artFile(set ?? metaFor(db, [itemId]).get(itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
     if (!file) return reply.code(404).send({ error: "Not found" });
     const type = ART_TYPES[path.extname(file).toLowerCase()];
     if (!type) return reply.code(404).send({ error: "Not found" });

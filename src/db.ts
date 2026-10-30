@@ -14,8 +14,29 @@ export function openDatabase(file: string): Database.Database {
   const db = new Database(file);
   db.pragma("foreign_keys = ON");
   if (file !== ":memory:") db.pragma("journal_mode = WAL");
+  addColumns(db);
   db.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
   return db;
+}
+
+/** Columns added after a table was first made: added to an older file before
+ *  the schema runs (a new file gets them from schema.sql itself). */
+const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
+  ["movies", "set_name", "TEXT"],
+  ["movies", "set_overview", "TEXT"],
+  ["movies", "set_tmdb_id", "TEXT"],
+  ["metadata", "set_tmdb_id", "TEXT"],
+  ["metadata", "set_name", "TEXT"],
+  ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"]
+];
+
+function addColumns(db: Database.Database): void {
+  for (const [table, column, definition] of ADDED_COLUMNS) {
+    const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[];
+    // No table yet: schema.sql makes it whole.
+    if (columns.length === 0 || columns.some((row) => row.name === column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 export type Db = Database.Database;

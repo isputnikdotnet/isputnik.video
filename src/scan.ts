@@ -216,12 +216,13 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
 
   const findMovie = db.prepare("SELECT id FROM movies WHERE library_id = ? AND folder = ?");
   const upsertMovie = db.prepare(`
-    INSERT INTO movies (id, library_id, folder, file, title, sort_title, original_title, year, plot, genres, imdb_id, tmdb_id, runtime_minutes, source, size_bytes, modified_at)
-    VALUES (@id, @library, @folder, @file, @title, @sortTitle, @originalTitle, @year, @plot, @genres, @imdbId, @tmdbId, @runtime, @source, @size, @modifiedAt)
+    INSERT INTO movies (id, library_id, folder, file, title, sort_title, original_title, year, plot, genres, imdb_id, tmdb_id, runtime_minutes, set_name, set_overview, set_tmdb_id, source, size_bytes, modified_at)
+    VALUES (@id, @library, @folder, @file, @title, @sortTitle, @originalTitle, @year, @plot, @genres, @imdbId, @tmdbId, @runtime, @setName, @setOverview, @setTmdbId, @source, @size, @modifiedAt)
     ON CONFLICT (library_id, folder) DO UPDATE SET
       file = excluded.file, title = excluded.title, sort_title = excluded.sort_title, original_title = excluded.original_title,
       year = excluded.year, plot = excluded.plot, genres = excluded.genres, imdb_id = excluded.imdb_id, tmdb_id = excluded.tmdb_id,
-      runtime_minutes = excluded.runtime_minutes, source = excluded.source, size_bytes = excluded.size_bytes,
+      runtime_minutes = excluded.runtime_minutes, set_name = excluded.set_name, set_overview = excluded.set_overview,
+      set_tmdb_id = excluded.set_tmdb_id, source = excluded.source, size_bytes = excluded.size_bytes,
       modified_at = excluded.modified_at, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `);
 
@@ -271,6 +272,9 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
         imdbId: nfo?.imdbId ?? named.imdbId,
         tmdbId: nfo?.tmdbId ?? named.tmdbId,
         runtime: nfo?.runtimeMinutes ?? null,
+        setName: nfo?.set?.name ?? null,
+        setOverview: nfo?.set?.overview ?? null,
+        setTmdbId: nfo?.set?.tmdbId ?? null,
         source: nfo ? "nfo" : "folder",
         size: main.size,
         modifiedAt: main.modifiedAt

@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS movies (
   imdb_id       TEXT,
   tmdb_id       TEXT,
   runtime_minutes INTEGER,
+  -- The set the .nfo puts it in (<set>), if any; sets.ts groups by it.
+  set_name      TEXT,
+  set_overview  TEXT,
+  set_tmdb_id   TEXT,
   source        TEXT NOT NULL DEFAULT 'folder' CHECK (source IN ('folder', 'nfo')),
   size_bytes    INTEGER NOT NULL DEFAULT 0,
   modified_at   TEXT,
@@ -162,5 +166,41 @@ CREATE TABLE IF NOT EXISTS metadata (
   still_path     TEXT,
   checked_at     TEXT,
   error          TEXT,
+  -- A film's TMDB collection (belongs_to_collection); set_checked is 0 until
+  -- TMDB has been asked since sets came in, so older matches are asked again.
+  set_tmdb_id    TEXT,
+  set_name       TEXT,
+  set_checked    INTEGER NOT NULL DEFAULT 0,
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Films that belong together (sets.ts): a TMDB collection, or a name the
+-- .nfo files share. Rebuilt from movies + metadata after every scan and
+-- metadata pass, so it never drifts from them; ids stay while the set has films.
+CREATE TABLE IF NOT EXISTS sets (
+  id             TEXT PRIMARY KEY,
+  tmdb_id        TEXT UNIQUE,
+  name_key       TEXT UNIQUE,
+  name           TEXT NOT NULL,
+  sort_name      TEXT NOT NULL,
+  overview       TEXT,
+  -- TMDB's words and art for the collection, and its parts' release dates.
+  tmdb_name      TEXT,
+  tmdb_overview  TEXT,
+  parts          TEXT NOT NULL DEFAULT '[]',
+  poster         TEXT,
+  backdrop       TEXT,
+  poster_path    TEXT,
+  backdrop_path  TEXT,
+  checked_at     TEXT,
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Which set each film is in: one at most. 'released' orders the set.
+CREATE TABLE IF NOT EXISTS set_members (
+  movie_id   TEXT PRIMARY KEY,
+  set_id     TEXT NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+  source     TEXT NOT NULL CHECK (source IN ('nfo', 'tmdb')),
+  released   TEXT
+);
+CREATE INDEX IF NOT EXISTS set_members_set ON set_members (set_id);
