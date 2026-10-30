@@ -7,13 +7,14 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.9.1, alpha. Catalog, library sync and playback work, with each
+Status: 0.10.0, alpha. Catalog, library sync and playback work, with each
 person's progress (resume, next episode, Continue watching). A file a browser
 plays as it is goes as it is; the rest are converted to HLS as they play — the
 sound to AAC, the picture to H.264 only when a browser can't show it.
 A film with several sound tracks plays the one chosen; subtitles inside it or
 beside it are offered too (text as WebVTT, images burned in). Posters come
-from beside the files, and from TMDB with the admin's key.
+from beside the files, and from TMDB with the admin's key; films that belong
+together are grouped into sets, from the .nfo files or TMDB's collections.
 
 ## The contract, from this side
 
