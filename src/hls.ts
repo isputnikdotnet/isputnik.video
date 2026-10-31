@@ -131,6 +131,11 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
   if (delivery.audio) {
     if (delivery.audioCopy) args.push("-c:a", "copy");
     else args.push("-c:a", "aac", "-ac", "2", "-b:a", "192k");
+    // Copied sound would start at the keyframe before the seek, seconds ahead of the
+    // re-encoded picture. A player that sets its clock from a segment's first packet
+    // (Media3, the TV app) would then show the whole film that far behind. A picture
+    // that is copied too has to keep its keyframe, and starts on the cut anyway.
+    if (delivery.audioCopy && !delivery.videoCopy) args.push("-copypriorss", "0");
   }
 
   // The segment muxer's split points count from the run's first timestamp; a

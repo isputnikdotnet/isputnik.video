@@ -82,6 +82,17 @@ describe("the cuts and the playlist", () => {
     expect(text.trim().endsWith("#EXT-X-ENDLIST")).toBe(true);
   });
 
+  it("keeps copied sound from starting before a re-encoded picture, and leaves a copied picture its keyframe", () => {
+    const reencoded = buildPlan("m1", "/media/film.mkv", info({ duration: 30, vcodec: "hevc", acodec: "aac" }), decideDelivery(info({ vcodec: "hevc", acodec: "aac" }), ".mkv"), null);
+    expect(ffmpegArgs(reencoded, 2, "/tmp/s")).toEqual(expect.arrayContaining(["-c:a", "copy", "-copypriorss", "0"]));
+
+    const copied = buildPlan("m1", "/media/film.mkv", info({ duration: 30, acodec: "aac" }), decideDelivery(info({ acodec: "aac" }), ".mkv"), [0, 6, 12, 18, 24]);
+    expect(ffmpegArgs(copied, 2, "/tmp/s")).not.toContain("-copypriorss");
+
+    const converted = buildPlan("m1", "/media/film.mkv", info({ duration: 30, vcodec: "hevc", acodec: "ac3" }), decideDelivery(info({ vcodec: "hevc", acodec: "ac3" }), ".mkv"), null);
+    expect(ffmpegArgs(converted, 2, "/tmp/s")).not.toContain("-copypriorss");
+  });
+
   it("starts a later run just past its keyframe and splits relative to it", () => {
     const plan = buildPlan("m1", "/media/film.mkv", info({ duration: 30 }), decideDelivery(info({ acodec: "ac3" }), ".mkv"), [0, 6, 12, 18, 24]);
     const args = ffmpegArgs(plan, 2, "/tmp/s");
