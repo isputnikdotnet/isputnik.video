@@ -203,11 +203,13 @@ export function saveProgress(
   db: Db,
   userId: string,
   item: Pick<PlayableItem, "id" | "type">,
-  input: { position: number; duration: number | null; watched?: boolean }
+  input: { position: number; duration: number | null; watched?: boolean },
+  /** Where the credits start, when the file says: watched from there, not at 92 %. */
+  creditsAt: number | null = null
 ): Progress {
   const duration = input.duration && input.duration > 0 ? input.duration : null;
   const position = Math.max(0, duration ? Math.min(input.position, duration) : input.position);
-  const watched = input.watched ?? (duration !== null && position >= duration * WATCHED_FRACTION);
+  const watched = input.watched ?? (creditsAt !== null ? position >= creditsAt : duration !== null && position >= duration * WATCHED_FRACTION);
   db.prepare(`
     INSERT INTO progress (user_id, item_id, item_type, position_s, duration_s, watched, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))

@@ -12,6 +12,7 @@ import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, pr
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
+import { NO_MARKERS, findMarkers } from "./markers.js";
 import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -444,12 +445,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextInSet(db, identity, item.id);
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
+    let markers = NO_MARKERS;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
     let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null } =
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
+      markers = findMarkers(probed, file.absolute);
       const tracks = probed ? listSubtitles(probed, file.absolute) : [];
       const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
       subtitleTracks = tracks.map((track) => ({
@@ -486,6 +489,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       playback,
       audioTracks,
       subtitleTracks,
+      markers,
       progress,
       resumeAt: resumeAt(progress),
       next: next ? { id: next.id, season: "season" in next ? next.season : null, episode: "episode" in next ? next.episode : null, title: next.title } : null
@@ -667,13 +671,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     trackSegment
   });
 
+  /** Where a title's credits start, when the file says; not asked when the player
+   *  already knows it is watched. */
+  const creditsAt = async (item: PlayableItem, watched: boolean | undefined): Promise<number | null> => {
+    const file = watched === undefined ? fileOf(options.mediaRoot, item) : null;
+    if (!file || !mediaProbe || !(await toolsReady)) return null;
+    const info = await mediaProbe.info(item.id, file).catch(() => null);
+    return findMarkers(info, file.absolute).credits?.start ?? null;
+  };
+
   // How far the person got; the player sends it every few seconds and on pause.
   app.put(`${API}/progress/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const identity = request.identity!;
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
     if (!item) return reply.code(404).send({ error: "Not found" });
     const body = progressBodySchema.parse(request.body);
-    return { progress: saveProgress(db, identity.id, item, body) };
+    return { progress: saveProgress(db, identity.id, item, body, await creditsAt(item, body.watched)) };
   });
 
   app.get(`${API}/continue`, { preHandler: requireIdentity }, async (request) => {

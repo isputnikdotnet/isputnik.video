@@ -80,6 +80,12 @@ export interface SubtitleStream {
   height: number;
 }
 
+export interface MediaChapter {
+  start: number;
+  end: number;
+  title: string | null;
+}
+
 export interface MediaInfo {
   /** ffprobe's format names, e.g. "matroska,webm" or "mov,mp4,m4a,3gp,3g2,mj2". */
   container: string;
@@ -89,6 +95,8 @@ export interface MediaInfo {
   video: VideoStream | null;
   audio: AudioStream[];
   subtitles: SubtitleStream[];
+  /** On the file's clock, as `start` is. */
+  chapters: MediaChapter[];
 }
 
 interface ProbeStream {
@@ -107,8 +115,8 @@ interface ProbeStream {
 
 /** The file's streams and length; reads only its header. */
 export async function probe(tools: Tools, file: string): Promise<MediaInfo> {
-  const out = await run(tools.ffprobe, ["-v", "error", "-show_format", "-show_streams", "-of", "json", file], 60_000);
-  const parsed = JSON.parse(out) as { format?: { format_name?: string; duration?: string; start_time?: string }; streams?: ProbeStream[] };
+  const out = await run(tools.ffprobe, ["-v", "error", "-show_format", "-show_streams", "-show_chapters", "-of", "json", file], 60_000);
+  const parsed = JSON.parse(out) as { format?: { format_name?: string; duration?: string; start_time?: string }; streams?: ProbeStream[]; chapters?: { start_time?: string; end_time?: string; tags?: Record<string, string> }[] };
   const streams = parsed.streams ?? [];
   // A cover picture is a "video" stream too; the film is the first real one.
   const video = streams.find((stream) => stream.codec_type === "video" && !stream.disposition?.attached_pic);
@@ -143,7 +151,10 @@ export async function probe(tools: Tools, file: string): Promise<MediaInfo> {
       forced: stream.disposition?.forced === 1,
       width: stream.width ?? 0,
       height: stream.height ?? 0
-    }))
+    })),
+    chapters: (parsed.chapters ?? [])
+      .map((chapter) => ({ start: Number(chapter.start_time), end: Number(chapter.end_time), title: chapter.tags?.title?.trim() || null }))
+      .filter((chapter) => Number.isFinite(chapter.start) && Number.isFinite(chapter.end))
   };
 }
 
