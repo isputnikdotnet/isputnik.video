@@ -486,7 +486,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       runtimeMinutes: item.runtimeMinutes,
       available: Boolean(file),
       sizeBytes: file?.size ?? null,
-      playback,
+      // `original` is for a player that decides for itself what its device decodes
+      // (home's TV app): it tries the file as it is, and `url` is its way out.
+      playback: { ...playback, original: file ? stream : null },
       audioTracks,
       subtitleTracks,
       markers,

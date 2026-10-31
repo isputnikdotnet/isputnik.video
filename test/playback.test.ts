@@ -48,6 +48,12 @@ afterEach(async () => {
 const episode = (n: number) => radar.seasons[0].episodes[n - 1];
 
 describe("the stream", () => {
+  it("names the file as it is, for a player that decides for itself", async () => {
+    const id = episode(2).id;
+    const play = (await get(`/video/api/play/${id}`, as("mum"))).json();
+    expect(play.playback.original).toBe(`/video/api/stream/${id}`);
+  });
+
   it("sends the whole file, or the byte range asked for", async () => {
     const id = episode(2).id;
     const whole = await get(`/video/api/stream/${id}`, as("mum"));
