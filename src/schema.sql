@@ -65,7 +65,9 @@ CREATE INDEX IF NOT EXISTS episodes_order ON episodes (show_id, season, episode)
 CREATE TABLE IF NOT EXISTS movies (
   id            TEXT PRIMARY KEY,
   library_id    TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
-  -- Relative to the library folder: the movie's folder, or the loose file itself.
+  -- Relative to the library folder: the movie's folder, or the file itself when
+  -- the film has no folder to itself (a loose file, a film of a folder of films).
+  -- `file` is then the same path; otherwise it is relative to `folder`.
   folder        TEXT NOT NULL,
   file          TEXT NOT NULL,
   title         TEXT NOT NULL,
@@ -77,16 +79,35 @@ CREATE TABLE IF NOT EXISTS movies (
   imdb_id       TEXT,
   tmdb_id       TEXT,
   runtime_minutes INTEGER,
-  -- The set the .nfo puts it in (<set>), if any; sets.ts groups by it.
+  -- The set the .nfo puts it in (<set>), else the folder of films it sits in;
+  -- sets.ts groups by it.
   set_name      TEXT,
   set_overview  TEXT,
   set_tmdb_id   TEXT,
+  -- Where its file's name puts it in the set ("… part-3"), if it says.
+  set_order     INTEGER,
   source        TEXT NOT NULL DEFAULT 'folder' CHECK (source IN ('folder', 'nfo')),
+  -- Of all its parts, when the film is in several files.
   size_bytes    INTEGER NOT NULL DEFAULT 0,
   modified_at   TEXT,
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (library_id, folder)
 );
+
+-- The second part of a film in several files, and those after it. movies.file
+-- and movies.id are the first part. A part plays and keeps its place like any
+-- film, by its own id.
+CREATE TABLE IF NOT EXISTS movie_parts (
+  id          TEXT PRIMARY KEY,
+  movie_id    TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+  part        INTEGER NOT NULL,
+  -- From the same place as movies.file.
+  file        TEXT NOT NULL,
+  size_bytes  INTEGER NOT NULL DEFAULT 0,
+  modified_at TEXT,
+  UNIQUE (movie_id, file)
+);
+CREATE INDEX IF NOT EXISTS movie_parts_order ON movie_parts (movie_id, part);
 
 -- How far each person got: one row per person and episode or movie. Ids stay
 -- the same across rescans, so a rescan keeps everyone's place; the daily sweep

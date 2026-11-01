@@ -296,9 +296,9 @@ export class MetadataRunner {
     const existing = metaFor(db, [title.id, ...episodes.map((episode) => episode.id)]);
     const row: MetaRow = { ...(existing.get(title.id) ?? emptyRow(title.id, kind)), kind };
 
-    // Beside the files: the title's own folder; a loose film, its own name in the library folder.
+    // Beside the files: the title's own folder; a film without one, its own name in the folder it sits in.
     const loose = kind === "movie" && title.folder === title.file;
-    const dir = loose ? library.folder : posix(library.folder, title.folder);
+    const dir = loose ? path.posix.dirname(posix(library.folder, title.folder)) : posix(library.folder, title.folder);
     const stem = title.file ? path.basename(title.file, path.extname(title.file)) : null;
     const ownNames = (suffixes: string[]) => (stem ? suffixes.map((suffix) => `${stem}-${suffix}`) : []);
     const localPoster = findImage(mediaRoot, dir, loose ? [...ownNames(["poster"]), stem!] : [...ownNames(["poster"]), ...POSTER_NAMES]);

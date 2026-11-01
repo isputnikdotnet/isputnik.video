@@ -99,9 +99,55 @@ export interface PlayableItem {
   show: { id: string; title: string } | null;
   season: number | null;
   episode: number | null;
+  /** A film in several files: the film, and which of its parts this is. */
+  movieId: string | null;
+  part: number | null;
   /** Relative to the media root. */
   relative: string;
 }
+
+export interface MoviePart {
+  id: string;
+  part: number;
+  file: string;
+}
+
+/** Every part of a film, first to last; one entry, the film's own, when it is in one file. */
+export function partsOfMovie(db: Db, movie: { id: string; file: string }): MoviePart[] {
+  const later = db.prepare("SELECT id, part, file FROM movie_parts WHERE movie_id = ? ORDER BY part").all(movie.id) as MoviePart[];
+  return [{ id: movie.id, part: 1, file: movie.file }, ...later];
+}
+
+/** The film an id stands for: the film's own, or the film one of its parts belongs to. */
+export function movieIdOf(db: Db, id: string): string {
+  return (db.prepare("SELECT movie_id FROM movie_parts WHERE id = ?").get(id) as { movie_id: string } | undefined)?.movie_id ?? id;
+}
+
+/** Where a person is in a film of several parts: the part they were in last, else
+ *  the one after the last they finished, else the first. Once they have finished
+ *  the last part, the film is watched and starts again from the first. */
+export function placeInFilm(db: Db, userId: string, parts: MoviePart[]): { id: string; progress: Progress | null; watched: boolean } {
+  const progress = progressFor(db, userId, parts.map((part) => part.id));
+  const latest = parts
+    .map((part, at) => ({ at, seen: progress.get(part.id) }))
+    .filter((entry) => entry.seen)
+    .sort((a, b) => b.seen!.updatedAt.localeCompare(a.seen!.updatedAt))[0];
+  const at = !latest ? 0 : latest.seen!.watched ? latest.at + 1 : latest.at;
+  if (at >= parts.length) return { id: parts[0].id, progress: progress.get(parts[parts.length - 1].id) ?? null, watched: true };
+  return { id: parts[at].id, progress: progress.get(parts[at].id) ?? null, watched: false };
+}
+
+/** The part after this one, or null after the last or for a film in one file. */
+export function nextPart(db: Db, item: PlayableItem): { id: string; title: string } | null {
+  if (!item.movieId) return null;
+  const parts = db.prepare("SELECT id, part FROM movie_parts WHERE movie_id = ? ORDER BY part").all(item.movieId) as { id: string; part: number }[];
+  const next = parts.find((part) => part.part > (item.part ?? 1));
+  if (!next) return null;
+  const film = db.prepare("SELECT title FROM movies WHERE id = ?").get(item.movieId) as { title: string };
+  return { id: next.id, title: partTitle(film.title, next.part, parts.length + 1) };
+}
+
+const partTitle = (title: string, part: number, total: number) => `${title} (${part}/${total})`;
 
 /** An episode or movie this person may see, by id; null when it is not there for them. */
 export function findItem(db: Db, identity: Identity, id: string): PlayableItem | null {
@@ -125,28 +171,36 @@ export function findItem(db: Db, identity: Identity, id: string): PlayableItem |
       show: { id: episode.show_id as string, title: episode.show_title as string },
       season,
       episode: number,
+      movieId: null,
+      part: null,
       relative: `${episode.library_folder}/${episode.show_folder}/${episode.file}`
     };
   }
+  const movieId = movieIdOf(db, id);
   const movie = db.prepare(`
     SELECT m.id, m.title, m.folder, m.file, m.runtime_minutes, l.id AS library_id, l.folder AS library_folder
     FROM movies m JOIN libraries l ON l.id = m.library_id
     WHERE m.id = ? AND l.state = 'active'
-  `).get(id) as Record<string, unknown> | undefined;
+  `).get(movieId) as Record<string, unknown> | undefined;
   if (!movie || !canSee(identity, movie.library_id as string)) return null;
-  // A film in a folder of its own is folder/file; a loose one is the folder itself.
+  // A film in a folder of its own is folder/file; any other is the folder itself.
   const folder = movie.folder as string;
-  const file = movie.file as string;
+  const parts = partsOfMovie(db, { id: movieId, file: movie.file as string });
+  const part = parts.find((candidate) => candidate.id === id);
+  if (!part) return null;
   return {
-    id: movie.id as string,
+    id,
     type: "movie",
     libraryId: movie.library_id as string,
-    title: movie.title as string,
-    runtimeMinutes: (movie.runtime_minutes as number | null) ?? null,
+    title: parts.length > 1 ? partTitle(movie.title as string, part.part, parts.length) : movie.title as string,
+    // An .nfo's runtime is the whole film's.
+    runtimeMinutes: parts.length > 1 ? null : (movie.runtime_minutes as number | null) ?? null,
     show: null,
     season: null,
     episode: null,
-    relative: folder === file ? `${movie.library_folder}/${file}` : `${movie.library_folder}/${folder}/${file}`
+    movieId: parts.length > 1 ? movieId : null,
+    part: parts.length > 1 ? part.part : null,
+    relative: folder === movie.file ? `${movie.library_folder}/${part.file}` : `${movie.library_folder}/${folder}/${part.file}`
   };
 }
 
@@ -227,7 +281,7 @@ export function purgeOrphanProgress(db: Db): number {
   return db.prepare(`
     DELETE FROM progress WHERE
       (item_type = 'episode' AND item_id NOT IN (SELECT id FROM episodes)) OR
-      (item_type = 'movie' AND item_id NOT IN (SELECT id FROM movies))
+      (item_type = 'movie' AND item_id NOT IN (SELECT id FROM movies) AND item_id NOT IN (SELECT id FROM movie_parts))
   `).run().changes;
 }
 
@@ -255,12 +309,26 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
   const rows = db.prepare("SELECT * FROM progress WHERE user_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 400").all(identity.id) as ProgressRow[];
   const out: ContinueItem[] = [];
   const shows = new Set<string>();
+  const films = new Set<string>();
   for (const row of rows) {
     if (out.length >= limit) break;
     const item = findItem(db, identity, row.item_id);
     if (!item) continue;
     const progress = toProgress(row);
     if (item.type === "movie") {
+      // A film in parts counts once, and a finished part leads to the next.
+      if (item.movieId) {
+        if (films.has(item.movieId)) continue;
+        films.add(item.movieId);
+        const next = progress.watched ? nextPart(db, item) : null;
+        const nextItem = next ? findItem(db, identity, next.id) : null;
+        if (nextItem) {
+          const nextProgress = progressFor(db, identity.id, [nextItem.id]).get(nextItem.id);
+          const position = resumeAt(nextProgress);
+          out.push({ ...entryOf(nextItem), position, duration: nextProgress?.duration ?? null, resume: position > 0, updatedAt: progress.updatedAt });
+          continue;
+        }
+      }
       if (progress.watched || progress.position < RESUME_MIN_S) continue;
       out.push({ ...entryOf(item), position: progress.position, duration: progress.duration, resume: true, updatedAt: progress.updatedAt });
       continue;

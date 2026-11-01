@@ -1,6 +1,6 @@
 // What folder and file names say (names.ts), tidy and as downloads arrive.
 import { describe, expect, it } from "vitest";
-import { episodeFromFile, episodeTitleFromFile, parseFolderName, seasonFromFolder, sortTitle } from "../src/names.js";
+import { episodeFromFile, episodeTitleFromFile, isExtraFile, isPartFolder, parseFolderName, partFromName, seasonFromFolder, sortTitle } from "../src/names.js";
 
 describe("parseFolderName", () => {
   it("reads the tidy layout, with an id tag", () => {
@@ -17,6 +17,38 @@ describe("parseFolderName", () => {
 
   it("keeps a title that is only a year", () => {
     expect(parseFolderName("1917 (2019)")).toMatchObject({ title: "1917", year: 2019 });
+  });
+});
+
+describe("parts of a film", () => {
+  it("reads the part from the usual shapes, and what it is a part of", () => {
+    expect(partFromName("Voditel avtobusa part1_HQ")).toMatchObject({ title: "Voditel avtobusa", part: 1 });
+    expect(partFromName("Angélique, Marquise des Anges part-1")).toMatchObject({ title: "Angélique, Marquise des Anges", part: 1 });
+    expect(partFromName("Some.Film.2010.CD2.x264")).toMatchObject({ title: "Some Film", year: 2010, part: 2 });
+    expect(partFromName("Семнадцать мгновений, 2 серия")).toMatchObject({ title: "Семнадцать мгновений", part: 2 });
+    expect(partFromName("Служебный роман ч.2")).toMatchObject({ title: "Служебный роман", part: 2 });
+    expect(partFromName("Film part 2 (1975)")).toMatchObject({ title: "Film", year: 1975, part: 2 });
+  });
+
+  it("leaves other numbers alone", () => {
+    expect(partFromName("Rocky 2")).toBeNull();
+    expect(partFromName("Apart 2")).toBeNull();
+    expect(partFromName("Blade Runner 2049")).toBeNull();
+  });
+
+  it("knows a folder that only names a part", () => {
+    expect(isPartFolder("CD1")).toBe(true);
+    expect(isPartFolder("Часть 2")).toBe(true);
+    expect(isPartFolder("Film part 2")).toBe(false);
+  });
+
+  it("knows what goes with a film rather than being one", () => {
+    expect(isExtraFile("trailer.mkv")).toBe(true);
+    expect(isExtraFile("Some Film-trailer.mkv")).toBe(true);
+    expect(isExtraFile("Extras/Interview with the director.mkv")).toBe(true);
+    expect(isExtraFile("Some Film-behindthescenes.mkv")).toBe(true);
+    expect(isExtraFile("The Extra.mkv")).toBe(false);
+    expect(isExtraFile("Angelique and the King part-3.m4v")).toBe(false);
   });
 });
 

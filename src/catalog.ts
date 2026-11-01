@@ -3,7 +3,7 @@
 // home worked it out). Home's screens draw it; this answers in plain JSON.
 import type { Db } from "./db.js";
 import { canSee, type Identity } from "./identity.js";
-import { browserPlayability, nextUp, progressFor, resumeAt } from "./playback.js";
+import { browserPlayability, movieIdOf, nextUp, partsOfMovie, placeInFilm, progressFor, resumeAt } from "./playback.js";
 import { BASE_PATH } from "./config.js";
 import { artUrl, metaFor, metaGenres, type MetaRow } from "./metadata.js";
 import { setOfMovie } from "./sets.js";
@@ -182,13 +182,18 @@ export function getShow(db: Db, identity: Identity, id: string) {
   };
 }
 
-export function getMovie(db: Db, identity: Identity, id: string) {
+/** A film, asked for by its own id or by a part's (the player's way back). */
+export function getMovie(db: Db, identity: Identity, askedId: string) {
+  const id = movieIdOf(db, askedId);
   const movie = db.prepare(`
     SELECT m.* FROM movies m JOIN libraries l ON l.id = m.library_id
     WHERE m.id = ? AND l.state = 'active'
   `).get(id) as Record<string, unknown> | undefined;
   if (!movie || !canSee(identity, movie.library_id as string)) return null;
   const meta = metaFor(db, [id]).get(id);
+  const parts = partsOfMovie(db, { id, file: movie.file as string });
+  const place = placeInFilm(db, identity.id, parts);
+  const partProgress = progressFor(db, identity.id, parts.map((part) => part.id));
   return {
     id: movie.id as string,
     libraryId: movie.library_id as string,
@@ -205,7 +210,16 @@ export function getMovie(db: Db, identity: Identity, id: string) {
     backdrop: artUrl(API, meta, "backdrop"),
     ...matchOf(meta),
     direct: browserPlayability(movie.file as string).direct,
-    progress: progressFor(db, identity.id, [movie.id as string]).get(movie.id as string) ?? null,
+    /** What Play starts: the film, or the part this person has got to. */
+    playId: place.id,
+    progress: place.progress && { ...place.progress, watched: place.watched },
+    /** Its files, when it is in several; empty when it is in one. */
+    parts: parts.length < 2 ? [] : parts.map((part) => ({
+      id: part.id,
+      part: part.part,
+      direct: browserPlayability(part.file).direct,
+      progress: partProgress.get(part.id) ?? null
+    })),
     /** The set it is in, with the films of it this person may see. */
     set: setOfMovie(db, identity, movie.id as string)
   };

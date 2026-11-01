@@ -41,6 +41,45 @@ export function parseFolderName(raw: string): NameFacts {
   return { title, year: year && year >= 1880 && year <= 2100 ? year : null, imdbId: imdb?.[1] ?? null, tmdbId: tmdb?.[1] ?? null };
 }
 
+export interface PartFacts extends NameFacts {
+  part: number;
+}
+
+const PART_START = String.raw`(?:^|[\s._\-(\[,])`;
+const PART_END = String.raw`(?=$|[\s._\-)\],])`;
+/** "part 2", "part-2", "part2_HQ", "pt.2", "CD2", "disc 2", "часть 2", "серия 2", "ч.2". */
+const PART_WORD_FIRST = new RegExp(`${PART_START}(?:part|pt|cd|dvd|dis[ck]|часть|серия|ч)[\\s._-]*(\\d{1,2})${PART_END}`, "i");
+/** "2 часть", "2-я серия". */
+const PART_NUMBER_FIRST = new RegExp(`${PART_START}(\\d{1,2})(?:-?я)?[\\s._-]*(?:часть|серия)${PART_END}`, "i");
+
+/** The part a name says it is, with the name of what it is a part of: what comes
+ *  before the part's number, because what comes after is usually a quality tag. */
+export function partFromName(raw: string): PartFacts | null {
+  const found = PART_WORD_FIRST.exec(raw) ?? PART_NUMBER_FIRST.exec(raw);
+  if (!found) return null;
+  const before = raw.slice(0, found.index).replace(/[\s,._-]+$/, "");
+  const named = parseFolderName(before);
+  const year = named.year ?? parseFolderName(raw.slice(found.index + found[0].length)).year;
+  return { ...named, title: before ? named.title : "", year, part: Number(found[1]) };
+}
+
+const EXTRA_FOLDER = /^(?:extras?|trailers?|featurettes?|behind the scenes|deleted scenes|interviews?|scenes|shorts?|samples?|bonus|other|бонус|бонусы|допы|дополнительно)$/i;
+const EXTRA_FILE = /(?:^|[-._ ])(?:trailer|sample|teaser|featurette)\d*$|-(?:behindthescenes|deleted|interview|scene|short|extra|other)$/i;
+
+/** A video that goes with a film rather than being one, the way Jellyfin and Kodi
+ *  name them. `relative` is the file's path inside the film's folder. */
+export function isExtraFile(relative: string): boolean {
+  const parts = relative.split("/");
+  const stem = parts[parts.length - 1].replace(/\.[^.]+$/, "");
+  return EXTRA_FILE.test(stem) || parts.slice(0, -1).some((folder) => EXTRA_FOLDER.test(folder.trim()));
+}
+
+/** A folder that only says which disc or part it holds: "CD1", "Disc 2", "Часть 1". */
+export function isPartFolder(name: string): boolean {
+  const found = partFromName(name);
+  return found !== null && found.title === "";
+}
+
 /** The season a folder stands for: "Season 01", "S2", "Сезон 3", "Specials" (0). */
 export function seasonFromFolder(name: string): number | null {
   if (/^specials?$/i.test(name.trim())) return 0;

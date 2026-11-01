@@ -1,6 +1,7 @@
 // Film sets (home's docs/video-sets-plan.md): films that belong together, found
-// rather than made — the .nfo's <set> first (what a family wrote down wins),
-// else TMDB's collection (belongs_to_collection on the film).
+// rather than made — the .nfo's <set> or the folder of films they were put in
+// first (what a family wrote down wins), else TMDB's collection
+// (belongs_to_collection on the film).
 //
 // `sets` and `set_members` are rebuilt from movies + metadata after every scan
 // and metadata pass, so they never drift from what those say; a set keeps its id
@@ -17,7 +18,7 @@ import { BASE_PATH } from "./config.js";
 import { canSee, type Identity } from "./identity.js";
 import { artUrl, metaFor, versionedArtUrl } from "./metadata.js";
 import { sortTitle } from "./names.js";
-import { progressFor, resumeAt, type Progress } from "./playback.js";
+import { movieIdOf, partsOfMovie, placeInFilm, progressFor, resumeAt, type Progress } from "./playback.js";
 
 const API = `${BASE_PATH}/api`;
 
@@ -204,6 +205,8 @@ interface Member {
   year: number | null;
   released: string | null;
   runtime_minutes: number | null;
+  set_order: number | null;
+  file: string;
 }
 
 /** A set shows as a set (in the list) once the person can see this many of its films. */
@@ -214,9 +217,11 @@ function movieLibraries(db: Db, identity: Identity, only?: string): string[] {
   return rows.map((row) => row.id).filter((id) => canSee(identity, id) && (!only || id === only));
 }
 
-/** The order of a set: release dates (TMDB's), else the year, then the title. */
+/** The order of a set: what the file names number, else release dates (TMDB's),
+ *  else the year, then the title. */
 const orderKey = (member: Member) => member.released ?? (member.year ? `${member.year}-99-99` : "9999");
-const byOrder = (a: Member, b: Member) => orderKey(a).localeCompare(orderKey(b)) || a.sort_title.localeCompare(b.sort_title);
+const byOrder = (a: Member, b: Member) =>
+  (a.set_order !== null && b.set_order !== null ? a.set_order - b.set_order : 0) || orderKey(a).localeCompare(orderKey(b)) || a.sort_title.localeCompare(b.sort_title);
 
 /** The films of the given sets (all, when null) this person may see, each set in order. */
 function visibleMembers(db: Db, identity: Identity, setIds: string[] | null, library?: string): Map<string, Member[]> {
@@ -224,7 +229,7 @@ function visibleMembers(db: Db, identity: Identity, setIds: string[] | null, lib
   const out = new Map<string, Member[]>();
   if (libraries.length === 0 || (setIds && setIds.length === 0)) return out;
   const rows = db.prepare(`
-    SELECT sm.set_id, m.id, m.title, m.sort_title, COALESCE(m.year, md.year) AS year, sm.released, m.runtime_minutes
+    SELECT sm.set_id, m.id, m.title, m.sort_title, COALESCE(m.year, md.year) AS year, sm.released, m.runtime_minutes, m.set_order, m.file
     FROM set_members sm JOIN movies m ON m.id = sm.movie_id LEFT JOIN metadata md ON md.item_id = m.id
     WHERE m.library_id IN (${libraries.map(() => "?").join(", ")}) ${setIds ? `AND sm.set_id IN (${setIds.map(() => "?").join(", ")})` : ""}
   `).all(...libraries, ...(setIds ?? [])) as Member[];
@@ -257,9 +262,9 @@ export function listSets(db: Db, identity: Identity, query: SetListQuery) {
     .filter((row) => !needle || row.name.toLocaleLowerCase().includes(needle) || (row.tmdb_name ?? "").toLocaleLowerCase().includes(needle))
     .sort((a, b) => a.sort_name.localeCompare(b.sort_name));
   const pageRows = matching.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
-  const filmIds = pageRows.flatMap((row) => members.get(row.id)!.map((member) => member.id));
-  const meta = metaFor(db, filmIds);
-  const progress = progressFor(db, identity.id, filmIds);
+  const pageFilms = pageRows.flatMap((row) => members.get(row.id)!);
+  const meta = metaFor(db, pageFilms.map((member) => member.id));
+  const progress = filmProgress(db, identity.id, pageFilms);
   return {
     items: pageRows.map((row) => {
       const films = members.get(row.id)!;
@@ -281,6 +286,20 @@ export function listSets(db: Db, identity: Identity, query: SetListQuery) {
   };
 }
 
+/** This person's progress on films, a film in parts counting as watched once its
+ *  last part is, and otherwise showing the part they have got to. */
+function filmProgress(db: Db, userId: string, films: Member[]): Map<string, Progress> {
+  const progress = progressFor(db, userId, films.map((film) => film.id));
+  for (const film of films) {
+    const parts = partsOfMovie(db, film);
+    if (parts.length < 2) continue;
+    const place = placeInFilm(db, userId, parts);
+    if (place.progress) progress.set(film.id, { ...place.progress, watched: place.watched });
+    else progress.delete(film.id);
+  }
+  return progress;
+}
+
 /** What Play on a set starts: the first film not yet watched, in order; null once all are. */
 function nextOf(films: Member[], progress: Map<string, Progress>): Member | null {
   return films.find((film) => !progress.get(film.id)?.watched) ?? null;
@@ -291,9 +310,8 @@ export function getSet(db: Db, identity: Identity, id: string) {
   const row = db.prepare("SELECT * FROM sets WHERE id = ?").get(id) as SetRow | undefined;
   const films = row ? visibleMembers(db, identity, [id]).get(id) ?? [] : [];
   if (!row || films.length === 0) return null;
-  const ids = films.map((film) => film.id);
-  const meta = metaFor(db, ids);
-  const progress = progressFor(db, identity.id, ids);
+  const meta = metaFor(db, films.map((film) => film.id));
+  const progress = filmProgress(db, identity.id, films);
   const next = nextOf(films, progress);
   return {
     id: row.id,
@@ -309,7 +327,7 @@ export function getSet(db: Db, identity: Identity, id: string) {
       poster: artUrl(API, meta.get(film.id), "poster"),
       progress: progress.get(film.id) ?? null
     })),
-    next: next ? { id: next.id, title: next.title, position: resumeAt(progress.get(next.id)) } : null
+    next: next ? { id: placeInFilm(db, identity.id, partsOfMovie(db, next)).id, title: next.title, position: resumeAt(progress.get(next.id)) } : null
   };
 }
 
@@ -327,7 +345,8 @@ export function setOfMovie(db: Db, identity: Identity, movieId: string) {
 }
 
 /** The film after this one in its set, for the player's "next" card. */
-export function nextInSet(db: Db, identity: Identity, movieId: string): { id: string; title: string } | null {
+export function nextInSet(db: Db, identity: Identity, askedId: string): { id: string; title: string } | null {
+  const movieId = movieIdOf(db, askedId);
   const member = db.prepare("SELECT set_id FROM set_members WHERE movie_id = ?").get(movieId) as { set_id: string } | undefined;
   if (!member) return null;
   const films = visibleMembers(db, identity, [member.set_id]).get(member.set_id) ?? [];

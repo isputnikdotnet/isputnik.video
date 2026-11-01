@@ -67,6 +67,6 @@ export class MediaProbe {
 /** Rows whose episode or movie is gone; for the daily sweep. */
 export function purgeOrphanProbes(db: Db): number {
   return db.prepare(`
-    DELETE FROM media_probe WHERE item_id NOT IN (SELECT id FROM episodes) AND item_id NOT IN (SELECT id FROM movies)
+    DELETE FROM media_probe WHERE item_id NOT IN (SELECT id FROM episodes) AND item_id NOT IN (SELECT id FROM movies) AND item_id NOT IN (SELECT id FROM movie_parts)
   `).run().changes;
 }

@@ -8,7 +8,7 @@ import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./catalog.js";
-import { browserPlayability, continueWatching, fileOf, findItem, nextEpisode, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { browserPlayability, continueWatching, fileOf, findItem, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
@@ -441,8 +441,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!item) return reply.code(404).send({ error: "Not found" });
     const file = fileOf(options.mediaRoot, item);
     const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
-    // After an episode the next one; after a film the next of its set.
-    const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextInSet(db, identity, item.id);
+    // After an episode the next one; after a film its next part, else the next of its set.
+    const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextPart(db, item) ?? nextInSet(db, identity, item.id);
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
     let markers = NO_MARKERS;
@@ -616,7 +616,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // TMDB's kept in the art folder. Only for someone who may see the title.
   const serveArt = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id, kind } = request.params as { id: string; kind: string };
-    const itemId = itemIdSchema.parse(id);
+    // A film's parts share its pictures.
+    const itemId = movieIdOf(db, itemIdSchema.parse(id));
     const artKind = artKindSchema.safeParse(kind);
     const owner = db.prepare(`
       SELECT library_id FROM shows WHERE id = @id

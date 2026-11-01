@@ -7,7 +7,7 @@ server, which owns every screen and every library. This server has no pages.
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
 
-Status: 0.13.0, alpha. Catalog, library sync and playback work, with each
+Status: 0.14.0, alpha. Catalog, library sync and playback work, with each
 person's progress (resume, next episode, Continue watching). A file a browser
 plays as it is goes as it is; the rest are converted to HLS as they play — the
 sound to AAC, the picture to H.264 only when a browser can't show it.
@@ -60,11 +60,20 @@ together are grouped into sets, from the .nfo files or TMDB's collections.
 ```
 Show (Year) [imdbid-tt…]/Season 01/Show (Year) S01E01 - Title.mkv   (+ .nfo, tvshow.nfo)
 Movie (Year) [tmdbid-…]/Movie (Year).mkv                            (+ movie.nfo)
+Movie (Year)/Movie part1.avi, Movie part2.avi                        one film in two files
+Set name/First film.mkv, Second film part-2.mkv                      a set of films
 ```
 
 The layout Jellyfin and Kodi read. `.nfo` files come first; names fill in the
 rest, including release names as they are downloaded. A file written in the last
 two minutes is left for the next scan, so a copy in progress is never catalogued.
+
+A movie folder holds one film unless its files say otherwise. Names that differ
+only by a part number counting from 1 (`part 2`, `pt2`, `CD2`, `disc 2`, `часть 2`,
+`серия 2`) are one film in parts, played in turn. Other files at least a fifth of
+the biggest's size are films of their own, in a set named after the folder and
+ordered by any part number in their names. Trailers and extras are left out by
+name (`-trailer`, `Extras/`), and a `movie.nfo` says the folder is one film.
 
 ## Configuration
 

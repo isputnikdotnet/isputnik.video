@@ -328,6 +328,19 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
     const { item, file, info } = looked;
     const extension = path.extname(item.relative).toLowerCase();
     const binge = item.show ? { bingeGroup: `isputnik-${site.id}-${item.show.id}` } : {};
+    // A film in parts is one title to Stremio: its later parts are further streams.
+    const later = (item.movieId && item.part === 1 ? db.prepare("SELECT id FROM movie_parts WHERE movie_id = ? ORDER BY part").all(item.movieId) as { id: string }[] : []).flatMap(({ id }) => {
+      const part = findItem(db, identity, id);
+      const partFile = part ? fileOf(deps.mediaRoot, part) : null;
+      if (!part || !partFile) return [];
+      const partExtension = path.extname(part.relative).toLowerCase();
+      return [{
+        name: "iSputnik",
+        description: `${part.title} · Original · ${partExtension.slice(1).toUpperCase()}`,
+        url: `${site.base}/play/${part.id}`,
+        behaviorHints: { notWebReady: partExtension !== ".mp4" && partExtension !== ".m4v", filename: path.basename(part.relative), videoSize: partFile.size }
+      }];
+    });
     const original = {
       name: "iSputnik",
       description: `Original · ${extension.slice(1).toUpperCase()}${info?.video ? ` · ${info.video.codec.toUpperCase()} ${info.video.height}p` : ""}`,
@@ -337,16 +350,16 @@ export function registerStremio(app: FastifyInstance, deps: StremioDeps): void {
     // A TV crashes on what it cannot decode: offer the converted picture first then.
     // ffmpeg has to have read the file for that; one it could not read plays as it is.
     const risk = deps.canConvert && info ? tvRisk(info) : null;
-    if (!risk || !info) return { streams: [original] };
+    if (!risk || !info) return { streams: [original, ...later] };
     const delivery = decideDelivery(info, extension);
-    if (delivery.mode === "direct") return { streams: [original] };
+    if (delivery.mode === "direct") return { streams: [original, ...later] };
     const converted = {
       name: "iSputnik",
       description: "Converted · H.264 for TVs",
       url: `${site.base}/hls/${item.id}/${deps.trackSegment(delivery)}/index.m3u8`,
       behaviorHints: { notWebReady: false, ...binge }
     };
-    return { streams: [converted, original] };
+    return { streams: [converted, original, ...later] };
   });
 
   app.get(`${ROOT}/subtitles/*`, async (request, reply) => {

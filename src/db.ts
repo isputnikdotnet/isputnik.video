@@ -31,6 +31,7 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["movies", "set_name", "TEXT"],
   ["movies", "set_overview", "TEXT"],
   ["movies", "set_tmdb_id", "TEXT"],
+  ["movies", "set_order", "INTEGER"],
   ["metadata", "set_tmdb_id", "TEXT"],
   ["metadata", "set_name", "TEXT"],
   ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"]
