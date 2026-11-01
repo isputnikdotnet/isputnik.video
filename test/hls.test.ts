@@ -5,12 +5,12 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
 import { findTools, keyframes, probe, type MediaInfo } from "../src/ffmpeg.js";
-import { HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
+import { DEFAULT_CONVERSION, HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec?: string }): MediaInfo => ({
@@ -149,7 +149,8 @@ describe("seeking", () => {
     plan = buildPlan("seek", film, info, decideDelivery(info, ".mkv"), await keyframes(tools, film));
   }, 60_000);
 
-  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // A killed ffmpeg lets go of the film a moment later on Windows.
+  afterAll(() => fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
 
   it("lets the newest request move the run: one still waiting behind it gives way instead of dragging it back", async () => {
     expect(plan.starts.length).toBeGreaterThanOrEqual(9);
@@ -176,10 +177,50 @@ describe("seeking", () => {
       const gone = new AbortController();
       gone.abort();
       await expect(sessions.segment("mum:seek", plan, 6, { signal: gone.signal })).rejects.toThrow("Cancelled");
+      // A player already gone holds nothing for later.
+      expect(sessions.usage().viewers).toEqual([]);
     } finally {
       sessions.close();
     }
   });
+
+  it("does not start a film again for a request from before the player left", async () => {
+    const sessions = new HlsSessions(tools, null, quiet);
+    try {
+      const asked = Date.now() - 1;
+      sessions.leave("mum:seek");
+      await expect(sessions.segment("mum:seek", plan, 0, { asked })).rejects.toThrow("Stopped");
+      expect(sessions.refusal("mum:other")).toBeNull();
+      // Coming back to it afterwards is a new request.
+      await expect(sessions.segment("mum:seek", plan, 0, { asked: Date.now() + 1 })).resolves.toBeTruthy();
+    } finally {
+      sessions.close();
+    }
+  }, 60_000);
+
+  it("refuses a second film only while the first is being watched, and frees its place", async () => {
+    const sessions = new HlsSessions(tools, null, quiet);
+    const now = vi.spyOn(Date, "now");
+    try {
+      await sessions.segment("mum:seek", plan, 0, { who: { user: "Mum", title: "First" } });
+      expect(sessions.refusal("mum:other")).toMatchObject({ reason: "person", title: "First" });
+      expect(sessions.refusal("dad:other")).toBeNull();
+
+      // Nothing asked for a while: closed, or paused. The film after it goes ahead.
+      const later = Date.now() + 21_000;
+      now.mockReturnValue(later);
+      expect(sessions.refusal("mum:other")).toBeNull();
+      sessions.configure({ ...DEFAULT_CONVERSION, maxViewers: 1 });
+      expect(sessions.refusal("mum:other")).toBeNull();
+      expect(sessions.refusal("dad:other")).toMatchObject({ reason: "household" });
+
+      await sessions.segment("mum:other", plan, 0, { who: { user: "Mum", title: "Second" } });
+      expect(sessions.usage().viewers.map((viewer) => viewer.title)).toEqual(["Second"]);
+    } finally {
+      now.mockRestore();
+      sessions.close();
+    }
+  }, 60_000);
 });
 
 describe("real segments", () => {

@@ -40,6 +40,9 @@ const JUMP_AHEAD = 3;
 /** With "wait", a run whose viewer's memory is full still keeps this many ahead. */
 const MIN_AHEAD = 3;
 const IDLE_MS = 60_000;
+/** A playing film asks every few seconds. One silent this long is closed or paused,
+ *  and no longer keeps its person from starting another. */
+const PERSON_HOLD_MS = 20_000;
 /** How long a request waits for its segment (a re-encode's first one is slowest). */
 const WAIT_MS = 45_000;
 
@@ -214,9 +217,9 @@ export class HlsError extends Error {}
 
 /** Everyone the admin allows is already watching something converted. */
 /** Why someone may not start converting a film now: every place the admin
- *  allows is taken ("household"), or they are converting another film already
- *  ("person" — on another screen, or a tab left open; it lets go within a
- *  minute of nobody asking). */
+ *  allows is taken ("household"), or they are watching another film converted
+ *  ("person" — on another screen, or a tab left playing; it lets go once it
+ *  has asked for nothing for PERSON_HOLD_MS). */
 export interface HlsRefusal {
   reason: "household" | "person";
   limit: number;
@@ -258,6 +261,9 @@ export interface HlsLog {
 
 export class HlsSessions {
   private sessions = new Map<string, Session>();
+  /** When each player said it had gone, so a request of its still on the way
+   *  can't start the film again behind it. */
+  private left = new Map<string, number>();
   private sweeper: NodeJS.Timeout;
   private root: string;
 
@@ -289,15 +295,18 @@ export class HlsSessions {
   }
 
   /** Why `key` may not watch now; null when it may: already converting this
-   *  film, or a place is free and this person converts nothing else. One film
+   *  film, or a place is free and this person is watching nothing else. One film
    *  at a time per person, refused rather than taken over, so two screens on
-   *  one account don't stop each other's conversion turn about. */
+   *  one account don't stop each other's conversion turn about. A film of theirs
+   *  gone quiet gives way, and its place counts as free (open stops it). */
   refusal(key: string): HlsRefusal | null {
     if (this.sessions.has(key)) return null;
     const person = personOf(key);
-    const other = [...this.sessions.values()].find((session) => personOf(session.key) === person);
+    const mine = [...this.sessions.values()].filter((session) => personOf(session.key) === person);
+    const now = Date.now();
+    const other = mine.find((session) => now - session.touched <= PERSON_HOLD_MS);
     if (other) return { reason: "person", limit: this.settings.maxViewers, title: other.title };
-    if (this.sessions.size >= this.settings.maxViewers) return { reason: "household", limit: this.settings.maxViewers };
+    if (this.sessions.size - mine.length >= this.settings.maxViewers) return { reason: "household", limit: this.settings.maxViewers };
     return null;
   }
 
@@ -307,8 +316,8 @@ export class HlsSessions {
 
   /** Segment `n`, made if it isn't there yet. `who` names the session for the
    *  admin; `signal` is the player hanging up (a seek cancels the segment it
-   *  was loading), which ends the wait. */
-  async segment(key: string, plan: HlsPlan, n: number, options: { who?: { user: string; title: string }; signal?: AbortSignal } = {}): Promise<SegmentData> {
+   *  was loading), which ends the wait; `asked` is when the request came in. */
+  async segment(key: string, plan: HlsPlan, n: number, options: { who?: { user: string; title: string }; signal?: AbortSignal; asked?: number } = {}): Promise<SegmentData> {
     const who = options.who ?? { user: "", title: "" };
     const signal = options.signal;
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
@@ -320,6 +329,9 @@ export class HlsSessions {
       session = undefined;
     }
     if (!session) {
+      if (signal?.aborted) throw new HlsError("Cancelled");
+      const left = this.left.get(key);
+      if (left !== undefined && options.asked !== undefined && options.asked < left) throw new HlsError("Stopped");
       const refused = this.refusal(key);
       if (refused) throw new HlsBusyError(refused);
       session = this.open(key, plan, who);
@@ -343,6 +355,8 @@ export class HlsSessions {
         if (session.done.has(n)) return { file: path.join(session.dir, `${n}.ts`), size: session.onDisk.get(n) ?? 0 };
       }
       if (signal?.aborted) throw new HlsError("Cancelled");
+      // Still wanted: a slow first segment is someone watching, not silence.
+      session.touched = Date.now();
       if (session.failure && started) throw new HlsError(session.failure);
       const running = session.proc !== null;
       if (!running || n < session.runFrom || n > session.writing + JUMP_AHEAD) {
@@ -358,6 +372,12 @@ export class HlsSessions {
       // The session was stopped while this request waited (the player left).
       if (this.sessions.get(key) !== session) throw new HlsError("Stopped");
     }
+  }
+
+  /** The player has gone: stop now, and refuse what it asked before it went. */
+  leave(key: string): void {
+    this.left.set(key, Date.now());
+    this.stop(key);
   }
 
   stop(key: string): void {
@@ -408,6 +428,11 @@ export class HlsSessions {
   }
 
   private open(key: string, plan: HlsPlan, who: { user: string; title: string }): Session {
+    // refusal let this through, so any other film of theirs has gone quiet.
+    const person = personOf(key);
+    for (const other of [...this.sessions.keys()]) {
+      if (personOf(other) === person) this.stop(other);
+    }
     const dir = fs.mkdtempSync(path.join(this.root, "s-"));
     const session: Session = {
       key, plan, user: who.user, title: who.title, dir,
@@ -551,6 +576,9 @@ export class HlsSessions {
     for (const session of [...this.sessions.values()]) {
       if (session.proc) this.refresh(session);
       if (now - session.touched > IDLE_MS) this.stop(session.key);
+    }
+    for (const [key, at] of this.left) {
+      if (now - at > IDLE_MS) this.left.delete(key);
     }
   }
 }

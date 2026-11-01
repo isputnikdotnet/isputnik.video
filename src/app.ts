@@ -565,6 +565,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const { name } = request.params as { name: string };
     const segment = /^(\d{1,6})\.ts$/.exec(name);
     if (name !== "index.m3u8" && !segment) return reply.code(404).send({ error: "Not found" });
+    const asked = Date.now();
+    // The player cancels the segment it was loading when someone seeks or leaves:
+    // stop waiting for it then, or the wait outlives the seek and fights it. Heard
+    // from the start, since working out the plan can take a while (the keyframes).
+    const hungUp = new AbortController();
+    reply.raw.on("close", () => { if (!reply.raw.writableEnded) hungUp.abort(); });
     const found = await planFor(request);
     if (!found) return reply.code(404).send({ error: "Not found" });
     // Every place taken: refused before the player waits on a segment.
@@ -575,13 +581,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     }
     const n = Number(segment[1]);
     if (n >= found.plan.starts.length) return reply.code(404).send({ error: "Not found" });
-    // The player cancels the segment it was loading when someone seeks: stop
-    // waiting for it then, or the wait outlives the seek and fights it.
-    const hungUp = new AbortController();
-    reply.raw.on("close", () => { if (!reply.raw.writableEnded) hungUp.abort(); });
     let made: SegmentData;
     try {
-      made = await hls!.segment(found.key, found.plan, n, { who: found.who, signal: hungUp.signal });
+      made = await hls!.segment(found.key, found.plan, n, { who: found.who, signal: hungUp.signal, asked });
     } catch (err) {
       if (err instanceof HlsBusyError) return busyReply(reply, err.refusal);
       if (!(err instanceof HlsError)) throw err;
@@ -608,7 +610,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // The player has gone: stop converting for it now rather than after a minute.
   app.delete(`${API}/hls/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const id = itemIdSchema.parse((request.params as { id: string }).id);
-    hls?.stop(`${request.identity!.id}:${id}`);
+    hls?.leave(`${request.identity!.id}:${id}`);
     return reply.code(204).send();
   });
 
