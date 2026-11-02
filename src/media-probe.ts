@@ -1,9 +1,11 @@
 // ffprobe's answers kept per item (schema.sql → media_probe): the streams read
 // on the first play, the keyframes on the first play that needs them. A file
 // replaced on disk (new size or date) is probed again. Two requests for the same
-// file while one probe runs share it.
+// file while one probe runs share it. An MP4 gives up its keyframes from its
+// header (mp4-index.ts); every other file is walked by ffprobe.
 import type { Db } from "./db.js";
 import { keyframes, probe, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { mp4Keyframes } from "./mp4-index.js";
 
 interface ProbeRow {
   size: number;
@@ -17,6 +19,8 @@ export interface ProbedFile {
   size: number;
   modified: Date;
 }
+
+const isMp4 = (container: string) => /(^|,)(mov|mp4)(,|$)/.test(container);
 
 export class MediaProbe {
   private running = new Map<string, Promise<unknown>>();
@@ -53,11 +57,12 @@ export class MediaProbe {
   }
 
   async keyframes(itemId: string, file: ProbedFile): Promise<number[]> {
-    await this.info(itemId, file);
+    const info = await this.info(itemId, file);
     const cached = this.row(itemId, file);
     if (cached?.keyframes) return JSON.parse(cached.keyframes) as number[];
     return this.once(`keyframes:${itemId}`, async () => {
-      const times = await keyframes(this.tools, file.absolute);
+      const fromHeader = info.video && isMp4(info.container) ? await mp4Keyframes(file.absolute, info.video).catch(() => null) : null;
+      const times = fromHeader ?? await keyframes(this.tools, file.absolute);
       this.db.prepare("UPDATE media_probe SET keyframes = ? WHERE item_id = ?").run(JSON.stringify(times), itemId);
       return times;
     });
