@@ -154,6 +154,22 @@ CREATE TABLE IF NOT EXISTS markers (
   PRIMARY KEY (item_id, season, kind)
 );
 
+-- What the engine found by itself (detect.ts): an episode's intro by the sound its
+-- season shares, the credits by the black they sit on. One row per episode or film
+-- file, for that file as it was (size and date); NULLs where nothing was found.
+-- Apart from markers: an admin's mark, an .edl and chapters all win over these.
+CREATE TABLE IF NOT EXISTS detected_markers (
+  item_id       TEXT PRIMARY KEY,
+  size          INTEGER NOT NULL,
+  modified_ms   INTEGER NOT NULL,
+  intro_start   REAL,
+  intro_end     REAL,
+  -- 1 once its season was compared with it in it; a film's is always 1.
+  intro_checked INTEGER NOT NULL DEFAULT 0,
+  credits_start REAL,
+  detected_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 -- The admin's choices (settings.ts): one row per setting, its value JSON.
 CREATE TABLE IF NOT EXISTS settings (
   key         TEXT PRIMARY KEY,

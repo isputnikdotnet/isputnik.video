@@ -12,7 +12,8 @@ import { browserPlayability, continueWatching, fileOf, findItem, movieIdOf, next
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
-import { MarkError, clearMark, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
+import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
+import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -40,6 +41,8 @@ declare module "fastify" {
   interface FastifyInstance {
     /** Resolves once every scan asked for so far has finished — for tests and shutdown. */
     scansSettled(): Promise<void>;
+    /** …and the intros and credits looked for after them (detect.ts). */
+    detectionSettled(): Promise<void>;
   }
 }
 
@@ -67,6 +70,9 @@ export interface AppOptions {
   fetch?: Fetch;
   /** Tests settle files at once instead of waiting out a copy. */
   scan?: ScanOptions;
+  /** Find intros and credits by itself (detect.ts) after each scan and on start.
+   *  The server turns it on (DETECT_MARKERS=false turns it off); tests ask for it. */
+  detect?: boolean;
   fastify?: FastifyServerOptions;
 }
 
@@ -248,9 +254,55 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     await metadataChain;
   });
 
+  // Intros and credits found by sound and picture (detect.ts): one library, show
+  // or title at a time, after the scans, never counted as catalog work — it only
+  // writes rows of its own, keyed by the file it read, which a restore can't undo.
+  const detector = tools && mediaProbe && options.detect ? new DetectRunner({ db, tools, mediaRoot: options.mediaRoot, probe: mediaProbe }) : null;
+  const detectStop = new AbortController();
+  let detectChain: Promise<void> = Promise.resolve();
+  const detectQueued = new Set<string>();
+  type DetectScope = Parameters<DetectRunner["run"]>[0];
+  const queueDetect = (scope: DetectScope, force: boolean, request: FastifyRequest | null) => {
+    if (!detector) return;
+    const key = `${JSON.stringify(scope)}:${force}`;
+    if (detectQueued.has(key)) return;
+    detectQueued.add(key);
+    detectChain = detectChain.then(async () => {
+      detectQueued.delete(key);
+      if (detectStop.signal.aborted || !(await toolsReady)) return;
+      const started = Date.now();
+      try {
+        const done = await detector.run(scope, force, detectStop.signal);
+        if (done.seasons + done.films === 0) return;
+        note(request, "info", "detect.finished", {
+          libraryId: "library" in scope ? scope.library : null,
+          detail: `${done.seasons} season(s), ${done.films} film(s): ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
+        });
+      } catch (err) {
+        if (detectStop.signal.aborted) return;
+        note(request, "error", "detect.failed", { detail: (err as Error).message });
+        app.log.error({ err, scope }, "Finding intros and credits failed");
+      }
+    });
+  };
+  app.decorate("detectionSettled", async () => {
+    await scanChain;
+    await metadataChain;
+    await detectChain;
+  });
+  // On start, whatever wasn't looked at before (an engine older than 0.16.0 never did).
+  if (detector) {
+    void toolsReady.then((ok) => {
+      if (!ok || detectStop.signal.aborted) return;
+      for (const library of listLibraries(db)) if (library.state === "active") queueDetect({ library: library.id }, false, null);
+    });
+  }
+
   app.addHook("onClose", async () => {
     clearInterval(daily);
     hls?.close();
+    detectStop.abort();
+    await detectChain.catch(() => undefined);
     await scanChain.catch(() => undefined);
     await metadataChain.catch(() => undefined);
     db.close();
@@ -265,6 +317,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     purgeOrphanProgress(db);
     purgeOrphanProbes(db);
     purgeOrphanMarkers(db);
+    purgeOrphanDetected(db);
     purgeOrphanMetadata(db, artDir);
     rebuildSets(db, artDir);
   };
@@ -363,6 +416,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
           detail: `${summary.titles} title(s), ${summary.episodes} episode(s); ${summary.added} added, ${summary.removed} removed${growing}${unnumbered}`
         });
         queueMetadata(libraryId, null, false);
+        queueDetect({ library: libraryId }, false, null);
       } catch (err) {
         const message = err instanceof ScanError ? err.message : `The scan failed: ${(err as Error).message}`;
         setScanState(db, libraryId, "error", message);
@@ -461,7 +515,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
-      markers = findMarkers(probed, file.absolute, markers);
+      markers = findMarkers(probed, file.absolute, markers, detectedMarkers(readDetected(db, item.id, file)));
       const tracks = probed ? listSubtitles(probed, file.absolute) : [];
       const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
       subtitleTracks = tracks.map((track) => ({
@@ -694,7 +748,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = fileOf(options.mediaRoot, item);
     if (!file || !mediaProbe || !(await toolsReady)) return null;
     const info = await mediaProbe.info(item.id, file).catch(() => null);
-    return findMarkers(info, file.absolute, marks).credits?.start ?? null;
+    return findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file))).credits?.start ?? null;
   };
 
   /** A title's markers as /play gives them. */
@@ -703,8 +757,18 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = fileOf(options.mediaRoot, item);
     if (!file || !mediaProbe || !(await toolsReady)) return { markers: marks, duration: null };
     const info = await mediaProbe.info(item.id, file).catch(() => null);
-    return { markers: findMarkers(info, file.absolute, marks), duration: info?.duration ?? null };
+    return { markers: findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file))), duration: info?.duration ?? null };
   };
+
+  // Look for this episode's season's intros and credits again (or the film's),
+  // whatever was found before: the admin's "Find again" in home's player.
+  app.post(`${API}/admin/markers/:id/detect`, { preHandler: requireAdmin }, async (request, reply) => {
+    const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
+    if (!item) return reply.code(404).send({ error: "Not found" });
+    if (!detector) return reply.code(409).send({ error: "Finding intros by itself is turned off, or ffmpeg is missing" });
+    queueDetect({ item: item.id }, true, request);
+    return reply.code(202).send({ queued: true });
+  });
 
   // An admin marks where the intro or the credits are, in home's player, for this
   // episode or film or for its whole season; a null start puts back what was there

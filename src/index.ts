@@ -15,6 +15,8 @@ const app = await buildApp({
   artDir: config.artDir,
   version: config.version,
   stage: config.stage,
+  // Intros and credits found by sound and picture after each scan (detect.ts).
+  detect: process.env.DETECT_MARKERS?.trim().toLowerCase() !== "false",
   logBuffer,
   fastify: {
     logger: { level: process.env.LOG_LEVEL?.trim() || "info", stream: logBuffer }

@@ -5,7 +5,8 @@
 // - a mark an admin set in home's player (the markers table): the episode's or
 //   film's own, else its season's;
 // - an .edl beside the video: Kodi's edit list, which intro-skipper tools write;
-// - chapters inside the file, by their names. An unnamed "Chapter 3" says nothing.
+// - chapters inside the file, by their names. An unnamed "Chapter 3" says nothing;
+// - what the engine found by itself (detect.ts, the detected_markers table).
 //
 // The files' are worked out when asked, never stored: reading both is cheap (the
 // chapters come with the probe media_probe keeps) and a new .edl counts at once.
@@ -15,7 +16,7 @@ import path from "node:path";
 import type { Db } from "./db.js";
 import type { MediaChapter, MediaInfo } from "./ffmpeg.js";
 
-export type MarkerSource = "manual" | "edl" | "chapter";
+export type MarkerSource = "manual" | "edl" | "chapter" | "detected";
 /** A mark for this episode or film alone, or for every episode of its season. */
 export type MarkScope = "episode" | "season";
 export type MarkerKind = "intro" | "credits";
@@ -124,13 +125,26 @@ function readEdl(videoFile: string): { start: number; end: number }[] {
 }
 
 /** A title's intro and credits: the marks by hand, else the .edl's, else its
- *  chapters', each kind on its own. Without the probe only the marks: an .edl
- *  means nothing without the file's length. */
-export function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS): Markers {
-  if (!info) return marks;
+ *  chapters', else what the engine found by itself (detect.ts), each kind on its
+ *  own. Without the probe only the marks and what was found: an .edl means
+ *  nothing without the file's length. */
+export function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS, detected: Markers = NO_MARKERS): Markers {
+  if (!info) return { intro: marks.intro ?? detected.intro, credits: marks.credits ?? detected.credits };
   const edl = markersFromEdl(readEdl(videoFile), info.duration);
   const chapters = markersFromChapters(info.chapters, info.start, info.duration);
-  return { intro: marks.intro ?? edl.intro ?? chapters.intro, credits: marks.credits ?? edl.credits ?? chapters.credits };
+  return {
+    intro: marks.intro ?? edl.intro ?? chapters.intro ?? detected.intro,
+    credits: marks.credits ?? edl.credits ?? chapters.credits ?? detected.credits
+  };
+}
+
+/** What detect.ts found, as markers. */
+export function detectedMarkers(row: { intro_start: number | null; intro_end: number | null; credits_start: number | null } | null): Markers {
+  if (!row) return NO_MARKERS;
+  return {
+    intro: row.intro_start !== null && row.intro_end !== null ? { start: row.intro_start, end: row.intro_end, source: "detected" } : null,
+    credits: row.credits_start !== null ? { start: row.credits_start, source: "detected" } : null
+  };
 }
 
 // ── Marks by hand ───────────────────────────────────────────────────────────

@@ -86,6 +86,7 @@ name (`-trailer`, `Extras/`), and a `movie.nfo` says the folder is one film.
 | `TRANSCODE_PATH` | temp folder | where ffmpeg writes segments while someone watches (image: `/transcode`); finished ones move into memory up to the share set on home's Apps → Installed, the rest stay here; emptied on start |
 | `ART_PATH` | `art` beside `DB_PATH` | posters, backdrops and stills fetched from TMDB (image: `/config/art`); not in backups — fetched again |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | on `PATH` | the image installs both; a checkout uses the ffmpeg-static dev dependencies |
+| `DETECT_MARKERS` | on | `false` stops the engine finding intros (by the sound a season's episodes share) and credits (by the black they sit on) after each scan; marks, `.edl` files and chapters still count |
 | `LOG_LEVEL` | `info` | |
 | `DEV_USER` | `dev:Developer` | development without a secret: an admin who sees every library |
 
