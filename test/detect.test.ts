@@ -140,10 +140,12 @@ describe("a season looked at", () => {
     for (const [i, cold] of coldOpens.entries()) {
       const { intro, credits } = await markersOf(ids[i]);
       expect(intro.source).toBe("detected");
-      expect(intro.start).toBeGreaterThan(cold - 1);
-      expect(intro.start).toBeLessThan(cold + 1);
+      // Within 2 s each end: how far stray matches carry a run's edges differs with
+      // the ffmpeg build that encoded the files (1.3 s early on CI's, at 0.16.0).
+      expect(intro.start).toBeGreaterThan(cold - 2);
+      expect(intro.start).toBeLessThan(cold + 2);
       expect(intro.end).toBeGreaterThan(cold + 18);
-      expect(intro.end).toBeLessThan(cold + 21.5);
+      expect(intro.end).toBeLessThan(cold + 22);
       expect(credits.source).toBe("detected");
       expect(credits.start).toBeGreaterThan(93);
       expect(credits.start).toBeLessThan(97);
