@@ -12,7 +12,7 @@ import { browserPlayability, continueWatching, fileOf, findItem, movieIdOf, next
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
-import { NO_MARKERS, findMarkers } from "./markers.js";
+import { MarkError, clearMark, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -149,6 +149,13 @@ const matchSearchSchema = z.object({
 });
 
 const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable() });
+// A mark by hand (markers.ts); a null start clears it.
+const markBodySchema = z.object({
+  kind: z.enum(["intro", "credits"]),
+  scope: z.enum(["episode", "season"]),
+  start: z.number().min(0).max(24 * 3600).nullable(),
+  end: z.number().min(0).max(24 * 3600).nullable().default(null)
+});
 
 const ART_TYPES: Record<string, string> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
@@ -257,6 +264,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
     purgeOrphanProgress(db);
     purgeOrphanProbes(db);
+    purgeOrphanMarkers(db);
     purgeOrphanMetadata(db, artDir);
     rebuildSets(db, artDir);
   };
@@ -298,6 +306,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof LibraryError) return reply.code(error.status).send({ error: error.message });
+    if (error instanceof MarkError) return reply.code(400).send({ error: error.message });
     if (error instanceof RestoreError) {
       note(request, "warn", "restore.refused", { detail: error.message });
       return reply.code(error.status).send({ error: error.message });
@@ -445,14 +454,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextPart(db, item) ?? nextInSet(db, identity, item.id);
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
-    let markers = NO_MARKERS;
+    let markers = readMarks(db, item);
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
     let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null } =
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
-      markers = findMarkers(probed, file.absolute);
+      markers = findMarkers(probed, file.absolute, markers);
       const tracks = probed ? listSubtitles(probed, file.absolute) : [];
       const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
       subtitleTracks = tracks.map((track) => ({
@@ -676,14 +685,44 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     trackSegment
   });
 
-  /** Where a title's credits start, when the file says; not asked when the player
-   *  already knows it is watched. */
+  /** Where a title's credits start, when a mark or the file says; not asked when
+   *  the player already knows it is watched. */
   const creditsAt = async (item: PlayableItem, watched: boolean | undefined): Promise<number | null> => {
-    const file = watched === undefined ? fileOf(options.mediaRoot, item) : null;
+    if (watched !== undefined) return null;
+    const marks = readMarks(db, item);
+    if (marks.credits) return marks.credits.start;
+    const file = fileOf(options.mediaRoot, item);
     if (!file || !mediaProbe || !(await toolsReady)) return null;
     const info = await mediaProbe.info(item.id, file).catch(() => null);
-    return findMarkers(info, file.absolute).credits?.start ?? null;
+    return findMarkers(info, file.absolute, marks).credits?.start ?? null;
   };
+
+  /** A title's markers as /play gives them. */
+  const markersOf = async (item: PlayableItem) => {
+    const marks = readMarks(db, item);
+    const file = fileOf(options.mediaRoot, item);
+    if (!file || !mediaProbe || !(await toolsReady)) return { markers: marks, duration: null };
+    const info = await mediaProbe.info(item.id, file).catch(() => null);
+    return { markers: findMarkers(info, file.absolute, marks), duration: info?.duration ?? null };
+  };
+
+  // An admin marks where the intro or the credits are, in home's player, for this
+  // episode or film or for its whole season; a null start puts back what was there
+  // before (the season's, the .edl's, the chapters'). Answers the markers anew.
+  app.put(`${API}/admin/markers/:id`, { preHandler: requireAdmin }, async (request, reply) => {
+    const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
+    if (!item) return reply.code(404).send({ error: "Not found" });
+    const body = markBodySchema.parse(request.body);
+    const label = item.show ? `${item.show.title} ${item.title}` : item.title;
+    if (body.start === null) {
+      clearMark(db, item, body.kind, body.scope);
+      note(request, "info", "markers.cleared", { libraryId: item.libraryId, detail: `${label}: ${body.kind} (${body.scope})` });
+    } else {
+      setMark(db, item, { kind: body.kind, scope: body.scope, start: body.start, end: body.end }, (await markersOf(item)).duration);
+      note(request, "info", "markers.set", { libraryId: item.libraryId, detail: `${label}: ${body.kind} (${body.scope})` });
+    }
+    return { markers: (await markersOf(item)).markers };
+  });
 
   // How far the person got; the player sends it every few seconds and on pause.
   app.put(`${API}/progress/:id`, { preHandler: requireIdentity }, async (request, reply) => {

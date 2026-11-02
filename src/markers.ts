@@ -1,23 +1,30 @@
 // Where a title's intro and credits are (home's docs/video-skip-plan.md), so the
 // player can offer Skip intro and bring its next-episode card up when the credits
-// start. Only ever what the files say, the family's own first:
+// start. In this order, each kind on its own:
 //
+// - a mark an admin set in home's player (the markers table): the episode's or
+//   film's own, else its season's;
 // - an .edl beside the video: Kodi's edit list, which intro-skipper tools write;
 // - chapters inside the file, by their names. An unnamed "Chapter 3" says nothing.
 //
-// Worked out when asked, never stored: reading both is cheap (the chapters come
-// with the probe media_probe keeps) and a new .edl counts at once. All times are
-// seconds from the start of the file, the clock the player runs on.
+// The files' are worked out when asked, never stored: reading both is cheap (the
+// chapters come with the probe media_probe keeps) and a new .edl counts at once.
+// All times are seconds from the start of the file, the clock the player runs on.
 import fs from "node:fs";
 import path from "node:path";
+import type { Db } from "./db.js";
 import type { MediaChapter, MediaInfo } from "./ffmpeg.js";
 
-export type MarkerSource = "edl" | "chapter";
+export type MarkerSource = "manual" | "edl" | "chapter";
+/** A mark for this episode or film alone, or for every episode of its season. */
+export type MarkScope = "episode" | "season";
+export type MarkerKind = "intro" | "credits";
 
 export interface Markers {
-  intro: { start: number; end: number; source: MarkerSource } | null;
+  /** `scope` says where a mark by hand is kept, so it can be cleared there. */
+  intro: { start: number; end: number; source: MarkerSource; scope?: MarkScope } | null;
   /** To the end of the file. */
-  credits: { start: number; source: MarkerSource } | null;
+  credits: { start: number; source: MarkerSource; scope?: MarkScope } | null;
 }
 
 export const NO_MARKERS: Markers = { intro: null, credits: null };
@@ -116,11 +123,79 @@ function readEdl(videoFile: string): { start: number; end: number }[] {
   }
 }
 
-/** A title's intro and credits: the .edl's, else its chapters', each on its own.
- *  Nothing without the probe: an .edl means nothing without the file's length. */
-export function findMarkers(info: MediaInfo | null, videoFile: string): Markers {
-  if (!info) return NO_MARKERS;
+/** A title's intro and credits: the marks by hand, else the .edl's, else its
+ *  chapters', each kind on its own. Without the probe only the marks: an .edl
+ *  means nothing without the file's length. */
+export function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS): Markers {
+  if (!info) return marks;
   const edl = markersFromEdl(readEdl(videoFile), info.duration);
   const chapters = markersFromChapters(info.chapters, info.start, info.duration);
-  return { intro: edl.intro ?? chapters.intro, credits: edl.credits ?? chapters.credits };
+  return { intro: marks.intro ?? edl.intro ?? chapters.intro, credits: marks.credits ?? edl.credits ?? chapters.credits };
+}
+
+// ── Marks by hand ───────────────────────────────────────────────────────────
+
+/** What a mark is kept against: an episode (with its show and season) or a film. */
+export interface Markable {
+  id: string;
+  show: { id: string } | null;
+  season: number | null;
+}
+
+export class MarkError extends Error {}
+
+/** A season's mark lives on the show, under the season's number. */
+function keyOf(item: Markable, scope: MarkScope): { itemId: string; season: number } {
+  if (scope === "season") {
+    if (!item.show || item.season === null) throw new MarkError("Only an episode has a season to mark");
+    return { itemId: item.show.id, season: item.season };
+  }
+  return { itemId: item.id, season: -1 };
+}
+
+/** The marks an admin set for this title: its own, else its season's, per kind. */
+export function readMarks(db: Db, item: Markable): Markers {
+  const rows = db.prepare(`
+    SELECT kind, start_s, end_s, season FROM markers
+    WHERE (item_id = @id AND season = -1) OR (item_id = @show AND season = @season)
+    ORDER BY season = -1 DESC
+  `).all({ id: item.id, show: item.show?.id ?? null, season: item.season ?? -2 }) as { kind: MarkerKind; start_s: number; end_s: number | null; season: number }[];
+  const found: Markers = { intro: null, credits: null };
+  for (const row of rows) {
+    const scope: MarkScope = row.season === -1 ? "episode" : "season";
+    if (row.kind === "intro" && !found.intro && row.end_s !== null) found.intro = { start: row.start_s, end: row.end_s, source: "manual", scope };
+    else if (row.kind === "credits" && !found.credits) found.credits = { start: row.start_s, source: "manual", scope };
+  }
+  return found;
+}
+
+/** Mark the intro (start and end) or where the credits start; `duration`, when
+ *  known, keeps a mark inside the file. */
+export function setMark(db: Db, item: Markable, mark: { kind: MarkerKind; scope: MarkScope; start: number; end: number | null }, duration: number | null): void {
+  const { itemId, season } = keyOf(item, mark.scope);
+  const { kind, start } = mark;
+  const end = kind === "intro" ? mark.end : null;
+  if (kind === "intro" && (end === null || end - start < 1)) throw new MarkError("The intro must end after it starts");
+  if (duration !== null && duration > 0 && (start >= duration || (end !== null && end > duration + 1))) {
+    throw new MarkError("That mark is past the end of the file");
+  }
+  db.prepare(`
+    INSERT INTO markers (item_id, season, kind, start_s, end_s, source) VALUES (?, ?, ?, ?, ?, 'manual')
+    ON CONFLICT (item_id, season, kind) DO UPDATE SET start_s = excluded.start_s, end_s = excluded.end_s, source = 'manual',
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `).run(itemId, season, kind, start, end);
+}
+
+/** Back to what the files say (or the season's mark, for an episode's own). */
+export function clearMark(db: Db, item: Markable, kind: MarkerKind, scope: MarkScope): boolean {
+  const { itemId, season } = keyOf(item, scope);
+  return db.prepare("DELETE FROM markers WHERE item_id = ? AND season = ? AND kind = ?").run(itemId, season, kind).changes > 0;
+}
+
+/** Marks whose episode, film or show is gone; for the daily sweep. */
+export function purgeOrphanMarkers(db: Db): number {
+  return db.prepare(`
+    DELETE FROM markers WHERE item_id NOT IN (SELECT id FROM episodes) AND item_id NOT IN (SELECT id FROM movies)
+      AND item_id NOT IN (SELECT id FROM movie_parts) AND item_id NOT IN (SELECT id FROM shows)
+  `).run().changes;
 }

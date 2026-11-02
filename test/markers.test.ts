@@ -146,4 +146,84 @@ describe("a chaptered film", () => {
       fs.rmSync(edl);
     }
   });
+
+  const mark = (payload: object, as = headers) => app.inject({ method: "PUT", url: `/video/api/admin/markers/${id}`, headers: as, payload });
+
+  it("lets an admin's mark win over the chapters, and clearing it gives them back", async () => {
+    const set = await mark({ kind: "credits", scope: "episode", start: 40 });
+    expect(set.statusCode).toBe(200);
+    expect(set.json().markers.credits).toEqual({ start: 40, source: "manual", scope: "episode" });
+    expect((await play()).markers.intro).toEqual({ start: 5, end: 15, source: "chapter" });
+    expect((await save(45)).watched).toBe(true);
+    const cleared = (await mark({ kind: "credits", scope: "episode", start: null })).json();
+    expect(cleared.markers.credits).toEqual({ start: 50, source: "chapter" });
+  });
+
+  it("refuses a mark past the end, an intro that ends before it starts, a season for a film, and anyone but an admin", async () => {
+    expect((await mark({ kind: "credits", scope: "episode", start: 70 })).statusCode).toBe(400);
+    expect((await mark({ kind: "intro", scope: "episode", start: 10, end: 5 })).statusCode).toBe(400);
+    expect((await mark({ kind: "intro", scope: "season", start: 1, end: 5 })).statusCode).toBe(400);
+    expect((await mark({ kind: "intro", scope: "episode", start: 1, end: 5 }, { ...headers, "x-isputnik-user-role": "member" })).statusCode).toBe(403);
+  });
+});
+
+describe("marks for a season", () => {
+  const SECRET = "video-secret-video-secret-0123456789";
+  const headers = {
+    "x-isputnik-gateway": SECRET,
+    "x-isputnik-user-id": "admin",
+    "x-isputnik-user-name": "admin",
+    "x-isputnik-user-role": "admin",
+    "x-isputnik-libraries": "lib_shows"
+  };
+  let root: string;
+  let app: FastifyInstance;
+  let episodes: { id: string; season: number; episode: number }[];
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-marks-"));
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    for (const [season, episode] of [[1, 1], [1, 2], [2, 1]]) {
+      const dir = path.join(root, "Shows", "Show (2020)", `Season ${season}`);
+      fs.mkdirSync(dir, { recursive: true });
+      // Not real video: marks need no probe.
+      const file = path.join(dir, `Show (2020) S0${season}E0${episode}.mkv`);
+      fs.writeFileSync(file, "x");
+      fs.utimesSync(file, hourAgo, hourAgo);
+    }
+    app = await buildApp({
+      gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: root, version: "0.0.0-test", stage: null,
+      scan: { settleMs: 60_000 }, tools: null, fastify: { logger: false }
+    });
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_shows", headers, payload: { name: "Shows", kind: "shows", folder: "Shows" } });
+    await app.scansSettled();
+    const show = (await app.inject({ method: "GET", url: "/video/api/shows", headers })).json().items[0];
+    const detail = (await app.inject({ method: "GET", url: `/video/api/shows/${show.id}`, headers })).json();
+    episodes = detail.seasons.flatMap((season: { number: number; episodes: { id: string; episode: number }[] }) =>
+      season.episodes.map((entry) => ({ ...entry, season: season.number })));
+  });
+
+  afterAll(async () => {
+    await app?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const of = (season: number, episode: number) => episodes.find((entry) => entry.season === season && entry.episode === episode)!.id;
+  const markersOf = async (itemId: string) => (await app.inject({ method: "GET", url: `/video/api/play/${itemId}`, headers })).json().markers;
+  const mark = (itemId: string, payload: object) => app.inject({ method: "PUT", url: `/video/api/admin/markers/${itemId}`, headers, payload });
+
+  it("holds for every episode of that season and no other, and an episode's own wins", async () => {
+    expect((await mark(of(1, 1), { kind: "intro", scope: "season", start: 60, end: 120 })).statusCode).toBe(200);
+    const seasonMark = { start: 60, end: 120, source: "manual", scope: "season" };
+    expect((await markersOf(of(1, 2))).intro).toEqual(seasonMark);
+    expect((await markersOf(of(2, 1))).intro).toBeNull();
+
+    await mark(of(1, 2), { kind: "intro", scope: "episode", start: 10, end: 70 });
+    expect((await markersOf(of(1, 2))).intro).toEqual({ start: 10, end: 70, source: "manual", scope: "episode" });
+    expect((await markersOf(of(1, 1))).intro).toEqual(seasonMark);
+
+    // The episode's own cleared: the season's comes back.
+    await mark(of(1, 2), { kind: "intro", scope: "episode", start: null });
+    expect((await markersOf(of(1, 2))).intro).toEqual(seasonMark);
+  });
 });

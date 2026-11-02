@@ -137,6 +137,23 @@ CREATE TABLE IF NOT EXISTS media_probe (
   probed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+-- Where an intro and the credits are, marked by an admin in home's player
+-- (markers.ts), in seconds on the title's own clock. One row per item and kind:
+-- an episode's or film's own mark (season -1: a NULL in a key would let
+-- duplicates in), or a season's, kept on the show. The episode's own wins.
+-- The .edl and chapters are read when asked and never stored here.
+CREATE TABLE IF NOT EXISTS markers (
+  item_id     TEXT NOT NULL,
+  season      INTEGER NOT NULL DEFAULT -1,
+  kind        TEXT NOT NULL CHECK (kind IN ('intro', 'credits')),
+  start_s     REAL NOT NULL,
+  -- NULL for the credits: they run to the end.
+  end_s       REAL,
+  source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'detected')),
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (item_id, season, kind)
+);
+
 -- The admin's choices (settings.ts): one row per setting, its value JSON.
 CREATE TABLE IF NOT EXISTS settings (
   key         TEXT PRIMARY KEY,
