@@ -40,8 +40,11 @@ CREATE TABLE IF NOT EXISTS shows (
   -- 'nfo' when tvshow.nfo described it, 'folder' when only its name did.
   source        TEXT NOT NULL DEFAULT 'folder' CHECK (source IN ('folder', 'nfo')),
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  -- When the scan first found it: what "Recently added" sorts by, shows and films alike.
+  added_at      TEXT,
   UNIQUE (library_id, folder)
 );
+CREATE INDEX IF NOT EXISTS shows_added ON shows (added_at DESC);
 
 CREATE TABLE IF NOT EXISTS episodes (
   id              TEXT PRIMARY KEY,
@@ -91,8 +94,11 @@ CREATE TABLE IF NOT EXISTS movies (
   size_bytes    INTEGER NOT NULL DEFAULT 0,
   modified_at   TEXT,
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  -- When the scan first found it (see shows.added_at).
+  added_at      TEXT,
   UNIQUE (library_id, folder)
 );
+CREATE INDEX IF NOT EXISTS movies_added ON movies (added_at DESC);
 
 -- The second part of a film in several files, and those after it. movies.file
 -- and movies.id are the first part. A part plays and keeps its place like any

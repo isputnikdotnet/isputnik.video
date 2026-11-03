@@ -30,7 +30,18 @@ export function upgradeDatabase(db: Database.Database): void {
       db.exec(`INSERT INTO markers (item_id, season, kind, start_s, end_s, source, updated_at)
         SELECT item_id, season, kind, start_s, end_s, source, updated_at FROM ${OLD_MARKERS}; DROP TABLE ${OLD_MARKERS};`);
     }
+    dateTheUndated(db);
   })();
+}
+
+/** Titles from before 0.19 have no added_at: their files' age stands in, so a
+ *  library that has been there for years doesn't all read as "just added". */
+function dateTheUndated(db: Database.Database): void {
+  db.exec(`
+    UPDATE movies SET added_at = COALESCE(modified_at, updated_at) WHERE added_at IS NULL;
+    UPDATE shows SET added_at = COALESCE((SELECT MIN(e.modified_at) FROM episodes e WHERE e.show_id = shows.id), updated_at)
+      WHERE added_at IS NULL;
+  `);
 }
 
 const OLD_MARKERS = "markers_before_recap";
@@ -59,7 +70,9 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["metadata", "backdrop_picked", "INTEGER NOT NULL DEFAULT 0"],
   ["detected_markers", "recap_start", "REAL"],
   ["detected_markers", "recap_end", "REAL"],
-  ["detected_markers", "recap_checked", "INTEGER NOT NULL DEFAULT 0"]
+  ["detected_markers", "recap_checked", "INTEGER NOT NULL DEFAULT 0"],
+  ["shows", "added_at", "TEXT"],
+  ["movies", "added_at", "TEXT"]
 ];
 
 function addColumns(db: Database.Database): void {

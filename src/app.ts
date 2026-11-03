@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
-import { getMovie, getShow, listMovies, listShows, visibleLibraries } from "./catalog.js";
+import { getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries } from "./catalog.js";
 import { browserPlayability, continueWatching, fileOf, findItem, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
@@ -115,6 +115,24 @@ const listQuerySchema = z.object({
 });
 
 const itemIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+
+/** A comma-separated list in a query string, each value checked. */
+const listParam = (each: z.ZodString) =>
+  z.string().max(4000).optional()
+    .transform((value) => (value ?? "").split(",").map((part) => part.trim()).filter(Boolean))
+    .pipe(z.array(each).max(100));
+
+const kindSchema = z.enum(["shows", "movies"]);
+
+const titleQuerySchema = z.object({
+  kind: kindSchema.optional(),
+  libraries: listParam(libraryIdSchema),
+  genres: listParam(z.string().max(100)),
+  q: z.string().max(200).optional(),
+  sort: z.enum(["title", "year", "added"]).default("title"),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(200).default(60)
+});
 
 const setListQuerySchema = z.object({
   library: libraryIdSchema.optional(),
@@ -504,6 +522,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.get(`${API}/libraries`, { preHandler: requireIdentity }, async (request) => ({
     libraries: visibleLibraries(db, request.identity!)
+  }));
+
+  // Films and shows in one list, and the genres to narrow it by: home's one video page.
+  app.get(`${API}/titles`, { preHandler: requireIdentity }, async (request) => listTitles(db, request.identity!, titleQuerySchema.parse(request.query ?? {})));
+
+  app.get(`${API}/genres`, { preHandler: requireIdentity }, async (request) => ({
+    genres: visibleGenres(db, request.identity!, z.object({ kind: kindSchema.optional() }).parse(request.query ?? {}).kind)
   }));
 
   app.get(`${API}/shows`, { preHandler: requireIdentity }, async (request) => listShows(db, request.identity!, listQuerySchema.parse(request.query ?? {})));
