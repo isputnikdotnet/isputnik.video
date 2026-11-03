@@ -14,10 +14,10 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
-import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setMatch, tmdbKeySchema, type ArtKind } from "./metadata.js";
+import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setBackdropChoice, setMatch, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
-import { conversionSchema, readConversion, saveConversion } from "./settings.js";
+import { conversionSchema, detectionSchema, readConversion, readDetection, saveConversion, saveDetection } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { registerStremio } from "./stremio.js";
@@ -70,8 +70,8 @@ export interface AppOptions {
   fetch?: Fetch;
   /** Tests settle files at once instead of waiting out a copy. */
   scan?: ScanOptions;
-  /** Find intros and credits by itself (detect.ts) after each scan and on start.
-   *  The server turns it on (DETECT_MARKERS=false turns it off); tests ask for it. */
+  /** Find intros, recaps and credits by itself (detect.ts) after each scan and on
+   *  start, while the admin's setting allows. The server turns it on; tests ask for it. */
   detect?: boolean;
   fastify?: FastifyServerOptions;
 }
@@ -155,6 +155,7 @@ const matchSearchSchema = z.object({
 });
 
 const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable() });
+const backdropBodySchema = z.object({ path: imagePathSchema.nullable() });
 // A mark by hand (markers.ts); a null start clears it.
 const markBodySchema = z.object({
   kind: z.enum(["intro", "credits", "recap"]),
@@ -257,29 +258,33 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // Intros and credits found by sound and picture (detect.ts): one library, show
   // or title at a time, after the scans, never counted as catalog work — it only
   // writes rows of its own, keyed by the file it read, which a restore can't undo.
+  // The admin turns it on and off on home's Settings → Video (readDetection);
+  // turned off, what runs stops and nothing more is queued.
   const detector = tools && mediaProbe && options.detect ? new DetectRunner({ db, tools, mediaRoot: options.mediaRoot, probe: mediaProbe }) : null;
   const detectStop = new AbortController();
+  let detectPause = new AbortController();
   let detectChain: Promise<void> = Promise.resolve();
   const detectQueued = new Set<string>();
   type DetectScope = Parameters<DetectRunner["run"]>[0];
   const queueDetect = (scope: DetectScope, force: boolean, request: FastifyRequest | null) => {
-    if (!detector) return;
+    if (!detector || !readDetection(db).enabled) return;
     const key = `${JSON.stringify(scope)}:${force}`;
     if (detectQueued.has(key)) return;
     detectQueued.add(key);
     detectChain = detectChain.then(async () => {
       detectQueued.delete(key);
-      if (detectStop.signal.aborted || !(await toolsReady)) return;
+      if (detectStop.signal.aborted || !readDetection(db).enabled || !(await toolsReady)) return;
       const started = Date.now();
+      const signal = AbortSignal.any([detectStop.signal, detectPause.signal]);
       try {
-        const done = await detector.run(scope, force, detectStop.signal);
+        const done = await detector.run(scope, force, signal);
         if (done.seasons + done.films === 0) return;
         note(request, "info", "detect.finished", {
           libraryId: "library" in scope ? scope.library : null,
           detail: `${done.seasons} season(s), ${done.films} film(s): ${done.recaps} recap(s), ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
         });
       } catch (err) {
-        if (detectStop.signal.aborted) return;
+        if (signal.aborted) return;
         note(request, "error", "detect.failed", { detail: (err as Error).message });
         app.log.error({ err, scope }, "Finding intros and credits failed");
       }
@@ -290,11 +295,23 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     await metadataChain;
     await detectChain;
   });
+  /** Every library's titles not looked at yet, in the queue. */
+  const detectEverything = (request: FastifyRequest | null) => {
+    for (const library of listLibraries(db)) if (library.state === "active") queueDetect({ library: library.id }, false, request);
+  };
+  // 0.17.0 compared a recap only with the earlier episodes of its own season, so
+  // one made of the season before (Counterpart S2E02) was missed: those without
+  // one are looked at once more, their pictures already kept.
+  if (!db.prepare("SELECT 1 FROM settings WHERE key = 'recaps-reach-back'").get()) {
+    db.transaction(() => {
+      db.prepare("UPDATE detected_markers SET recap_checked = 0 WHERE recap_start IS NULL AND recap_checked = 1 AND intro_checked = 1 AND item_id IN (SELECT id FROM episodes)").run();
+      db.prepare("INSERT INTO settings (key, value) VALUES ('recaps-reach-back', 'true')").run();
+    })();
+  }
   // On start, whatever wasn't looked at before (an engine older than 0.16.0 never did).
   if (detector) {
     void toolsReady.then((ok) => {
-      if (!ok || detectStop.signal.aborted) return;
-      for (const library of listLibraries(db)) if (library.state === "active") queueDetect({ library: library.id }, false, null);
+      if (ok && !detectStop.signal.aborted) detectEverything(null);
     });
   }
 
@@ -766,7 +783,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.post(`${API}/admin/markers/:id/detect`, { preHandler: requireAdmin }, async (request, reply) => {
     const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
     if (!item) return reply.code(404).send({ error: "Not found" });
-    if (!detector) return reply.code(409).send({ error: "Finding intros by itself is turned off, or ffmpeg is missing" });
+    if (!detector) return reply.code(409).send({ error: "ffmpeg is missing: nothing can be found by itself" });
+    if (!readDetection(db).enabled) return reply.code(409).send({ error: "Finding intros, recaps and credits is turned off on Settings → Video", code: "video.detection_off" });
     queueDetect({ item: item.id }, true, request);
     return reply.code(202).send({ queued: true });
   });
@@ -886,6 +904,36 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
 
 
+  /** A show or film by id, with what its library says. */
+  const titleKindOf = (id: string): { kind: "show" | "movie"; title: string; libraryId: string; language: string } | null => {
+    const row = db.prepare(`
+      SELECT 'show' AS kind, s.title, s.library_id, l.language FROM shows s JOIN libraries l ON l.id = s.library_id WHERE s.id = @id
+      UNION ALL SELECT 'movie', m.title, m.library_id, l.language FROM movies m JOIN libraries l ON l.id = m.library_id WHERE m.id = @id
+    `).get({ id }) as { kind: "show" | "movie"; title: string; library_id: string; language: string } | undefined;
+    return row ? { kind: row.kind, title: row.title, libraryId: row.library_id, language: row.language } : null;
+  };
+
+  // Finding intros, recaps and credits by itself: on or off (settings.ts).
+  // `available` is false where the engine can't (no ffmpeg).
+  const detectionState = () => ({ ...readDetection(db), available: Boolean(detector) });
+
+  app.get(`${API}/admin/detection`, { preHandler: requireAdmin }, async () => detectionState());
+
+  app.put(`${API}/admin/detection`, { preHandler: requireAdmin }, async (request) => {
+    const settings = detectionSchema.parse(request.body);
+    const was = readDetection(db).enabled;
+    saveDetection(db, settings);
+    if (was && !settings.enabled) {
+      // What runs stops; what it finished so far is kept.
+      detectPause.abort();
+      detectPause = new AbortController();
+    } else if (!was && settings.enabled) {
+      detectEverything(request);
+    }
+    if (was !== settings.enabled) note(request, "info", "detect.changed", { detail: settings.enabled ? "Finding intros, recaps and credits turned on" : "Finding intros, recaps and credits turned off" });
+    return detectionState();
+  });
+
   // TMDB (metadata.ts): the admin's key — never sent back, only whether there
   // is one and its last characters — and what the engine made of it.
   const metadataState = () => {
@@ -932,14 +980,51 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.get(`${API}/admin/metadata/image/:file`, { preHandler: requireAdmin }, async (request, reply) => {
     const imagePath = `/${(request.params as { file: string }).file}`;
+    // ?wide: a backdrop to choose from, at a still's size; else a poster thumb.
+    const wide = (request.query as { wide?: string } | undefined)?.wide !== undefined;
     const key = readTmdbKey(db);
     if (!key || !imagePathSchema.safeParse(imagePath).success) return reply.code(404).send({ error: "Not found" });
     try {
-      const bytes = await new Tmdb(key, options.fetch).image(imagePath, IMAGE_SIZES.thumb);
+      const bytes = await new Tmdb(key, options.fetch).image(imagePath, wide ? IMAGE_SIZES.still : IMAGE_SIZES.thumb);
       return reply.header("Content-Type", ART_TYPES[path.extname(imagePath).toLowerCase()]).header("Cache-Control", "private, max-age=86400").send(bytes);
     } catch {
       return reply.code(404).send({ error: "Not found" });
     }
+  });
+
+  // A title's backdrops on TMDB, for the admin to choose from (Fix match): those
+  // with no words first; `current` is the one shown now.
+  app.get(`${API}/admin/metadata/items/:id/backdrops`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    const key = readTmdbKey(db);
+    if (!key) return reply.code(409).send({ error: "No TMDB key", code: "video.tmdb_no_key" });
+    const match = tmdbMatchOf(db, id);
+    if (!match) return { backdrops: [], current: null, chosen: false };
+    try {
+      const backdrops = await new Tmdb(key, options.fetch).backdrops(found.kind === "show" ? "tv" : "movie", match.tmdbId, found.language);
+      return {
+        backdrops: backdrops.map(({ path: imagePath, ...rest }) => ({ ...rest, path: imagePath, preview: `${API}/admin/metadata/image${imagePath}?wide` })),
+        current: match.current,
+        chosen: match.choice !== null
+      };
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  // The admin's choice of backdrop, or back to the best by votes (null): fetched
+  // at once, and the title answered as the family now sees it.
+  app.put(`${API}/admin/metadata/items/:id/backdrop`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const { path: imagePath } = backdropBodySchema.parse(request.body);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    setBackdropChoice(db, id, found.kind, imagePath);
+    await metadata.refreshOne(id);
+    note(request, "info", "metadata.backdrop", { libraryId: found.libraryId, detail: imagePath ? `${found.title}: backdrop chosen by hand` : `${found.title}: backdrop picked automatically again` });
+    return found.kind === "show" ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
   });
 
   // A match fixed by hand (a TMDB id), or handed back to the automatic one (null):

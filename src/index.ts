@@ -15,8 +15,9 @@ const app = await buildApp({
   artDir: config.artDir,
   version: config.version,
   stage: config.stage,
-  // Intros and credits found by sound and picture after each scan (detect.ts).
-  detect: process.env.DETECT_MARKERS?.trim().toLowerCase() !== "false",
+  // Intros, recaps and credits found by sound and picture after each scan
+  // (detect.ts); the admin turns it off on home's Settings → Video.
+  detect: true,
   logBuffer,
   fastify: {
     logger: { level: process.env.LOG_LEVEL?.trim() || "info", stream: logBuffer }

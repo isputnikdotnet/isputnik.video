@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
+import { bestBackdrop } from "../src/tmdb.js";
 
 const SECRET = "video-secret-video-secret-0123456789";
 const GOOD_KEY = "0123456789abcdef0123456789abcdef";
@@ -211,5 +212,18 @@ describe("with a TMDB key", () => {
     await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films renamed", kind: "movies", folder: "Movies", language: "ru" } });
     await app.scansSettled();
     expect(tmdb.asked.length).toBe(now);
+  });
+});
+
+describe("the backdrop picked", () => {
+  const image = (file_path: string, iso_639_1: string | null, vote_average: number, vote_count = 1) => ({ file_path, iso_639_1, vote_average, vote_count, width: 1920, height: 1080 });
+
+  it("is the best voted with no words on it, never one with its name across it", () => {
+    expect(bestBackdrop({ backdrops: [image("/titled.jpg", "en", 9), image("/smoke.jpg", null, 5.1), image("/portrait.jpg", null, 5.6)] })).toBe("/portrait.jpg");
+  });
+
+  it("is none when TMDB has no textless one, so its default stands", () => {
+    expect(bestBackdrop({ backdrops: [image("/titled.jpg", "ru", 7)] })).toBeNull();
+    expect(bestBackdrop(undefined)).toBeNull();
   });
 });

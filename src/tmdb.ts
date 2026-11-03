@@ -41,6 +41,17 @@ const searchSchema = z.object({
 
 const genreList = z.array(z.object({ name: z.string() })).optional();
 
+const imagesSchema = z.object({
+  backdrops: z.array(z.object({
+    file_path: z.string(),
+    iso_639_1: z.string().nullable().optional(),
+    vote_average: z.number().nullable().optional(),
+    vote_count: z.number().nullable().optional(),
+    width: z.number().nullable().optional(),
+    height: z.number().nullable().optional()
+  }).passthrough()).default([])
+}).passthrough();
+
 const movieSchema = z.object({
   id: z.number(),
   title: z.string().optional(),
@@ -52,6 +63,7 @@ const movieSchema = z.object({
   runtime: z.number().nullable().optional(),
   poster_path: z.string().nullable().optional(),
   backdrop_path: z.string().nullable().optional(),
+  images: imagesSchema.optional(),
   belongs_to_collection: z.object({ id: z.number(), name: z.string().optional() }).passthrough().nullable().optional()
 }).passthrough();
 
@@ -74,7 +86,8 @@ const showSchema = z.object({
   vote_average: z.number().nullable().optional(),
   status: z.string().nullable().optional(),
   poster_path: z.string().nullable().optional(),
-  backdrop_path: z.string().nullable().optional()
+  backdrop_path: z.string().nullable().optional(),
+  images: imagesSchema.optional()
 }).passthrough();
 
 const seasonSchema = z.object({
@@ -87,6 +100,24 @@ const seasonSchema = z.object({
     runtime: z.number().nullable().optional()
   }).passthrough()).default([])
 }).passthrough();
+
+/** TMDB's backdrops with no words on them (iso_639_1 null), best voted first. A
+ *  title's default backdrop is often a poster-like picture with its name across
+ *  it, or a still that says nothing; the family's own votes pick better. */
+export function bestBackdrop(images: z.infer<typeof imagesSchema> | undefined): string | null {
+  const textless = (images?.backdrops ?? []).filter((image) => !image.iso_639_1 && imagePathSchema.safeParse(image.file_path).success);
+  textless.sort((a, b) => (b.vote_average ?? 0) - (a.vote_average ?? 0) || (b.vote_count ?? 0) - (a.vote_count ?? 0) || (b.width ?? 0) - (a.width ?? 0));
+  return textless[0]?.file_path ?? null;
+}
+
+export interface TmdbBackdrop {
+  path: string;
+  /** Null for one with no words on it. */
+  language: string | null;
+  width: number | null;
+  height: number | null;
+  votes: number;
+}
 
 const findSchema = z.object({
   movie_results: z.array(z.object({ id: z.number() }).passthrough()).default([]),
@@ -195,8 +226,10 @@ export class Tmdb {
   }
 
   async details(kind: TmdbKind, tmdbId: string, language: string): Promise<TmdbDetails> {
+    // The pictures with no words on them come along in the same request.
+    const withImages = { language, append_to_response: "images", include_image_language: "null" };
     if (kind === "movie") {
-      const movie = await this.get(`/movie/${encodeURIComponent(tmdbId)}`, { language }, movieSchema);
+      const movie = await this.get(`/movie/${encodeURIComponent(tmdbId)}`, withImages, movieSchema);
       return {
         tmdbId: String(movie.id),
         title: text(movie.title),
@@ -208,13 +241,13 @@ export class Tmdb {
         rating: movie.vote_average ?? null,
         status: null,
         posterPath: movie.poster_path ?? null,
-        backdropPath: movie.backdrop_path ?? null,
+        backdropPath: bestBackdrop(movie.images) ?? movie.backdrop_path ?? null,
         collection: movie.belongs_to_collection
           ? { tmdbId: String(movie.belongs_to_collection.id), name: text(movie.belongs_to_collection.name) }
           : null
       };
     }
-    const show = await this.get(`/tv/${encodeURIComponent(tmdbId)}`, { language }, showSchema);
+    const show = await this.get(`/tv/${encodeURIComponent(tmdbId)}`, withImages, showSchema);
     return {
       tmdbId: String(show.id),
       title: text(show.name),
@@ -226,9 +259,21 @@ export class Tmdb {
       rating: show.vote_average ?? null,
       status: text(show.status),
       posterPath: show.poster_path ?? null,
-      backdropPath: show.backdrop_path ?? null,
+      backdropPath: bestBackdrop(show.images) ?? show.backdrop_path ?? null,
       collection: null
     };
+  }
+
+  /** Every backdrop TMDB has for a title, for the admin to choose from: those with
+   *  no words first, then the library's language's and English. */
+  async backdrops(kind: TmdbKind, tmdbId: string, language: string): Promise<TmdbBackdrop[]> {
+    const lang = language.slice(0, 2);
+    const found = await this.get(`/${kind}/${encodeURIComponent(tmdbId)}/images`, { include_image_language: [...new Set(["null", lang, "en"])].join(",") }, imagesSchema);
+    return found.backdrops
+      .filter((image) => imagePathSchema.safeParse(image.file_path).success)
+      .map((image) => ({ path: image.file_path, language: image.iso_639_1 ?? null, width: image.width ?? null, height: image.height ?? null, votes: image.vote_average ?? 0 }))
+      .sort((a, b) => Number(a.language !== null) - Number(b.language !== null) || b.votes - a.votes)
+      .slice(0, 40);
   }
 
   /** A collection of films: its words, its art and its parts. */

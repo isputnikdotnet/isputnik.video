@@ -55,6 +55,8 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["metadata", "set_tmdb_id", "TEXT"],
   ["metadata", "set_name", "TEXT"],
   ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"],
+  ["metadata", "backdrop_choice", "TEXT"],
+  ["metadata", "backdrop_picked", "INTEGER NOT NULL DEFAULT 0"],
   ["detected_markers", "recap_start", "REAL"],
   ["detected_markers", "recap_end", "REAL"],
   ["detected_markers", "recap_checked", "INTEGER NOT NULL DEFAULT 0"]

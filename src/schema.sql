@@ -242,6 +242,10 @@ CREATE TABLE IF NOT EXISTS metadata (
   set_tmdb_id    TEXT,
   set_name       TEXT,
   set_checked    INTEGER NOT NULL DEFAULT 0,
+  -- A TMDB backdrop the admin chose (Fix match); backdrop_path follows it. And
+  -- 1 once the backdrop was picked from TMDB's textless ones by votes (0.18.0).
+  backdrop_choice TEXT,
+  backdrop_picked INTEGER NOT NULL DEFAULT 0,
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

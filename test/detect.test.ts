@@ -179,6 +179,16 @@ describe("a season looked at", () => {
     expect((await markersOf(ids[0])).credits.source).toBe("detected");
   });
 
+  it("is turned off and on by the admin's setting, which Find again respects", async () => {
+    expect((await app.inject({ method: "GET", url: "/video/api/admin/detection", headers })).json()).toEqual({ enabled: true, available: true });
+    expect((await app.inject({ method: "PUT", url: "/video/api/admin/detection", headers, payload: { enabled: false } })).json().enabled).toBe(false);
+    const refused = await app.inject({ method: "POST", url: `/video/api/admin/markers/${ids[1]}/detect`, headers });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().code).toBe("video.detection_off");
+    await app.inject({ method: "PUT", url: "/video/api/admin/detection", headers, payload: { enabled: true } });
+    await app.detectionSettled();
+  });
+
   it("looks again when an admin asks, and only an admin", async () => {
     const asked = await app.inject({ method: "POST", url: `/video/api/admin/markers/${ids[1]}/detect`, headers });
     expect(asked.statusCode).toBe(202);

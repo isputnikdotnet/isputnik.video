@@ -702,14 +702,15 @@ export class DetectRunner {
       if (targets.length === 0 || (!force && targets.every((target) => this.fresh(target)))) continue;
       const rows = await detectSeason(this.options.tools, targets, signal);
       // Recaps: each episode's opening against every episode before it this
-      // season; the first episode's against the end of the season before.
+      // season and the end of the season before — an episode's recap may reach
+      // back past the premiere (Counterpart S2E02 is all season 1).
       const prints: (Uint32Array | null)[] = [];
       for (const target of targets) prints.push(await this.printsOf(target, signal));
       const before = await this.previousSeason(show_id, season, signal);
       for (const [i, row] of rows.entries()) {
         signal?.throwIfAborted();
         const own = prints[i];
-        const earlier = i === 0 ? before : prints.slice(0, i).filter((p): p is Uint32Array => p !== null);
+        const earlier = [...before, ...prints.slice(0, i).filter((p): p is Uint32Array => p !== null)];
         const recap = own && earlier.length > 0 ? await recapFromPrints(own, earlier, row.intro_start) : null;
         row.recap_start = recap?.start ?? null;
         row.recap_end = recap?.end ?? null;

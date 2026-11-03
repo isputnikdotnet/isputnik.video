@@ -24,7 +24,32 @@ export function readConversion(db: Db): ConversionSettings {
 }
 
 export function saveConversion(db: Db, settings: ConversionSettings): void {
+  save(db, CONVERSION_KEY, settings);
+}
+
+function save(db: Db, key: string, value: unknown): void {
   db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`)
-    .run(CONVERSION_KEY, JSON.stringify(settings));
+    .run(key, JSON.stringify(value));
+}
+
+// Finding intros, recaps and credits by itself (detect.ts): on unless the admin
+// turned it off on home's Settings → Video. It reads every episode's sound and
+// picture once, which a small server may rather not spend.
+export const detectionSchema = z.object({ enabled: z.boolean() });
+export type DetectionSettings = z.infer<typeof detectionSchema>;
+
+const DETECTION_KEY = "detection";
+
+export function readDetection(db: Db): DetectionSettings {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(DETECTION_KEY) as { value: string } | undefined;
+  try {
+    return row ? detectionSchema.parse(JSON.parse(row.value)) : { enabled: true };
+  } catch {
+    return { enabled: true };
+  }
+}
+
+export function saveDetection(db: Db, settings: DetectionSettings): void {
+  save(db, DETECTION_KEY, settings);
 }
