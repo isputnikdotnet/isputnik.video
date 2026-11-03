@@ -1,6 +1,10 @@
 // Posters and TMDB: art beside the files first, then a (fake) TMDB once the
 // admin gives a key — matched by IMDb id or by title and year, its words only
 // where the .nfo left a gap — and a match fixed by hand that a rescan keeps.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
@@ -205,6 +209,40 @@ describe("with a TMDB key", () => {
     expect(again.body).toBe("image /t/p/w1280/portrait202.jpg");
     expect(again.url).not.toBe(chosen.url);
     expect((await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: mum, payload: { path: null } })).statusCode).toBe(403);
+  });
+
+  it("fetches a chosen backdrop that 0.18.0 recorded without fetching, when it is chosen again", async () => {
+    // A database and art folder of their own, kept across two runs of the engine.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
+    const dbPath = path.join(dir, "video.sqlite");
+    const artDir = path.join(dir, "art");
+    const boot = () => buildApp({
+      gatewaySecret: SECRET, devUser: null, dbPath, artDir, mediaRoot: fixture.root, version: "0.0.0-test", stage: null,
+      scan: { settleMs: 60_000 }, fetch: tmdb.fetchImpl, tools: null, fastify: { logger: false }
+    });
+    let own = await boot();
+    try {
+      await own.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_shows", headers: admin, payload: { name: "Shows", kind: "shows", folder: "Shows" } });
+      await own.inject({ method: "PUT", url: "/video/api/admin/metadata", headers: admin, payload: { tmdbKey: GOOD_KEY } });
+      await own.scansSettled();
+      const id = ((await own.inject({ method: "GET", url: "/video/api/shows", headers: mum })).json().items as { id: string; title: string }[]).find((show) => show.title === "Counterpart")!.id;
+      await own.close();
+      // As 0.18.0 left it: the choice recorded as the picture kept, the old picture
+      // still in the file, under the name every backdrop had then.
+      const db = new Database(dbPath);
+      fs.writeFileSync(path.join(artDir, `${id}-backdrop.jpg`), "the old picture");
+      db.prepare("UPDATE metadata SET backdrop = ?, backdrop_path = '/smoke202.jpg', backdrop_choice = '/smoke202.jpg' WHERE item_id = ?").run(`cache:${id}-backdrop.jpg`, id);
+      db.close();
+
+      own = await boot();
+      await own.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: admin, payload: { path: "/smoke202.jpg" } });
+      const url = (await own.inject({ method: "GET", url: `/video/api/shows/${id}`, headers: mum })).json().backdrop as string;
+      expect((await own.inject({ method: "GET", url, headers: mum })).body).toBe("image /t/p/w1280/smoke202.jpg");
+      expect(fs.existsSync(path.join(artDir, `${id}-backdrop.jpg`))).toBe(false);
+    } finally {
+      await own.close();
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    }
   });
 
   it("lets an admin fix a match by hand, keeps it through a rescan, and give it back", async () => {

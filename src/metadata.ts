@@ -122,6 +122,12 @@ export const metaGenres = (row: MetaRow | undefined): string[] => {
   }
 };
 
+/** A TMDB picture's file in the art folder: what it shows and which picture it is. */
+function cacheName(name: string, imagePath: string): string {
+  const which = crypto.createHash("sha1").update(imagePath).digest("hex").slice(0, 8);
+  return `${name}-${which}${path.extname(imagePath).toLowerCase()}`;
+}
+
 /** Where a picture is served, with a version so a new one isn't cached as the old. */
 export function versionedArtUrl(api: string, id: string, kind: ArtKind, source: string): string {
   const version = crypto.createHash("sha1").update(source).digest("hex").slice(0, 8);
@@ -259,22 +265,23 @@ export class MetadataRunner {
     const bytes = await tmdb.image(imagePath, size);
     await sleep(PAUSE_MS);
     fs.mkdirSync(this.ctx.artDir, { recursive: true });
-    const which = crypto.createHash("sha1").update(imagePath).digest("hex").slice(0, 8);
-    const file = `${name}-${which}${path.extname(imagePath).toLowerCase()}`;
+    const file = cacheName(name, imagePath);
     fs.writeFileSync(path.join(this.ctx.artDir, file), bytes);
     if (previous?.startsWith("cache:") && previous.slice(6) !== file) fs.rmSync(path.join(this.ctx.artDir, previous.slice(6)), { force: true });
     return `cache:${file}`;
   }
 
   /** The picture to show: one beside the files, else TMDB's (fetched if it isn't
-   *  here yet), else none. `cachedPath` is the TMDB picture the kept file is —
-   *  the row as it was before this pass, since by now it may name a new one. */
-  private async pick(tmdb: Tmdb | null, row: MetaRow, kind: ArtKind, local: string | null, imagePath: string | null, cachedPath: string | null): Promise<string | null> {
+   *  here yet), else none. The kept file's name says which of TMDB's pictures it
+   *  is, so nothing else has to remember it: a record written by 0.18.0 named the
+   *  chosen picture without having fetched it, and one named before 0.18.1 says
+   *  nothing — both are fetched again, once. */
+  private async pick(tmdb: Tmdb | null, row: MetaRow, kind: ArtKind, local: string | null, imagePath: string | null): Promise<string | null> {
     if (local) return local;
     const current = row[kind];
     const cached = current?.startsWith("cache:") && artFile(row, kind, this.ctx.mediaRoot, this.ctx.artDir) ? current : null;
     if (!imagePath) return null;
-    if (cached && cachedPath === imagePath) return cached;
+    if (cached === `cache:${cacheName(`${row.item_id}-${kind}`, imagePath)}`) return cached;
     if (!tmdb) return cached;
     const size = kind === "poster" ? IMAGE_SIZES.poster : kind === "backdrop" ? IMAGE_SIZES.backdrop : IMAGE_SIZES.still;
     return this.download(tmdb, imagePath, size, `${row.item_id}-${kind}`, current);
@@ -308,8 +315,6 @@ export class MetadataRunner {
     const tmdbKind: TmdbKind = kind === "show" ? "tv" : "movie";
     const existing = metaFor(db, [title.id, ...episodes.map((episode) => episode.id)]);
     const row: MetaRow = { ...(existing.get(title.id) ?? emptyRow(title.id, kind)), kind };
-    // Which TMDB pictures the kept files are, before this pass names new ones.
-    const kept = { poster: row.poster_path, backdrop: row.backdrop_path };
 
     // Beside the files: the title's own folder; a film without one, its own name in the folder it sits in.
     const loose = kind === "movie" && title.folder === title.file;
@@ -358,8 +363,8 @@ export class MetadataRunner {
     }
 
     try {
-      row.poster = await this.pick(tmdb, row, "poster", localPoster, row.poster_path, kept.poster);
-      row.backdrop = await this.pick(tmdb, row, "backdrop", localBackdrop, row.backdrop_path, kept.backdrop);
+      row.poster = await this.pick(tmdb, row, "poster", localPoster, row.poster_path);
+      row.backdrop = await this.pick(tmdb, row, "backdrop", localBackdrop, row.backdrop_path);
     } catch (err) {
       summary.error ??= `${title.title}: ${(err as Error).message}`;
     }
@@ -382,7 +387,7 @@ export class MetadataRunner {
       const episodeStem = path.basename(episode.file, path.extname(episode.file));
       const localThumb = findImage(mediaRoot, episodeDir, [`${episodeStem}-thumb`, episodeStem]);
       try {
-        own.still = await this.pick(tmdb, own, "still", localThumb, own.still_path, existing.get(episode.id)?.still_path ?? null);
+        own.still = await this.pick(tmdb, own, "still", localThumb, own.still_path);
       } catch (err) {
         summary.error ??= `${title.title} S${episode.season}E${episode.episode}: ${(err as Error).message}`;
       }
