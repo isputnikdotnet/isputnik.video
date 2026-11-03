@@ -266,39 +266,56 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   let detectChain: Promise<void> = Promise.resolve();
   const detectQueued = new Set<string>();
   type DetectScope = Parameters<DetectRunner["run"]>[0];
-  const queueDetect = (scope: DetectScope, force: boolean, request: FastifyRequest | null) => {
+  /** What an admin asked for (Find again): run at the next season boundary of
+   *  whatever long pass is going, not after it — a first pass takes hours. */
+  const detectUrgent: { scope: DetectScope; request: FastifyRequest | null }[] = [];
+  const runDetect = async (scope: DetectScope, force: boolean, request: FastifyRequest | null, between?: () => Promise<void>) => {
+    if (!detector || detectStop.signal.aborted || !readDetection(db).enabled || !(await toolsReady)) return;
+    const started = Date.now();
+    const signal = AbortSignal.any([detectStop.signal, detectPause.signal]);
+    try {
+      const done = await detector.run(scope, force, signal, between);
+      if (done.seasons + done.films === 0) return;
+      note(request, "info", "detect.finished", {
+        libraryId: "library" in scope ? scope.library : null,
+        detail: `${done.seasons} season(s), ${done.films} film(s): ${done.recaps} recap(s), ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
+      });
+    } catch (err) {
+      if (signal.aborted) return;
+      note(request, "error", "detect.failed", { detail: (err as Error).message });
+      app.log.error({ err, scope }, "Finding intros and credits failed");
+    }
+  };
+  const drainUrgent = async () => {
+    while (detectUrgent.length > 0) {
+      const job = detectUrgent.shift()!;
+      await runDetect(job.scope, true, job.request);
+    }
+  };
+  const queueDetect = (scope: DetectScope, force: boolean, request: FastifyRequest | null, urgent = false) => {
     if (!detector || !readDetection(db).enabled) return;
+    if (urgent) {
+      detectUrgent.push({ scope, request });
+      // Taken up by the pass going on now, between two seasons, or else at once.
+      detectChain = detectChain.then(drainUrgent);
+      return;
+    }
     const key = `${JSON.stringify(scope)}:${force}`;
     if (detectQueued.has(key)) return;
     detectQueued.add(key);
     detectChain = detectChain.then(async () => {
       detectQueued.delete(key);
-      if (detectStop.signal.aborted || !readDetection(db).enabled || !(await toolsReady)) return;
-      const started = Date.now();
-      const signal = AbortSignal.any([detectStop.signal, detectPause.signal]);
-      try {
-        const done = await detector.run(scope, force, signal);
-        if (done.seasons + done.films === 0) return;
-        note(request, "info", "detect.finished", {
-          libraryId: "library" in scope ? scope.library : null,
-          detail: `${done.seasons} season(s), ${done.films} film(s): ${done.recaps} recap(s), ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
-        });
-      } catch (err) {
-        if (signal.aborted) return;
-        note(request, "error", "detect.failed", { detail: (err as Error).message });
-        app.log.error({ err, scope }, "Finding intros and credits failed");
-      }
-    });
+      await runDetect(scope, force, request, drainUrgent);
+    }).finally(() => { detector.working = null; });
   };
   app.decorate("detectionSettled", async () => {
     await scanChain;
     await metadataChain;
     await detectChain;
   });
-  /** Every library's titles not looked at yet, in the queue. */
-  const detectEverything = (request: FastifyRequest | null) => {
-    for (const library of listLibraries(db)) if (library.state === "active") queueDetect({ library: library.id }, false, request);
-  };
+  /** Every title not looked at yet, in one pass over all the libraries, what is
+   *  being watched first (so a big kids' library doesn't keep the show on now waiting for hours). */
+  const detectEverything = (request: FastifyRequest | null) => queueDetect({ all: true }, false, request);
   // 0.17.0 compared a recap only with the earlier episodes of its own season, so
   // one made of the season before (Counterpart S2E02) was missed: those without
   // one are looked at once more, their pictures already kept.
@@ -785,7 +802,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!item) return reply.code(404).send({ error: "Not found" });
     if (!detector) return reply.code(409).send({ error: "ffmpeg is missing: nothing can be found by itself" });
     if (!readDetection(db).enabled) return reply.code(409).send({ error: "Finding intros, recaps and credits is turned off on Settings → Video", code: "video.detection_off" });
-    queueDetect({ item: item.id }, true, request);
+    queueDetect({ item: item.id }, true, request, true);
     return reply.code(202).send({ queued: true });
   });
 
@@ -915,7 +932,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // Finding intros, recaps and credits by itself: on or off (settings.ts).
   // `available` is false where the engine can't (no ffmpeg).
-  const detectionState = () => ({ ...readDetection(db), available: Boolean(detector) });
+  // `working` says what it is on now ("Counterpart · season 2"), null when idle.
+  const detectionState = () => ({ ...readDetection(db), available: Boolean(detector), working: detector?.working ?? null });
 
   app.get(`${API}/admin/detection`, { preHandler: requireAdmin }, async () => detectionState());
 

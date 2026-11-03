@@ -42,7 +42,14 @@ function fakeTmdb() {
     if (path === "/movie/404") return json({ id: 404, title: "The Right Film", overview: "The one.", release_date: "1999-01-01", genres: [{ name: "Thriller" }], vote_average: 6, poster_path: "/p404.jpg", backdrop_path: null });
     if (path === "/search/tv") return json({ results: query.startsWith("Counterpart") ? [{ id: 202, name: "Counterpart", first_air_date: "2017-12-10" }] : [] });
     if (path === "/find/tt33022834") return json({ movie_results: [], tv_results: [{ id: 303 }] });
-    if (path === "/tv/202") return json({ id: 202, name: "Counterpart", overview: "A spy story.", first_air_date: "2017-12-10", genres: [{ name: "Sci-Fi" }], poster_path: "/p202.jpg", backdrop_path: "/b202.jpg" });
+    // TMDB's default backdrop is the titled one; the best textless one is the portrait.
+    const backdrops202 = [
+      { file_path: "/b202.jpg", iso_639_1: "en", vote_average: 6, vote_count: 9, width: 1920, height: 1080 },
+      { file_path: "/smoke202.jpg", iso_639_1: null, vote_average: 5.1, vote_count: 3, width: 1920, height: 1080 },
+      { file_path: "/portrait202.jpg", iso_639_1: null, vote_average: 5.6, vote_count: 4, width: 1920, height: 1080 }
+    ];
+    if (path === "/tv/202") return json({ id: 202, name: "Counterpart", overview: "A spy story.", first_air_date: "2017-12-10", genres: [{ name: "Sci-Fi" }], poster_path: "/p202.jpg", backdrop_path: "/b202.jpg", images: { backdrops: backdrops202.filter((image) => image.iso_639_1 === null) } });
+    if (path === "/tv/202/images") return json({ backdrops: backdrops202 });
     if (path === "/tv/202/season/2") return json({ episodes: [
       { episode_number: 1, name: "Inside Out", overview: "Howard wakes.", still_path: "/s1.jpg" },
       { episode_number: 2, name: "Outside In", overview: "Emily returns.", still_path: "/s2.jpg" }
@@ -162,6 +169,42 @@ describe("with a TMDB key", () => {
     await app.scansSettled();
     expect(tmdb.asked.slice(before).filter((request) => request.startsWith("/3/movie/"))).toHaveLength(1);
     expect(tmdb.asked.slice(before).some((request) => request.startsWith("/t/p/"))).toBe(false);
+  });
+
+  it("takes the best textless backdrop, lets an admin choose another, and shows the new picture at a new address", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const id = byTitle(await shows(), "Counterpart").id as string;
+    const backdrop = async () => {
+      const url = (await app.inject({ method: "GET", url: `/video/api/shows/${id}`, headers: mum })).json().backdrop as string;
+      return { url, body: (await app.inject({ method: "GET", url, headers: mum })).body };
+    };
+    const auto = await backdrop();
+    expect(auto.body).toBe("image /t/p/w1280/portrait202.jpg");
+
+    const list = (await app.inject({ method: "GET", url: `/video/api/admin/metadata/items/${id}/backdrops`, headers: admin })).json();
+    expect(list.backdrops.map((image: { path: string }) => image.path)).toEqual(["/portrait202.jpg", "/smoke202.jpg", "/b202.jpg"]);
+    expect(list).toMatchObject({ current: "/portrait202.jpg", chosen: false });
+    expect(list.backdrops[0].preview).toBe("/video/api/admin/metadata/image/portrait202.jpg?wide");
+
+    const chose = await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: admin, payload: { path: "/smoke202.jpg" } });
+    expect(chose.statusCode).toBe(200);
+    const chosen = await backdrop();
+    // The chosen picture, at an address no browser has kept the old one under.
+    expect(chosen.body).toBe("image /t/p/w1280/smoke202.jpg");
+    expect(chosen.url).not.toBe(auto.url);
+    expect(chose.json().show.backdrop).toBe(chosen.url);
+
+    // Kept through a refresh of the whole library.
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_shows/metadata", headers: admin });
+    await app.scansSettled();
+    expect((await backdrop()).body).toBe("image /t/p/w1280/smoke202.jpg");
+
+    await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: admin, payload: { path: null } });
+    const again = await backdrop();
+    expect(again.body).toBe("image /t/p/w1280/portrait202.jpg");
+    expect(again.url).not.toBe(chosen.url);
+    expect((await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: mum, payload: { path: null } })).statusCode).toBe(403);
   });
 
   it("lets an admin fix a match by hand, keeps it through a rescan, and give it back", async () => {

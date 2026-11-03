@@ -673,13 +673,41 @@ export class DetectRunner {
     return out;
   }
 
-  /** `library` or `show`/`movie` (a title), or one `item` (its season, or the film). */
-  async run(scope: { library: string } | { show: string } | { movie: string } | { item: string }, force: boolean, signal?: AbortSignal): Promise<DetectSummary> {
+  /** What is being looked at now ("Counterpart · season 2"), for the admin; null when idle. */
+  working: string | null = null;
+
+  /** `all` (every library, what was watched lately first), a `library`, a
+   *  `show`/`movie` (a title), or one `item` (its season, or the film).
+   *  `between` runs before each season or film: where more urgent work cuts in. */
+  async run(
+    scope: { all: true } | { library: string } | { show: string } | { movie: string } | { item: string },
+    force: boolean,
+    signal?: AbortSignal,
+    between?: () => Promise<void>
+  ): Promise<DetectSummary> {
     const { db } = this.options;
     const summary: DetectSummary = { seasons: 0, films: 0, recaps: 0, intros: 0, credits: 0 };
     let seasons: { show_id: string; season: number }[] = [];
     let films: string[] = [];
-    if ("library" in scope) {
+    if ("all" in scope) {
+      // A whole library's first pass takes hours: the shows and films someone is
+      // watching are looked at first, then the rest by name.
+      seasons = db.prepare(`
+        SELECT e.show_id, e.season FROM episodes e JOIN shows s ON s.id = e.show_id JOIN libraries l ON l.id = s.library_id
+        WHERE l.state = 'active'
+        GROUP BY e.show_id, e.season
+        ORDER BY (SELECT MAX(p.updated_at) FROM progress p JOIN episodes w ON w.id = p.item_id WHERE w.show_id = e.show_id) IS NULL,
+          (SELECT MAX(p.updated_at) FROM progress p JOIN episodes w ON w.id = p.item_id WHERE w.show_id = e.show_id) DESC,
+          MIN(s.sort_title), e.season
+      `).all() as typeof seasons;
+      films = (db.prepare(`
+        SELECT f.id FROM (
+          SELECT m.id, m.id AS movie_id, m.sort_title FROM movies m JOIN libraries l ON l.id = m.library_id WHERE l.state = 'active'
+          UNION ALL SELECT p.id, m.id, m.sort_title FROM movie_parts p JOIN movies m ON m.id = p.movie_id JOIN libraries l ON l.id = m.library_id WHERE l.state = 'active'
+        ) f
+        ORDER BY (SELECT MAX(updated_at) FROM progress WHERE item_id = f.id) IS NULL, (SELECT MAX(updated_at) FROM progress WHERE item_id = f.id) DESC, f.sort_title
+      `).all() as { id: string }[]).map((row) => row.id);
+    } else if ("library" in scope) {
       seasons = db.prepare("SELECT e.show_id, e.season FROM episodes e JOIN shows s ON s.id = e.show_id WHERE s.library_id = ? GROUP BY e.show_id, e.season ORDER BY MIN(s.sort_title), e.season").all(scope.library) as typeof seasons;
       films = filmsWhere(db, "m.library_id = ?", scope.library);
     } else if ("show" in scope) {
@@ -693,6 +721,7 @@ export class DetectRunner {
     }
     for (const { show_id, season } of seasons) {
       signal?.throwIfAborted();
+      await between?.();
       const ids = (db.prepare("SELECT id FROM episodes WHERE show_id = ? AND season = ? ORDER BY episode").all(show_id, season) as { id: string }[]).map((row) => row.id);
       const targets: DetectTarget[] = [];
       for (const id of ids) {
@@ -700,6 +729,8 @@ export class DetectRunner {
         if (target) targets.push(target);
       }
       if (targets.length === 0 || (!force && targets.every((target) => this.fresh(target)))) continue;
+      const title = (db.prepare("SELECT title FROM shows WHERE id = ?").get(show_id) as { title: string } | undefined)?.title ?? show_id;
+      this.working = `${title} · season ${season}`;
       const rows = await detectSeason(this.options.tools, targets, signal);
       // Recaps: each episode's opening against every episode before it this
       // season and the end of the season before — an episode's recap may reach
@@ -724,8 +755,10 @@ export class DetectRunner {
     }
     for (const id of films) {
       signal?.throwIfAborted();
+      await between?.();
       const target = await this.target(id);
       if (!target || (!force && this.fresh(target))) continue;
+      this.working = (db.prepare("SELECT m.title FROM movies m LEFT JOIN movie_parts p ON p.movie_id = m.id WHERE m.id = ? OR p.id = ?").get(id, id) as { title: string } | undefined)?.title ?? id;
       const row = await detectFilm(this.options.tools, target, signal);
       writeDetected(db, row);
       summary.films += 1;
