@@ -19,16 +19,18 @@ import type { MediaChapter, MediaInfo } from "./ffmpeg.js";
 export type MarkerSource = "manual" | "edl" | "chapter" | "detected";
 /** A mark for this episode or film alone, or for every episode of its season. */
 export type MarkScope = "episode" | "season";
-export type MarkerKind = "intro" | "credits";
+export type MarkerKind = "intro" | "credits" | "recap";
 
 export interface Markers {
+  /** "Previously on": an episode's own, never a season's (each is its own length). */
+  recap: { start: number; end: number; source: MarkerSource; scope?: MarkScope } | null;
   /** `scope` says where a mark by hand is kept, so it can be cleared there. */
   intro: { start: number; end: number; source: MarkerSource; scope?: MarkScope } | null;
   /** To the end of the file. */
   credits: { start: number; source: MarkerSource; scope?: MarkScope } | null;
 }
 
-export const NO_MARKERS: Markers = { intro: null, credits: null };
+export const NO_MARKERS: Markers = { recap: null, intro: null, credits: null };
 
 /** An .edl is a few lines; anything bigger is not one. */
 const MAX_EDL_BYTES = 64 * 1024;
@@ -45,6 +47,10 @@ const CREDITS_NAMES = new Set([
   "credits", "end credits", "closing credits", "ending", "ed", "ending theme", "ending credits", "outro",
   "титры", "финальные титры", "конечные титры", "аутро", "эндинг"
 ]);
+const RECAP_NAMES = new Set([
+  "recap", "previously", "previously on", "last time", "last time on", "story so far", "the story so far",
+  "ранее", "ранее в сериале", "в предыдущих сериях", "в предыдущей серии", "previously in", "краткое содержание"
+]);
 
 /** "OP 1", "Ending:", " End  Credits " read as the name they are. */
 const chapterName = (title: string) => title
@@ -54,17 +60,18 @@ const chapterName = (title: string) => title
   .replace(/ ?\d+$/, "");
 
 /** What a chapter is, by its name alone. */
-export function chapterKind(title: string | null): "intro" | "credits" | null {
+export function chapterKind(title: string | null): MarkerKind | null {
   if (!title) return null;
   const name = chapterName(title);
   if (INTRO_NAMES.has(name)) return "intro";
+  if (RECAP_NAMES.has(name)) return "recap";
   return CREDITS_NAMES.has(name) ? "credits" : null;
 }
 
-/** An intro in the first half of the file, the credits in the second. A
- *  "Credits" chapter a few minutes in is the opening's, and says nothing here. */
+/** A recap and an intro in the first half of the file, the credits in the second.
+ *  A "Credits" chapter a few minutes in is the opening's, and says nothing here. */
 export function markersFromChapters(chapters: MediaChapter[], start: number, duration: number): Markers {
-  const found: Markers = { intro: null, credits: null };
+  const found: Markers = { recap: null, intro: null, credits: null };
   if (duration <= 0) return found;
   const half = duration / 2;
   // A clock a hair below 0 is sound's encoder delay, not a late start.
@@ -75,6 +82,8 @@ export function markersFromChapters(chapters: MediaChapter[], start: number, dur
     const to = chapter.end - offset;
     if (kind === "intro" && !found.intro && from < half && to - from >= MIN_INTRO_S) {
       found.intro = { start: from, end: to, source: "chapter" };
+    } else if (kind === "recap" && !found.recap && from < half && to - from >= MIN_INTRO_S) {
+      found.recap = { start: from, end: to, source: "chapter" };
     } else if (kind === "credits" && !found.credits && from >= half) {
       found.credits = { start: from, source: "chapter" };
     }
@@ -103,9 +112,10 @@ export function parseEdl(text: string): { start: number; end: number }[] {
 }
 
 /** An .edl says nothing of what a stretch is: an intro starts in the first third
- *  of the file, the credits run to its end from somewhere in the second half. */
+ *  of the file, the credits run to its end from somewhere in the second half. A
+ *  recap can't be told from an intro there, so an .edl gives none. */
 export function markersFromEdl(stretches: { start: number; end: number }[], duration: number): Markers {
-  const found: Markers = { intro: null, credits: null };
+  const found: Markers = { recap: null, intro: null, credits: null };
   if (duration <= 0) return found;
   for (const { start, end } of stretches) {
     if (!found.credits && start >= duration / 2 && end >= duration - END_SLACK_S) found.credits = { start, source: "edl" };
@@ -129,19 +139,23 @@ function readEdl(videoFile: string): { start: number; end: number }[] {
  *  own. Without the probe only the marks and what was found: an .edl means
  *  nothing without the file's length. */
 export function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS, detected: Markers = NO_MARKERS): Markers {
-  if (!info) return { intro: marks.intro ?? detected.intro, credits: marks.credits ?? detected.credits };
+  if (!info) return { recap: marks.recap ?? detected.recap, intro: marks.intro ?? detected.intro, credits: marks.credits ?? detected.credits };
   const edl = markersFromEdl(readEdl(videoFile), info.duration);
   const chapters = markersFromChapters(info.chapters, info.start, info.duration);
   return {
+    recap: marks.recap ?? chapters.recap ?? detected.recap,
     intro: marks.intro ?? edl.intro ?? chapters.intro ?? detected.intro,
     credits: marks.credits ?? edl.credits ?? chapters.credits ?? detected.credits
   };
 }
 
 /** What detect.ts found, as markers. */
-export function detectedMarkers(row: { intro_start: number | null; intro_end: number | null; credits_start: number | null } | null): Markers {
+export function detectedMarkers(row: {
+  recap_start: number | null; recap_end: number | null; intro_start: number | null; intro_end: number | null; credits_start: number | null;
+} | null): Markers {
   if (!row) return NO_MARKERS;
   return {
+    recap: row.recap_start !== null && row.recap_end !== null ? { start: row.recap_start, end: row.recap_end, source: "detected" } : null,
     intro: row.intro_start !== null && row.intro_end !== null ? { start: row.intro_start, end: row.intro_end, source: "detected" } : null,
     credits: row.credits_start !== null ? { start: row.credits_start, source: "detected" } : null
   };
@@ -174,22 +188,24 @@ export function readMarks(db: Db, item: Markable): Markers {
     WHERE (item_id = @id AND season = -1) OR (item_id = @show AND season = @season)
     ORDER BY season = -1 DESC
   `).all({ id: item.id, show: item.show?.id ?? null, season: item.season ?? -2 }) as { kind: MarkerKind; start_s: number; end_s: number | null; season: number }[];
-  const found: Markers = { intro: null, credits: null };
+  const found: Markers = { recap: null, intro: null, credits: null };
   for (const row of rows) {
     const scope: MarkScope = row.season === -1 ? "episode" : "season";
     if (row.kind === "intro" && !found.intro && row.end_s !== null) found.intro = { start: row.start_s, end: row.end_s, source: "manual", scope };
+    else if (row.kind === "recap" && !found.recap && row.end_s !== null && scope === "episode") found.recap = { start: row.start_s, end: row.end_s, source: "manual", scope };
     else if (row.kind === "credits" && !found.credits) found.credits = { start: row.start_s, source: "manual", scope };
   }
   return found;
 }
 
-/** Mark the intro (start and end) or where the credits start; `duration`, when
- *  known, keeps a mark inside the file. */
+/** Mark the recap or the intro (start and end) or where the credits start;
+ *  `duration`, when known, keeps a mark inside the file. */
 export function setMark(db: Db, item: Markable, mark: { kind: MarkerKind; scope: MarkScope; start: number; end: number | null }, duration: number | null): void {
+  if (mark.kind === "recap" && mark.scope === "season") throw new MarkError("A recap is marked for its own episode: each is its own length");
   const { itemId, season } = keyOf(item, mark.scope);
   const { kind, start } = mark;
-  const end = kind === "intro" ? mark.end : null;
-  if (kind === "intro" && (end === null || end - start < 1)) throw new MarkError("The intro must end after it starts");
+  const end = kind === "credits" ? null : mark.end;
+  if (kind !== "credits" && (end === null || end - start < 1)) throw new MarkError(`The ${kind} must end after it starts`);
   if (duration !== null && duration > 0 && (start >= duration || (end !== null && end > duration + 1))) {
     throw new MarkError("That mark is past the end of the file");
   }

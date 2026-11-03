@@ -21,8 +21,28 @@ export function openDatabase(file: string): Database.Database {
 /** This version's schema on a database of any older one: what opening does, and
  *  what a backup goes through before it is restored (restore.ts). */
 export function upgradeDatabase(db: Database.Database): void {
-  addColumns(db);
-  db.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
+  // All or nothing: a widening stopped halfway would leave the marks in the old table.
+  db.transaction(() => {
+    addColumns(db);
+    const widening = setAsideNarrowMarkers(db);
+    db.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
+    if (widening) {
+      db.exec(`INSERT INTO markers (item_id, season, kind, start_s, end_s, source, updated_at)
+        SELECT item_id, season, kind, start_s, end_s, source, updated_at FROM ${OLD_MARKERS}; DROP TABLE ${OLD_MARKERS};`);
+    }
+  })();
+}
+
+const OLD_MARKERS = "markers_before_recap";
+
+/** A markers table from 0.15/0.16 lets no 'recap' kind in, and SQLite can't change
+ *  a CHECK in place: it is renamed so schema.sql makes the new one, and its rows
+ *  are copied over. */
+function setAsideNarrowMarkers(db: Database.Database): boolean {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'markers'").get() as { sql: string } | undefined;
+  if (!row || row.sql.includes("'recap'")) return false;
+  db.exec(`DROP TABLE IF EXISTS ${OLD_MARKERS}; ALTER TABLE markers RENAME TO ${OLD_MARKERS};`);
+  return true;
 }
 
 /** Columns added after a table was first made: added to an older file before
@@ -34,7 +54,10 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["movies", "set_order", "INTEGER"],
   ["metadata", "set_tmdb_id", "TEXT"],
   ["metadata", "set_name", "TEXT"],
-  ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"]
+  ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"],
+  ["detected_markers", "recap_start", "REAL"],
+  ["detected_markers", "recap_end", "REAL"],
+  ["detected_markers", "recap_checked", "INTEGER NOT NULL DEFAULT 0"]
 ];
 
 function addColumns(db: Database.Database): void {

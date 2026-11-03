@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { findTools } from "../src/ffmpeg.js";
-import { STEP_S, creditsFromBlack, fingerprint, neighbourPairs, sharedStretch, stretchesFromPairs } from "../src/detect.js";
+import { STEP_S, creditsFromBlack, fingerprint, hashFrames, neighbourPairs, recapFromPieces, sharedStretch, stretchesFromPairs } from "../src/detect.js";
 
 /** Deterministic noise, so two arrays can share a stretch exactly. */
 function noise(seed: number, seconds: number): Int16Array {
@@ -76,6 +76,26 @@ describe("the pieces", () => {
     expect(result[4]).toBeNull();
   });
 
+  it("takes a recap from where the shared opening ends through pieces close together, and never into the intro", () => {
+    const pieces = [20, 26, 33, 40, 47, 60].map((from) => ({ from, to: from + 2 }));
+    expect(recapFromPieces(pieces, 18, null)).toEqual({ start: 18, end: 62 });
+    // The intro starts at 48, inside the piece 47-49: the recap stops at it.
+    expect(recapFromPieces(pieces, 18, 48)).toEqual({ start: 18, end: 48 });
+    // Too few pieces is a cold open picking up last week's scene, not a recap.
+    expect(recapFromPieces(pieces.slice(0, 3), 18, null)).toBeNull();
+    // Nothing near the "Previously on" card: no recap.
+    expect(recapFromPieces(pieces.map((p) => ({ from: p.from + 60, to: p.to + 60 })), 18, null)).toBeNull();
+  });
+
+  it("hashes a frame by its gradients, and a frame with no contrast to nothing", () => {
+    const frame = (value: (x: number, y: number) => number) => Buffer.from(Array.from({ length: 72 }, (_, i) => value(i % 9, Math.floor(i / 9))));
+    const ramp = hashFrames(frame((x) => 200 - x * 20));
+    expect([ramp[0], ramp[1]]).toEqual([0xffffffff, 0xffffffff]);
+    // The same picture brighter: the same hash.
+    expect([...hashFrames(frame((x) => 230 - x * 20))]).toEqual([...ramp]);
+    expect([...hashFrames(frame(() => 16))]).toEqual([0, 0]);
+  });
+
   it("finds the credits at the first long black stretch, cards close together counted as one", () => {
     expect(creditsFromBlack([{ start: 100, end: 104 }, { start: 200, end: 212 }, { start: 214, end: 230 }])).toBe(200);
     expect(creditsFromBlack([{ start: 100, end: 110 }, { start: 300, end: 310 }])).toBeNull();
@@ -131,7 +151,8 @@ describe("a season looked at", () => {
 
   afterAll(async () => {
     await app?.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    // On Windows a file ffprobe still has open can't go yet: try again for a moment.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const markersOf = async (id: string) => (await app.inject({ method: "GET", url: `/video/api/play/${id}`, headers })).json().markers;

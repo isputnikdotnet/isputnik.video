@@ -32,6 +32,12 @@ export class MediaProbe {
     return row && row.size === file.size && row.modified_ms === file.modified.getTime() ? row : null;
   }
 
+  /** Once every probe running now has finished: closing waits, so no ffprobe is
+   *  left holding a file (which Windows then can't delete). */
+  async idle(): Promise<void> {
+    await Promise.allSettled([...this.running.values()]);
+  }
+
   private once<T>(key: string, work: () => Promise<T>): Promise<T> {
     const running = this.running.get(key);
     if (running) return running as Promise<T>;

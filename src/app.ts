@@ -157,7 +157,7 @@ const matchSearchSchema = z.object({
 const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable() });
 // A mark by hand (markers.ts); a null start clears it.
 const markBodySchema = z.object({
-  kind: z.enum(["intro", "credits"]),
+  kind: z.enum(["intro", "credits", "recap"]),
   scope: z.enum(["episode", "season"]),
   start: z.number().min(0).max(24 * 3600).nullable(),
   end: z.number().min(0).max(24 * 3600).nullable().default(null)
@@ -276,7 +276,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         if (done.seasons + done.films === 0) return;
         note(request, "info", "detect.finished", {
           libraryId: "library" in scope ? scope.library : null,
-          detail: `${done.seasons} season(s), ${done.films} film(s): ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
+          detail: `${done.seasons} season(s), ${done.films} film(s): ${done.recaps} recap(s), ${done.intros} intro(s), ${done.credits} credits found in ${Math.round((Date.now() - started) / 1000)} s`
         });
       } catch (err) {
         if (detectStop.signal.aborted) return;
@@ -303,6 +303,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     hls?.close();
     detectStop.abort();
     await detectChain.catch(() => undefined);
+    await mediaProbe?.idle();
     await scanChain.catch(() => undefined);
     await metadataChain.catch(() => undefined);
     db.close();

@@ -145,7 +145,9 @@ CREATE TABLE IF NOT EXISTS media_probe (
 CREATE TABLE IF NOT EXISTS markers (
   item_id     TEXT NOT NULL,
   season      INTEGER NOT NULL DEFAULT -1,
-  kind        TEXT NOT NULL CHECK (kind IN ('intro', 'credits')),
+  -- A recap is only ever an episode's own (season -1). db.ts widens a table from
+  -- before recaps (0.17.0).
+  kind        TEXT NOT NULL CHECK (kind IN ('intro', 'credits', 'recap')),
   start_s     REAL NOT NULL,
   -- NULL for the credits: they run to the end.
   end_s       REAL,
@@ -167,7 +169,22 @@ CREATE TABLE IF NOT EXISTS detected_markers (
   -- 1 once its season was compared with it in it; a film's is always 1.
   intro_checked INTEGER NOT NULL DEFAULT 0,
   credits_start REAL,
+  -- "Previously on", by picture (0.17.0): 1 once looked for; a film's is always 1.
+  recap_start   REAL,
+  recap_end     REAL,
+  recap_checked INTEGER NOT NULL DEFAULT 0,
   detected_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Each episode's picture, for finding recaps (detect.ts): 4 frames a second, each
+-- a 64-bit hash (8 bytes, low word first) of the frame at 9×8 grey; 0 for a frame
+-- with no contrast. ~100 KB an episode. Stale once the file's size or date changes.
+CREATE TABLE IF NOT EXISTS picture_prints (
+  item_id     TEXT PRIMARY KEY,
+  size        INTEGER NOT NULL,
+  modified_ms INTEGER NOT NULL,
+  prints      BLOB NOT NULL,
+  made_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 -- The admin's choices (settings.ts): one row per setting, its value JSON.

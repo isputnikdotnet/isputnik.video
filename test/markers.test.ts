@@ -7,6 +7,8 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
+import Database from "better-sqlite3";
+import { openDatabase } from "../src/db.js";
 import { findTools, probe } from "../src/ffmpeg.js";
 import { chapterKind, findMarkers, markersFromChapters, markersFromEdl, parseEdl } from "../src/markers.js";
 
@@ -15,7 +17,8 @@ const chapter = (start: number, end: number, title: string | null) => ({ start, 
 describe("a chapter's name", () => {
   it.each([
     ["Intro", "intro"], ["OPENING", "intro"], ["OP", "intro"], ["OP 1", "intro"], ["Opening Credits", "intro"], ["Заставка", "intro"], ["Начальные титры", "intro"],
-    ["Credits", "credits"], ["End Credits", "credits"], ["ED", "credits"], ["Ending:", "credits"], ["Титры", "credits"], ["Финальные титры", "credits"]
+    ["Credits", "credits"], ["End Credits", "credits"], ["ED", "credits"], ["Ending:", "credits"], ["Титры", "credits"], ["Финальные титры", "credits"],
+    ["Recap", "recap"], ["Previously on...", "recap"], ["Ранее", "recap"], ["В предыдущих сериях", "recap"]
   ])("reads %s as %s", (title, kind) => {
     expect(chapterKind(title)).toBe(kind);
   });
@@ -29,16 +32,41 @@ describe("a chapter's name", () => {
   });
 });
 
+describe("a database from before recaps", () => {
+  it("keeps its marks, and takes a recap mark after", () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-widen-")), "video.sqlite");
+    // The markers table as 0.15.0 made it.
+    const old = new Database(file);
+    old.exec(`CREATE TABLE markers (
+      item_id TEXT NOT NULL, season INTEGER NOT NULL DEFAULT -1,
+      kind TEXT NOT NULL CHECK (kind IN ('intro', 'credits')), start_s REAL NOT NULL, end_s REAL,
+      source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'detected')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      PRIMARY KEY (item_id, season, kind));
+      INSERT INTO markers (item_id, season, kind, start_s, end_s) VALUES ('show1', 2, 'intro', 60, 130);`);
+    old.close();
+    const db = openDatabase(file);
+    try {
+      expect(db.prepare("SELECT item_id, season, kind, start_s, end_s FROM markers").all()).toEqual([{ item_id: "show1", season: 2, kind: "intro", start_s: 60, end_s: 130 }]);
+      db.prepare("INSERT INTO markers (item_id, kind, start_s, end_s) VALUES ('ep1', 'recap', 20, 80)").run();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'markers_before_recap'").get()).toBeUndefined();
+    } finally {
+      db.close();
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
 describe("chapters", () => {
   it("finds the intro in the first half and the credits in the second", () => {
     const found = markersFromChapters([
       chapter(0, 60, "Cold open"), chapter(60, 150, "Intro"), chapter(150, 2500, "Chapter 3"), chapter(2500, 2600, "End Credits"), chapter(2600, 2640, "Preview")
     ], 0, 2640);
-    expect(found).toEqual({ intro: { start: 60, end: 150, source: "chapter" }, credits: { start: 2500, source: "chapter" } });
+    expect(found).toEqual({ recap: null, intro: { start: 60, end: 150, source: "chapter" }, credits: { start: 2500, source: "chapter" } });
   });
 
   it("does not take a Credits chapter near the start for the end credits, nor an Opening near the end for the intro", () => {
-    expect(markersFromChapters([chapter(0, 90, "Credits"), chapter(2000, 2100, "Opening")], 0, 2640)).toEqual({ intro: null, credits: null });
+    expect(markersFromChapters([chapter(0, 90, "Credits"), chapter(2000, 2100, "Opening")], 0, 2640)).toEqual({ recap: null, intro: null, credits: null });
   });
 
   it("counts from the start of a file whose clock does not start at 0", () => {
@@ -60,13 +88,14 @@ describe("an .edl", () => {
 
   it("takes the stretch early on for the intro and the one reaching the end for the credits", () => {
     expect(markersFromEdl([{ start: 60, end: 150 }, { start: 1300, end: 1320 }, { start: 2500, end: 2638 }], 2640)).toEqual({
+      recap: null,
       intro: { start: 60, end: 150, source: "edl" },
       credits: { start: 2500, source: "edl" }
     });
   });
 
   it("makes nothing of a stretch in the middle", () => {
-    expect(markersFromEdl([{ start: 1300, end: 1400 }], 2640)).toEqual({ intro: null, credits: null });
+    expect(markersFromEdl([{ start: 1300, end: 1400 }], 2640)).toEqual({ recap: null, intro: null, credits: null });
   });
 });
 
@@ -114,7 +143,8 @@ describe("a chaptered film", () => {
 
   afterAll(async () => {
     await app?.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    // On Windows a file ffprobe still has open can't go yet: try again for a moment.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it("has its chapters probed", async () => {
@@ -128,7 +158,7 @@ describe("a chaptered film", () => {
     (await app.inject({ method: "PUT", url: `/video/api/progress/${id}`, headers, payload: { position, duration: 60 } })).json().progress;
 
   it("tells the player where its intro and credits are", async () => {
-    expect((await play()).markers).toEqual({ intro: { start: 5, end: 15, source: "chapter" }, credits: { start: 50, source: "chapter" } });
+    expect((await play()).markers).toEqual({ recap: null, intro: { start: 5, end: 15, source: "chapter" }, credits: { start: 50, source: "chapter" } });
   });
 
   it("counts as watched from where the credits start, not at 92 %", async () => {
@@ -141,7 +171,7 @@ describe("a chaptered film", () => {
     const edl = film.replace(/\.mkv$/, ".edl");
     fs.writeFileSync(edl, "4 14 3\n");
     try {
-      expect((await play()).markers).toEqual({ intro: { start: 4, end: 14, source: "edl" }, credits: { start: 50, source: "chapter" } });
+      expect((await play()).markers).toEqual({ recap: null, intro: { start: 4, end: 14, source: "edl" }, credits: { start: 50, source: "chapter" } });
     } finally {
       fs.rmSync(edl);
     }
@@ -164,6 +194,13 @@ describe("a chaptered film", () => {
     expect((await mark({ kind: "intro", scope: "episode", start: 10, end: 5 })).statusCode).toBe(400);
     expect((await mark({ kind: "intro", scope: "season", start: 1, end: 5 })).statusCode).toBe(400);
     expect((await mark({ kind: "intro", scope: "episode", start: 1, end: 5 }, { ...headers, "x-isputnik-user-role": "member" })).statusCode).toBe(403);
+  });
+
+  it("takes a recap mark for the title alone, never for a season", async () => {
+    const set = await mark({ kind: "recap", scope: "episode", start: 1, end: 4.5 });
+    expect(set.json().markers.recap).toEqual({ start: 1, end: 4.5, source: "manual", scope: "episode" });
+    expect((await mark({ kind: "recap", scope: "season", start: 1, end: 4.5 })).statusCode).toBe(400);
+    expect((await mark({ kind: "recap", scope: "episode", start: null })).json().markers.recap).toBeNull();
   });
 });
 
@@ -205,7 +242,8 @@ describe("marks for a season", () => {
 
   afterAll(async () => {
     await app?.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    // On Windows a file ffprobe still has open can't go yet: try again for a moment.
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const of = (season: number, episode: number) => episodes.find((entry) => entry.season === season && entry.episode === episode)!.id;

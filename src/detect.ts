@@ -293,6 +293,169 @@ export function creditsFromBlack(stretches: { start: number; end: number }[]): n
   return joined.find((s) => s.end - s.start >= MIN_BLACK_S)?.start ?? null;
 }
 
+// ── Recaps, by picture ──────────────────────────────────────────────────────
+//
+// A "Previously on" is pieces of the episodes before it, re-cut, with new music
+// over them — so its sound is no help, but its picture is the old frames. Every
+// episode's whole picture is hashed once (4 frames a second, 64 bits each) and
+// kept; an episode's first minutes are then matched against the earlier ones'.
+
+const PRINT_FPS = 4;
+/** Frame hashes differing in at most this many of 64 bits are the same picture. */
+const PRINT_MAX_BITS = 6;
+/** A piece is at least this many frames matching consecutive frames (1 s). */
+const PIECE_FRAMES = 4;
+/** A recap is looked for in the first this many seconds. */
+const RECAP_WINDOW_S = 240;
+/** What an earlier episode shows in its own first seconds is the opening every
+ *  episode shares (rating card, studio card, "Previously on"), not the recap. */
+const OPENING_S = 30;
+/** Pieces this far apart are one recap: clips from older episodes not compared fall between. */
+const RECAP_GAP_S = 25;
+const MIN_RECAP_PIECES = 5;
+
+/** A file's picture as frame hashes: two words a frame, 0 0 for one with no contrast. */
+export function pictureHashes(tools: Tools, file: string, signal?: AbortSignal): Promise<Uint32Array> {
+  return new Promise((resolve, reject) => {
+    // Two threads: this runs in the background, beside films being converted. B
+    // frames skipped: four frames a second don't need them, and it halves the work.
+    const child = spawn(tools.ffmpeg, ["-v", "error", "-threads", "2", "-skip_frame", "bidir", "-i", file, "-an", "-sn", "-dn",
+      "-vf", `fps=${PRINT_FPS},scale=9:8:flags=area,format=gray`, "-f", "rawvideo", "-"], { windowsHide: true, signal });
+    const chunks: Buffer[] = [];
+    let errText = "";
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => { errText = (errText + chunk.toString()).slice(-500); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) return reject(new Error(errText.trim().split("\n").pop() || `ffmpeg exited with ${code}`));
+      resolve(hashFrames(Buffer.concat(chunks)));
+    });
+  });
+}
+
+/** 9×8 grey frames to hashes: each bit says whether a pixel is brighter than the
+ *  one to its right, so a regraded or re-encoded copy keeps its hash. */
+export function hashFrames(raw: Buffer): Uint32Array {
+  const size = 72;
+  const frames = Math.floor(raw.length / size);
+  const out = new Uint32Array(frames * 2);
+  for (let f = 0; f < frames; f++) {
+    let lo = 0;
+    let hi = 0;
+    let min = 255;
+    let max = 0;
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        const a = raw[f * size + y * 9 + x];
+        const b = raw[f * size + y * 9 + x + 1];
+        if (a < min) min = a;
+        if (a > max) max = a;
+        if (a > b) {
+          const k = y * 8 + x;
+          if (k < 32) lo |= 1 << k;
+          else hi |= 1 << (k - 32);
+        }
+      }
+    }
+    // Black, a fade, a plain card: nothing to tell one from another.
+    if (max - min >= 12) {
+      out[f * 2] = lo >>> 0;
+      out[f * 2 + 1] = hi >>> 0;
+    }
+  }
+  return out;
+}
+
+export function readPrints(db: Db, itemId: string, file: DetectFile): Uint32Array | null {
+  const row = db.prepare("SELECT size, modified_ms, prints FROM picture_prints WHERE item_id = ?").get(itemId) as { size: number; modified_ms: number; prints: Buffer } | undefined;
+  if (!row || row.size !== file.size || row.modified_ms !== file.modified.getTime()) return null;
+  const copy = Buffer.from(row.prints);
+  return new Uint32Array(copy.buffer, copy.byteOffset, Math.floor(copy.length / 4));
+}
+
+export function writePrints(db: Db, itemId: string, file: DetectFile, prints: Uint32Array): void {
+  db.prepare(`
+    INSERT INTO picture_prints (item_id, size, modified_ms, prints) VALUES (?, ?, ?, ?)
+    ON CONFLICT (item_id) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms, prints = excluded.prints,
+      made_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `).run(itemId, file.size, file.modified.getTime(), Buffer.from(prints.buffer, prints.byteOffset, prints.byteLength));
+}
+
+/** Pieces of `head` found in `body`, in seconds of the head and of the body. */
+async function piecesOf(head: Uint32Array, body: Uint32Array): Promise<{ from: number; to: number; at: number }[]> {
+  const frames = head.length / 2;
+  const bodyFrames = body.length / 2;
+  const best = new Int32Array(frames).fill(-1);
+  for (let i = 0; i < frames; i++) {
+    if (i % 40 === 39) await yieldNow();
+    const lo = head[i * 2];
+    const hi = head[i * 2 + 1];
+    if (lo === 0 && hi === 0) continue;
+    let bestBits = PRINT_MAX_BITS + 1;
+    for (let j = 0; j < bodyFrames; j++) {
+      const bl = body[j * 2];
+      const bh = body[j * 2 + 1];
+      if (bl === 0 && bh === 0) continue;
+      const bits = popcount(lo ^ bl) + popcount(hi ^ bh);
+      if (bits < bestBits) {
+        bestBits = bits;
+        best[i] = j;
+      }
+    }
+  }
+  const pieces: { from: number; to: number; at: number }[] = [];
+  let i = 0;
+  while (i < frames) {
+    if (best[i] < 0) {
+      i++;
+      continue;
+    }
+    // Head frames whose matches follow each other in the body: one piece of it.
+    let j = i;
+    while (j + 1 < frames && best[j + 1] >= 0 && Math.abs(best[j + 1] - best[j] - 1) <= 1) j++;
+    if (j - i + 1 >= PIECE_FRAMES) pieces.push({ from: i / PRINT_FPS, to: (j + 1) / PRINT_FPS, at: best[i] / PRINT_FPS });
+    i = j + 1;
+  }
+  return pieces;
+}
+
+/** An episode's recap from its picture and the earlier episodes': from where the
+ *  shared opening ends (or its first piece) through pieces no more than
+ *  RECAP_GAP_S apart; none from fewer than MIN_RECAP_PIECES. Never into the intro. */
+export async function recapFromPrints(prints: Uint32Array, earlier: Uint32Array[], introStart: number | null): Promise<{ start: number; end: number } | null> {
+  const head = prints.subarray(0, Math.min(prints.length, RECAP_WINDOW_S * PRINT_FPS * 2));
+  let openingEnd = 0;
+  const pieces: { from: number; to: number }[] = [];
+  for (const body of earlier) {
+    for (const piece of await piecesOf(head, body)) {
+      if (piece.at < OPENING_S && piece.from < 2 * OPENING_S) openingEnd = Math.max(openingEnd, piece.to);
+      else pieces.push(piece);
+    }
+  }
+  return recapFromPieces(pieces, openingEnd, introStart);
+}
+
+export function recapFromPieces(pieces: { from: number; to: number }[], openingEnd: number, introStart: number | null): { start: number; end: number } | null {
+  const after = pieces.filter((piece) => piece.from >= openingEnd - 1).sort((a, b) => a.from - b.from);
+  let span: { start: number; end: number; count: number } | null = null;
+  for (const piece of after) {
+    if (introStart !== null && piece.from >= introStart) break;
+    if (!span) {
+      // A recap follows its "Previously on" card closely, if there is one.
+      if (openingEnd > 0 && piece.from - openingEnd > RECAP_GAP_S) break;
+      span = { start: openingEnd > 0 ? openingEnd : piece.from, end: piece.to, count: 1 };
+    } else if (piece.from - span.end <= RECAP_GAP_S) {
+      span.end = Math.max(span.end, piece.to);
+      span.count++;
+    } else {
+      break;
+    }
+  }
+  if (!span || span.count < MIN_RECAP_PIECES) return null;
+  const end = introStart !== null ? Math.min(span.end, introStart) : span.end;
+  return end - span.start >= MIN_SHARED_S ? { start: round(span.start), end: round(end) } : null;
+}
+
 // ── Kept ────────────────────────────────────────────────────────────────────
 
 export interface DetectedRow {
@@ -304,6 +467,10 @@ export interface DetectedRow {
   /** 1 once the item's season was compared with it in it (a film: always). */
   intro_checked: number;
   credits_start: number | null;
+  recap_start: number | null;
+  recap_end: number | null;
+  /** 1 once a recap was looked for (a film: always). */
+  recap_checked: number;
 }
 
 export interface DetectFile {
@@ -320,11 +487,12 @@ export function readDetected(db: Db, itemId: string, file: DetectFile): Detected
 
 export function writeDetected(db: Db, row: DetectedRow): void {
   db.prepare(`
-    INSERT INTO detected_markers (item_id, size, modified_ms, intro_start, intro_end, intro_checked, credits_start)
-    VALUES (@item_id, @size, @modified_ms, @intro_start, @intro_end, @intro_checked, @credits_start)
+    INSERT INTO detected_markers (item_id, size, modified_ms, intro_start, intro_end, intro_checked, credits_start, recap_start, recap_end, recap_checked)
+    VALUES (@item_id, @size, @modified_ms, @intro_start, @intro_end, @intro_checked, @credits_start, @recap_start, @recap_end, @recap_checked)
     ON CONFLICT (item_id) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms,
       intro_start = excluded.intro_start, intro_end = excluded.intro_end, intro_checked = excluded.intro_checked,
-      credits_start = excluded.credits_start, detected_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      credits_start = excluded.credits_start, recap_start = excluded.recap_start, recap_end = excluded.recap_end,
+      recap_checked = excluded.recap_checked, detected_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).run(row);
 }
 
@@ -333,12 +501,11 @@ export function forgetDetected(db: Db, itemIds: string[]): void {
   db.transaction(() => { for (const id of itemIds) drop.run(id); })();
 }
 
-/** Rows whose episode or film is gone; for the daily sweep. */
+/** Rows (and kept pictures) whose episode or film is gone; for the daily sweep. */
 export function purgeOrphanDetected(db: Db): number {
-  return db.prepare(`
-    DELETE FROM detected_markers WHERE item_id NOT IN (SELECT id FROM episodes) AND item_id NOT IN (SELECT id FROM movies)
-      AND item_id NOT IN (SELECT id FROM movie_parts)
-  `).run().changes;
+  const orphan = "item_id NOT IN (SELECT id FROM episodes) AND item_id NOT IN (SELECT id FROM movies) AND item_id NOT IN (SELECT id FROM movie_parts)";
+  return db.prepare(`DELETE FROM detected_markers WHERE ${orphan}`).run().changes
+    + db.prepare(`DELETE FROM picture_prints WHERE ${orphan}`).run().changes;
 }
 
 // ── One season, one film ────────────────────────────────────────────────────
@@ -403,7 +570,11 @@ export async function detectSeason(tools: Tools, episodes: DetectTarget[], signa
       intro_start: intro ? round(intro.start) : null,
       intro_end: intro ? round(intro.end) : null,
       intro_checked: 1,
-      credits_start: credits === null ? null : round(credits)
+      credits_start: credits === null ? null : round(credits),
+      // The runner fills these in from the season's pictures.
+      recap_start: null,
+      recap_end: null,
+      recap_checked: 0
     });
   }
   return rows;
@@ -419,7 +590,10 @@ export async function detectFilm(tools: Tools, film: DetectTarget, signal?: Abor
     intro_start: null,
     intro_end: null,
     intro_checked: 1,
-    credits_start: credits === null ? null : round(credits)
+    credits_start: credits === null ? null : round(credits),
+    recap_start: null,
+    recap_end: null,
+    recap_checked: 1
   };
 }
 
@@ -446,6 +620,7 @@ const ENGINE: Identity = { id: "engine", name: "engine", role: "admin", appRole:
 export interface DetectSummary {
   seasons: number;
   films: number;
+  recaps: number;
   intros: number;
   credits: number;
 }
@@ -465,13 +640,43 @@ export class DetectRunner {
   }
 
   private fresh(target: DetectTarget): boolean {
-    return readDetected(this.options.db, target.id, target)?.intro_checked === 1;
+    const row = readDetected(this.options.db, target.id, target);
+    return row?.intro_checked === 1 && row.recap_checked === 1;
+  }
+
+  /** An episode's picture as hashes: kept from before, or made now and kept. */
+  private async printsOf(target: DetectTarget, signal?: AbortSignal): Promise<Uint32Array | null> {
+    const kept = readPrints(this.options.db, target.id, target);
+    if (kept) return kept;
+    try {
+      const prints = await pictureHashes(this.options.tools, target.absolute, signal);
+      writePrints(this.options.db, target.id, target, prints);
+      return prints;
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      return null;
+    }
+  }
+
+  /** The last episodes of the season before, which a premiere's recap is made of. */
+  private async previousSeason(showId: string, season: number, signal?: AbortSignal): Promise<Uint32Array[]> {
+    const ids = (this.options.db.prepare(`
+      SELECT id FROM episodes WHERE show_id = ? AND season = (SELECT MAX(season) FROM episodes WHERE show_id = ? AND season < ?)
+      ORDER BY episode DESC LIMIT 2
+    `).all(showId, showId, season) as { id: string }[]).map((row) => row.id);
+    const out: Uint32Array[] = [];
+    for (const id of ids) {
+      const target = await this.target(id);
+      const prints = target ? await this.printsOf(target, signal) : null;
+      if (prints) out.push(prints);
+    }
+    return out;
   }
 
   /** `library` or `show`/`movie` (a title), or one `item` (its season, or the film). */
   async run(scope: { library: string } | { show: string } | { movie: string } | { item: string }, force: boolean, signal?: AbortSignal): Promise<DetectSummary> {
     const { db } = this.options;
-    const summary: DetectSummary = { seasons: 0, films: 0, intros: 0, credits: 0 };
+    const summary: DetectSummary = { seasons: 0, films: 0, recaps: 0, intros: 0, credits: 0 };
     let seasons: { show_id: string; season: number }[] = [];
     let films: string[] = [];
     if ("library" in scope) {
@@ -496,8 +701,23 @@ export class DetectRunner {
       }
       if (targets.length === 0 || (!force && targets.every((target) => this.fresh(target)))) continue;
       const rows = await detectSeason(this.options.tools, targets, signal);
+      // Recaps: each episode's opening against every episode before it this
+      // season; the first episode's against the end of the season before.
+      const prints: (Uint32Array | null)[] = [];
+      for (const target of targets) prints.push(await this.printsOf(target, signal));
+      const before = await this.previousSeason(show_id, season, signal);
+      for (const [i, row] of rows.entries()) {
+        signal?.throwIfAborted();
+        const own = prints[i];
+        const earlier = i === 0 ? before : prints.slice(0, i).filter((p): p is Uint32Array => p !== null);
+        const recap = own && earlier.length > 0 ? await recapFromPrints(own, earlier, row.intro_start) : null;
+        row.recap_start = recap?.start ?? null;
+        row.recap_end = recap?.end ?? null;
+        row.recap_checked = 1;
+      }
       db.transaction(() => { for (const row of rows) writeDetected(db, row); })();
       summary.seasons += 1;
+      summary.recaps += rows.filter((row) => row.recap_start !== null).length;
       summary.intros += rows.filter((row) => row.intro_start !== null).length;
       summary.credits += rows.filter((row) => row.credits_start !== null).length;
     }
