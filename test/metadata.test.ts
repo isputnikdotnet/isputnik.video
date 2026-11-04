@@ -44,7 +44,14 @@ function fakeTmdb() {
     }
     if (path === "/movie/101") return json({ id: 101, title: "Some Film", overview: "A film about something.", release_date: "2010-05-01", genres: [{ name: "Drama" }], vote_average: 7.1, poster_path: "/p101.jpg", backdrop_path: "/b101.jpg" });
     if (path === "/movie/404") return json({ id: 404, title: "The Right Film", overview: "The one.", release_date: "1999-01-01", genres: [{ name: "Thriller" }], vote_average: 6, poster_path: "/p404.jpg", backdrop_path: null });
-    if (path === "/search/tv") return json({ results: query.startsWith("Counterpart") ? [{ id: 202, name: "Counterpart", first_air_date: "2017-12-10" }] : [] });
+    if (path === "/search/tv") {
+      if (query.startsWith("Counterpart")) return json({ results: [{ id: 202, name: "Counterpart", first_air_date: "2017-12-10" }] });
+      // A concert kept as a film, which TMDB files as a TV show under its own name.
+      if (query === "Peter's Pop Show") return json({ results: [{ id: 505, name: "Peter's Pop Show", first_air_date: "1985-11-09", poster_path: "/p505.jpg" }] });
+      return json({ results: [] });
+    }
+    if (path === "/tv/505") return json({ id: 505, name: "Peter's Pop Show", overview: "Pop acts of the year.", first_air_date: "1985-11-09", genres: [{ name: "Music" }], poster_path: "/p505.jpg", backdrop_path: "/b505.jpg" });
+    if (path === "/tv/505/images") return json({ backdrops: [{ file_path: "/b505.jpg", iso_639_1: null, vote_average: 5, vote_count: 1, width: 1920, height: 1080 }] });
     if (path === "/find/tt33022834") return json({ movie_results: [], tv_results: [{ id: 303 }] });
     // TMDB's default backdrop is the titled one; the best textless one is the portrait.
     const backdrops202 = [
@@ -73,6 +80,7 @@ beforeEach(async () => {
   fixture = makeFixture();
   // A poster beside the film: it wins over TMDB's.
   fixture.write("Movies/Some Film (2010)/poster.jpg", "local poster");
+  fixture.write("Movies/Concert Peter's Pop Show (1985)/Concert Peter's Pop Show (1985).mkv", "x".repeat(4000));
   tmdb = fakeTmdb();
   app = await buildApp({
     gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null,
@@ -268,6 +276,32 @@ describe("with a TMDB key", () => {
     expect(back.json().movie.tmdbMatch).toMatchObject({ state: "unmatched", locked: false });
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=metadata.matched", headers: admin })).json();
     expect(events.events.map((event: { detail: string }) => event.detail)).toEqual(["Loose Film matched automatically again", "Loose Film matched by hand to TMDB 404"]);
+  });
+
+  it("matches a film TMDB files as a TV show, by its name with the first word dropped, and reads it from /tv", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const concert = byTitle(await movies(), "Concert Peter's Pop Show");
+    const detail = (await app.inject({ method: "GET", url: `/video/api/movies/${concert.id}`, headers: mum })).json();
+    expect(detail).toMatchObject({ plot: "Pop acts of the year.", genres: ["Music"], tmdbId: "505", tmdbMatch: { state: "matched", kind: "tv" } });
+    expect((await app.inject({ method: "GET", url: detail.poster, headers: mum })).body).toBe("image /t/p/w500/p505.jpg");
+    // Asked in this order: the name as it is, in films then shows; then without "Concert", in films then shows.
+    const searches = tmdb.asked.filter((request) => request.includes("Pop")).map((request) => decodeURIComponent(request.replace(/\?.*query=([^&]*).*$/, " $1").replace(/\+/g, " ")));
+    expect(searches).toEqual([
+      "/3/search/movie Concert Peter's Pop Show", "/3/search/movie Concert Peter's Pop Show",
+      "/3/search/tv Concert Peter's Pop Show", "/3/search/tv Concert Peter's Pop Show",
+      "/3/search/movie Peter's Pop Show", "/3/search/movie Peter's Pop Show",
+      "/3/search/tv Peter's Pop Show"
+    ]);
+    // It is still a film: no seasons were asked for.
+    expect(tmdb.asked.some((request) => request.includes("/tv/505/season"))).toBe(false);
+    // Its backdrops to choose from come from the show's.
+    const backdrops = (await app.inject({ method: "GET", url: `/video/api/admin/metadata/items/${concert.id}/backdrops`, headers: admin })).json();
+    expect(backdrops.backdrops.map((image: { path: string }) => image.path)).toEqual(["/b505.jpg"]);
+    expect(tmdb.asked.some((request) => request.startsWith("/3/tv/505/images"))).toBe(true);
+    // A film TMDB knows as a film is matched as before.
+    const some = (await app.inject({ method: "GET", url: `/video/api/movies/${byTitle(await movies(), "Some Film").id}`, headers: mum })).json();
+    expect(some).toMatchObject({ tmdbId: "101", tmdbMatch: { kind: "movie" } });
   });
 
   it("finds a title by TMDB's name too", async () => {

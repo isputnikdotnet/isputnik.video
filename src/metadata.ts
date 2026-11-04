@@ -59,6 +59,8 @@ export interface MetaRow {
   /** 1 once the backdrop was picked from TMDB's textless ones (0.18.0): before
    *  that it was TMDB's default, so a title is asked once more. */
   backdrop_picked: number;
+  /** Where on TMDB the match was found; null (before 0.21.0) means the title's own kind. */
+  tmdb_kind: TmdbKind | null;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -210,7 +212,7 @@ function emptyRow(itemId: string, kind: MetaKind): MetaRow {
     item_id: itemId, kind, tmdb_id: null, locked: 0, tmdb_state: "none", title: null, original_title: null, plot: null,
     year: null, aired: null, genres: "[]", rating: null, status: null, poster: null, backdrop: null, still: null,
     poster_path: null, backdrop_path: null, still_path: null, checked_at: null, error: null,
-    set_tmdb_id: null, set_name: null, set_checked: 0, backdrop_choice: null, backdrop_picked: 0
+    set_tmdb_id: null, set_name: null, set_checked: 0, backdrop_choice: null, backdrop_picked: 0, tmdb_kind: null
   };
 }
 
@@ -218,17 +220,17 @@ function saveRow(db: Db, row: MetaRow): void {
   db.prepare(`
     INSERT INTO metadata (item_id, kind, tmdb_id, locked, tmdb_state, title, original_title, plot, year, aired, genres, rating, status,
       poster, backdrop, still, poster_path, backdrop_path, still_path, checked_at, error, set_tmdb_id, set_name, set_checked,
-      backdrop_choice, backdrop_picked)
+      backdrop_choice, backdrop_picked, tmdb_kind)
     VALUES (@item_id, @kind, @tmdb_id, @locked, @tmdb_state, @title, @original_title, @plot, @year, @aired, @genres, @rating, @status,
       @poster, @backdrop, @still, @poster_path, @backdrop_path, @still_path, @checked_at, @error, @set_tmdb_id, @set_name, @set_checked,
-      @backdrop_choice, @backdrop_picked)
+      @backdrop_choice, @backdrop_picked, @tmdb_kind)
     ON CONFLICT (item_id) DO UPDATE SET kind = excluded.kind, tmdb_id = excluded.tmdb_id, locked = excluded.locked,
       tmdb_state = excluded.tmdb_state, title = excluded.title, original_title = excluded.original_title, plot = excluded.plot,
       year = excluded.year, aired = excluded.aired, genres = excluded.genres, rating = excluded.rating, status = excluded.status,
       poster = excluded.poster, backdrop = excluded.backdrop, still = excluded.still, poster_path = excluded.poster_path,
       backdrop_path = excluded.backdrop_path, still_path = excluded.still_path, checked_at = excluded.checked_at, error = excluded.error,
       set_tmdb_id = excluded.set_tmdb_id, set_name = excluded.set_name, set_checked = excluded.set_checked,
-      backdrop_choice = excluded.backdrop_choice, backdrop_picked = excluded.backdrop_picked,
+      backdrop_choice = excluded.backdrop_choice, backdrop_picked = excluded.backdrop_picked, tmdb_kind = excluded.tmdb_kind,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).run(row);
 }
@@ -287,22 +289,40 @@ export class MetadataRunner {
     return this.download(tmdb, imagePath, size, `${row.item_id}-${kind}`, current);
   }
 
-  /** The TMDB id for a title: the one fixed by hand, the .nfo's or folder's, the IMDb id's, else the best search hit. */
-  private async match(tmdb: Tmdb, kind: TmdbKind, title: TitleRow, row: MetaRow, language: string): Promise<string | null> {
-    if (row.locked && row.tmdb_id) return row.tmdb_id;
-    if (title.tmdb_id) return title.tmdb_id;
+  /** The TMDB id for a title, and where on TMDB it was found: the one fixed by
+   *  hand, the .nfo's or folder's, the IMDb id's, else the best search hit.
+   *
+   *  The title's own kind first; then the other, since TMDB files a Soviet
+   *  miniseries kept as a film («Д'Артаньян и три мушкетёра») as a TV show, and a
+   *  concert kept as a film the same way. The names as they are first, then with
+   *  their first word dropped ("Concert Peter's Pop Show"): a name of three
+   *  words or more often opens with a word that isn't the title's. */
+  private async match(tmdb: Tmdb, kind: TmdbKind, title: TitleRow, row: MetaRow, language: string): Promise<{ id: string; kind: TmdbKind } | null> {
+    if (row.locked && row.tmdb_id) return { id: row.tmdb_id, kind: row.tmdb_kind ?? kind };
+    if (title.tmdb_id) return { id: title.tmdb_id, kind };
+    const kinds: TmdbKind[] = [kind, kind === "movie" ? "tv" : "movie"];
     if (title.imdb_id) {
-      const found = await tmdb.findByImdb(kind, title.imdb_id);
-      await sleep(PAUSE_MS);
-      if (found) return found;
-    }
-    for (const query of [title.title, title.original_title].filter((value, at, all): value is string => Boolean(value) && all.indexOf(value) === at)) {
-      for (const year of title.year ? [title.year, null] : [null]) {
-        const results = await tmdb.search(kind, query, year, language);
+      for (const where of kinds) {
+        const found = await tmdb.findByImdb(where, title.imdb_id);
         await sleep(PAUSE_MS);
-        // With a year, one within a year of it (release dates differ by country); without, the first.
-        const hit = title.year ? results.find((result) => result.year !== null && Math.abs(result.year - title.year!) <= 1) : results[0];
-        if (hit) return hit.tmdbId;
+        if (found) return { id: found, kind: where };
+      }
+    }
+    const distinct = (values: string[]) => values.filter((value, at, all) => all.indexOf(value) === at);
+    const names = distinct([title.title, title.original_title].filter((value): value is string => Boolean(value)));
+    const trimmed = distinct(names.map((name) => name.trim().split(/\s+/)).filter((words) => words.length >= 3).map((words) => words.slice(1).join(" ")))
+      .filter((query) => !names.includes(query));
+    for (const queries of [names, trimmed]) {
+      for (const where of kinds) {
+        for (const query of queries) {
+          for (const year of title.year ? [title.year, null] : [null]) {
+            const results = await tmdb.search(where, query, year, language);
+            await sleep(PAUSE_MS);
+            // With a year, one within a year of it (release dates differ by country); without, the first.
+            const hit = title.year ? results.find((result) => result.year !== null && Math.abs(result.year - title.year!) <= 1) : results[0];
+            if (hit) return { id: hit.tmdbId, kind: where };
+          }
+        }
       }
     }
     return null;
@@ -330,16 +350,17 @@ export class MetadataRunner {
     const missingEpisode = episodes.some((episode) => !existing.has(episode.id));
     if (tmdb && (due(row, now, force) || (kind === "show" && missingEpisode && row.tmdb_state === "matched"))) {
       try {
-        const id = await this.match(tmdb, tmdbKind, title, row, library.language);
-        if (id) {
-          details = await tmdb.details(tmdbKind, id, library.language);
+        const found = await this.match(tmdb, tmdbKind, title, row, library.language);
+        if (found) {
+          details = await tmdb.details(found.kind, found.id, library.language);
           await sleep(PAUSE_MS);
-          for (const season of [...new Set(episodes.map((episode) => episode.season))]) {
-            seasons.set(season, await tmdb.season(id, season, library.language));
+          // A show's episodes are TMDB's only when it is a show there too.
+          for (const season of found.kind === "tv" ? [...new Set(episodes.map((episode) => episode.season))] : []) {
+            seasons.set(season, await tmdb.season(found.id, season, library.language));
             await sleep(PAUSE_MS);
           }
           Object.assign(row, {
-            tmdb_id: details.tmdbId, tmdb_state: "matched", title: details.title, original_title: details.originalTitle, plot: details.plot,
+            tmdb_id: details.tmdbId, tmdb_kind: found.kind, tmdb_state: "matched", title: details.title, original_title: details.originalTitle, plot: details.plot,
             year: details.year, aired: details.aired, genres: JSON.stringify(details.genres), rating: details.rating, status: details.status,
             // The admin's choice of TMDB's backdrops (Fix match) over the one picked by votes.
             poster_path: details.posterPath, backdrop_path: row.backdrop_choice ?? details.backdropPath, error: null,
@@ -347,7 +368,7 @@ export class MetadataRunner {
             backdrop_picked: 1
           });
         } else {
-          Object.assign(row, { tmdb_state: "unmatched", error: null, set_tmdb_id: null, set_name: null, set_checked: 1 });
+          Object.assign(row, { tmdb_state: "unmatched", tmdb_kind: null, error: null, set_tmdb_id: null, set_name: null, set_checked: 1 });
         }
       } catch (err) {
         const message = err instanceof TmdbError ? err.message : (err as Error).message;
@@ -494,7 +515,7 @@ export class MetadataRunner {
 export function setMatch(db: Db, itemId: string, kind: "show" | "movie", tmdbId: string | null): void {
   const row = metaFor(db, [itemId]).get(itemId) ?? emptyRow(itemId, kind);
   // Another title on TMDB: a backdrop chosen from the old one's means nothing now.
-  saveRow(db, { ...row, kind, tmdb_id: tmdbId, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null });
+  saveRow(db, { ...row, kind, tmdb_id: tmdbId, tmdb_kind: null, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null });
 }
 
 /** The admin's pick of a title's TMDB backdrops, or back to the best by votes (null). */
@@ -505,9 +526,10 @@ export function setBackdropChoice(db: Db, itemId: string, kind: "show" | "movie"
 }
 
 /** What a title is matched to on TMDB, for its backdrops; null when it isn't. */
-export function tmdbMatchOf(db: Db, itemId: string): { tmdbId: string; choice: string | null; current: string | null } | null {
+export function tmdbMatchOf(db: Db, itemId: string): { tmdbId: string; tmdbKind: TmdbKind; choice: string | null; current: string | null } | null {
   const row = metaFor(db, [itemId]).get(itemId);
-  return row?.tmdb_id && row.tmdb_state === "matched" ? { tmdbId: row.tmdb_id, choice: row.backdrop_choice, current: row.backdrop_path } : null;
+  if (!row?.tmdb_id || row.tmdb_state !== "matched") return null;
+  return { tmdbId: row.tmdb_id, tmdbKind: row.tmdb_kind ?? (row.kind === "show" ? "tv" : "movie"), choice: row.backdrop_choice, current: row.backdrop_path };
 }
 
 /** Rows (and their images) whose item is gone; for the daily sweep. */

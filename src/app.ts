@@ -1065,7 +1065,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const match = tmdbMatchOf(db, id);
     if (!match) return { backdrops: [], current: null, chosen: false };
     try {
-      const backdrops = await new Tmdb(key, options.fetch).backdrops(found.kind === "show" ? "tv" : "movie", match.tmdbId, found.language);
+      const backdrops = await new Tmdb(key, options.fetch).backdrops(match.tmdbKind, match.tmdbId, found.language);
       return {
         backdrops: backdrops.map(({ path: imagePath, ...rest }) => ({ ...rest, path: imagePath, preview: `${API}/admin/metadata/image${imagePath}?wide` })),
         current: match.current,

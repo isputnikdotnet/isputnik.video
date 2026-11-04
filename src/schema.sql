@@ -252,6 +252,10 @@ CREATE TABLE IF NOT EXISTS metadata (
   -- 1 once the backdrop was picked from TMDB's textless ones by votes (0.18.0).
   backdrop_choice TEXT,
   backdrop_picked INTEGER NOT NULL DEFAULT 0,
+  -- Where on TMDB the match was found: a film TMDB files as a TV show (a Soviet
+  -- miniseries) is matched there and read from /tv. Null before 0.21.0: the
+  -- title's own kind.
+  tmdb_kind      TEXT CHECK (tmdb_kind IN ('movie', 'tv')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

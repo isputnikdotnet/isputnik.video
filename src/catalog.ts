@@ -213,7 +213,7 @@ export function listTitles(db: Db, identity: Identity, query: TitleQuery) {
 
 /** How the title is matched on TMDB, for the admin's Fix match. */
 const matchOf = (meta: MetaRow | undefined) => ({
-  tmdbMatch: meta ? { id: meta.tmdb_id, state: meta.tmdb_state, locked: meta.locked === 1, error: meta.error } : null
+  tmdbMatch: meta ? { id: meta.tmdb_id, kind: meta.tmdb_kind, state: meta.tmdb_state, locked: meta.locked === 1, error: meta.error } : null
 });
 
 /** A show with its seasons and episodes, or null when it is not there for this person. */
