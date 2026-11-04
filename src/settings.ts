@@ -8,7 +8,8 @@ import { DEFAULT_CONVERSION, type ConversionSettings } from "./hls.js";
 export const conversionSchema = z.object({
   memoryPerViewerMb: z.number().int().min(0).max(16_384),
   maxViewers: z.number().int().min(1).max(50),
-  whenFull: z.enum(["disk", "wait"])
+  whenFull: z.enum(["disk", "wait"]),
+  hardware: z.enum(["auto", "cpu", "gpu"])
 });
 
 const CONVERSION_KEY = "conversion";

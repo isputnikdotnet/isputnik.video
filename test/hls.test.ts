@@ -331,7 +331,7 @@ describe("real segments", () => {
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
     let state = await conversion();
-    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto" });
     expect(state.usage.viewers).toMatchObject([{ user: "Mum", title: "Loud Film", mode: "remux" }]);
     expect(state.usage.memoryBytes).toBeGreaterThan(0);
     expect(state.usage.diskBytes).toBe(0);
@@ -389,7 +389,7 @@ describe("real segments", () => {
 
   it("keeps the admin's settings, refuses ones out of range, and lets only an admin near them", async () => {
     expect((await setConversion({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" })).json().settings)
-      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" });
+      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait", hardware: "auto" });
     expect((await conversion()).settings.memoryPerViewerMb).toBe(512);
     expect((await setConversion({ memoryPerViewerMb: -1, maxViewers: 2, whenFull: "wait" })).statusCode).toBe(400);
     expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 0, whenFull: "wait" })).statusCode).toBe(400);
@@ -397,7 +397,7 @@ describe("real segments", () => {
     expect((await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers })).statusCode).toBe(403);
     expect((await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers, payload: { memoryPerViewerMb: 1, maxViewers: 1, whenFull: "disk" } })).statusCode).toBe(403);
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=conversion.changed", headers: adminHeaders })).json();
-    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting, 512 MB of memory each, then waiting");
+    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting on the GPU where it can, 512 MB of memory each, then waiting");
     await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
   });
 

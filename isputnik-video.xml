@@ -70,6 +70,16 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Required="false"
           Mask="false"></Config>
 
+  <Config Name="Intel GPU"
+          Target="/dev/dri"
+          Default=""
+          Mode=""
+          Description="Optional. /dev/dri to convert video on an Intel CPU's graphics (Quick Sync) instead of the CPU: several viewers at once for little CPU. Leave empty to convert on the CPU. Settings → Video in isputnik.home shows what was found."
+          Type="Device"
+          Display="always"
+          Required="false"
+          Mask="false"></Config>
+
   <!-- Environment Variables -->
 
   <Config Name="Gateway Secret"

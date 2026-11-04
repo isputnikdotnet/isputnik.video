@@ -24,6 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Delivery } from "./delivery.js";
 import type { MediaInfo, Tools } from "./ffmpeg.js";
+import { deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** How long a segment is meant to be. */
 export const SEGMENT_TARGET_S = 6;
@@ -97,10 +98,20 @@ export function playlist(plan: HlsPlan): string {
   return lines.join("\n");
 }
 
-/** ffmpeg's arguments for a run that starts at segment `from`. */
-export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[] {
+/** The tallest picture a conversion makes; taller ones are scaled down to it. */
+const MAX_HEIGHT = 1080;
+
+/** ffmpeg's arguments for a run that starts at segment `from`. `gpu`: the
+ *  picture is encoded on the GPU (hardware.ts), and decoded there too when
+ *  it says so; null keeps it all on the CPU. */
+export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null): string[] {
   const { info, delivery } = plan;
   const args = ["-hide_banner", "-nostdin", "-v", "error", "-y"];
+  const gpu = delivery.videoCopy || !info.video ? null : gpuRun;
+  if (gpu) {
+    args.push(...deviceArgs(gpu.device));
+    if (gpu.decode) args.push("-hwaccel", "vaapi", "-hwaccel_device", "va", "-hwaccel_output_format", "vaapi");
+  }
   // Input seeking is relative to the file's start. A picture copied as it is can
   // only start on a keyframe, and ffmpeg lands on the one at or before the time
   // asked: just past the cut, so never the one before it.
@@ -108,7 +119,11 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
   if (from > 0) args.push("-ss", (offset + (delivery.videoCopy ? 0.05 : 0)).toFixed(3));
   args.push("-i", plan.file, "-copyts", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn");
   const burn = info.video ? delivery.burn : null;
-  const shrink = info.video !== null && info.video.height > 1080;
+  const shrink = info.video !== null && info.video.height > MAX_HEIGHT;
+  // The GPU's scaler takes no "keep the shape" width: worked out here, even.
+  const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * MAX_HEIGHT) / info.video.height / 2) * 2) : 0;
+  // A picture drawn or scaled on the CPU goes up to the GPU to be encoded.
+  const upload = gpu ? ",format=nv12,hwupload" : "";
   if (info.video && burn) {
     // The subtitle drawn over the picture, its canvas fitted to the picture
     // first (a 1080p PGS track on a cropped or 720p film).
@@ -116,7 +131,7 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
     const fit = burn.width > 0 && burn.height > 0 && (burn.width !== width || burn.height !== height);
     const sub = fit ? `[0:${burn.index}]scale=${width}:${height}[sub];` : "";
     const over = `[0:${info.video.index}]${fit ? "[sub]" : `[0:${burn.index}]`}overlay=eof_action=pass`;
-    args.push("-filter_complex", `${sub}${over}${shrink ? ",scale=-2:1080" : ""}[v]`, "-map", "[v]");
+    args.push("-filter_complex", `${sub}${over}${shrink ? `,scale=-2:${MAX_HEIGHT}` : ""}${upload}[v]`, "-map", "[v]");
   } else if (info.video) {
     args.push("-map", `0:${info.video.index}`);
   }
@@ -124,10 +139,20 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string): string[
 
   if (delivery.videoCopy) {
     args.push("-c:v", "copy");
+  } else if (gpu) {
+    // Decoded on the GPU: scaled there, and never back to the CPU. Decoded on
+    // the CPU: scaled there, then uploaded. The limits are the CPU encode's.
+    if (!burn) {
+      args.push("-vf", gpu.decode
+        ? `scale_vaapi=${shrink ? `w=${shrunkWidth}:h=${MAX_HEIGHT}:` : ""}format=nv12`
+        : `${shrink ? `scale=-2:${MAX_HEIGHT},` : ""}format=nv12,hwupload`);
+    }
+    args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", "8M", "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high");
+    args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   } else {
     args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "10M", "-bufsize", "20M",
       "-profile:v", "high", "-pix_fmt", "yuv420p");
-    if (shrink && !burn) args.push("-vf", "scale=-2:1080");
+    if (shrink && !burn) args.push("-vf", `scale=-2:${MAX_HEIGHT}`);
     // A keyframe on every cut, so every segment starts on one.
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   }
@@ -160,9 +185,11 @@ export interface ConversionSettings {
   maxViewers: number;
   /** Once a viewer's memory is full: carry on on the disk, or stay that far ahead. */
   whenFull: "disk" | "wait";
+  /** Where a picture is re-encoded (hardware.ts): the GPU where it can, the CPU only, or the GPU only. */
+  hardware: HardwareMode;
 }
 
-export const DEFAULT_CONVERSION: ConversionSettings = { memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" };
+export const DEFAULT_CONVERSION: ConversionSettings = { memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto" };
 
 /** A finished segment: in memory, or a file in the transcode folder. */
 export type SegmentData = { data: Buffer } | { file: string; size: number };
@@ -172,6 +199,8 @@ export interface ConversionViewer {
   user: string;
   title: string;
   mode: string;
+  /** Where the picture is re-encoded; null when it goes through as it is. */
+  converter: "gpu" | "cpu" | null;
   converting: boolean;
   memoryBytes: number;
   diskBytes: number;
@@ -201,6 +230,10 @@ interface Session {
   /** Segments being read into memory just now. */
   settling: Map<number, Promise<void>>;
   proc: ChildProcess | null;
+  /** The current run's GPU, or null on the CPU. */
+  gpu: GpuRun | null;
+  /** A GPU run failed: the rest of this viewing is on the CPU. */
+  cpuOnly: boolean;
   /** The segment the current run started at. */
   runFrom: number;
   /** The last segment the current run has started writing. */
@@ -275,8 +308,9 @@ export class HlsSessions {
   private ownsRoot: boolean;
   private settings: ConversionSettings = { ...DEFAULT_CONVERSION };
 
-  /** `root` null: a fresh temporary folder. */
-  constructor(private tools: Tools, root: string | null, private log: HlsLog) {
+  /** `root` null: a fresh temporary folder. `hardware`: the GPU, when the
+   *  engine looks for one; without it everything is converted on the CPU. */
+  constructor(private tools: Tools, root: string | null, private log: HlsLog, private hardware: Pick<Hardware, "choose" | "failed"> | null = null) {
     const usable = root ? prepareRoot(root, log) : null;
     this.root = usable ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-hls-"));
     this.ownsRoot = !usable;
@@ -401,6 +435,7 @@ export class HlsSessions {
       user: session.user,
       title: session.title,
       mode: session.plan.delivery.mode,
+      converter: session.plan.delivery.videoCopy ? null : session.gpu ? "gpu" as const : "cpu" as const,
       converting: session.proc !== null,
       memoryBytes: session.memoryBytes,
       diskBytes: [...session.onDisk.values()].reduce((sum, size) => sum + size, 0)
@@ -437,7 +472,7 @@ export class HlsSessions {
     const session: Session = {
       key, plan, user: who.user, title: who.title, dir,
       done: new Set(), memory: new Map(), memoryBytes: 0, onDisk: new Map(), settling: new Map(),
-      proc: null, runFrom: 0, writing: -1, failure: null, lastWanted: 0, asked: 0, touched: Date.now()
+      proc: null, gpu: null, cpuOnly: false, runFrom: 0, writing: -1, failure: null, lastWanted: 0, asked: 0, touched: Date.now()
     };
     this.sessions.set(key, session);
     return session;
@@ -448,7 +483,9 @@ export class HlsSessions {
     session.failure = null;
     session.runFrom = from;
     session.writing = from - 1;
-    const args = ffmpegArgs(session.plan, from, session.dir);
+    const gpu = session.cpuOnly ? null : this.hardware?.choose(session.plan.info, session.plan.delivery) ?? null;
+    session.gpu = gpu;
+    const args = ffmpegArgs(session.plan, from, session.dir, gpu);
     const proc = spawn(this.tools.ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     session.proc = proc;
     let stderr = "";
@@ -470,10 +507,20 @@ export class HlsSessions {
         return;
       }
       const reason = stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`;
+      // The GPU failed: the same segments again on the CPU, for the rest of the
+      // viewing, unless the admin asked for the GPU only.
+      if (gpu && this.hardware?.failed(reason)) {
+        this.log.warn({ item: session.plan.itemId, reason, stderr: stderr.trim() }, "The GPU could not convert this; converting it on the CPU");
+        session.cpuOnly = true;
+        let next = session.runFrom;
+        while (session.done.has(next)) next += 1;
+        if (next < session.plan.starts.length) this.start(session, next);
+        return;
+      }
       session.failure = `The conversion failed: ${reason}`;
       this.log.warn({ item: session.plan.itemId, code, signal, stderr: stderr.trim() }, "ffmpeg failed");
     });
-    this.log.info({ item: session.plan.itemId, from, mode: session.plan.delivery.mode }, "Converting");
+    this.log.info({ item: session.plan.itemId, from, mode: session.plan.delivery.mode, gpu: gpu ? (gpu.decode ? "decode+encode" : "encode") : null }, "Converting");
   }
 
   /** Stops the run and deletes the segment it was in the middle of. */

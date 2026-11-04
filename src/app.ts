@@ -16,6 +16,7 @@ import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers,
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setBackdropChoice, setMatch, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
+import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
 import { conversionSchema, detectionSchema, readConversion, readDetection, saveConversion, saveDetection } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
@@ -60,6 +61,8 @@ export interface AppOptions {
   /** ffmpeg and ffprobe, for converting what a browser can't play; found on
    *  PATH (or the dev dependencies) when left out, none at all when null. */
   tools?: Tools | null;
+  /** Finds out what the GPU can do (hardware.ts); tests hand in their own. */
+  detectGpu?: (tools: Tools) => Promise<GpuCapabilities>;
   /** Where segments are made while someone watches (TRANSCODE_PATH); emptied on
    *  start and removed on close. A fresh temporary folder when left out. */
   transcodeDir?: string;
@@ -230,13 +233,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!ok) app.log.warn("ffmpeg or ffprobe not found: only files a browser plays as they are will play");
   });
   const mediaProbe = tools ? new MediaProbe(db, tools) : null;
-  const hls = tools
-    ? new HlsSessions(tools, options.transcodeDir ?? null, {
-      info: (obj, msg) => app.log.info(obj, msg),
-      warn: (obj, msg) => app.log.warn(obj, msg)
-    })
-    : null;
+  const engineLog = {
+    info: (obj: object, msg: string) => app.log.info(obj, msg),
+    warn: (obj: object, msg: string) => app.log.warn(obj, msg)
+  };
+  // The GPU (hardware.ts): found out once ffmpeg answers, and on Check again.
+  const hardware = tools ? new Hardware(() => (options.detectGpu ?? detectGpu)(tools), engineLog) : null;
+  const hls = tools ? new HlsSessions(tools, options.transcodeDir ?? null, engineLog, hardware) : null;
   hls?.configure(readConversion(db));
+  void toolsReady.then((ok) => { if (ok) hardware?.configure(readConversion(db).hardware); });
   const subtitleCache = tools ? new SubtitleCache(tools) : null;
 
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
@@ -931,17 +936,28 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const conversion = () => ({
     available: Boolean(hls),
     settings: readConversion(db),
-    usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 }
+    usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 },
+    // What the GPU does here (engine 0.20+); null without ffmpeg.
+    hardware: hardware?.state() ?? null
   });
 
   app.get(`${API}/admin/conversion`, { preHandler: requireAdmin }, async () => conversion());
 
   app.put(`${API}/admin/conversion`, { preHandler: requireAdmin }, async (request) => {
-    const settings = conversionSchema.parse(request.body);
+    // A home from before 0.20 sends no `hardware`: what was chosen stays.
+    const settings = conversionSchema.parse({ ...readConversion(db), ...(request.body as object) });
     saveConversion(db, settings);
     hls?.configure(settings);
+    hardware?.configure(settings.hardware);
     const memory = settings.memoryPerViewerMb === 0 ? "no memory" : `${settings.memoryPerViewerMb} MB of memory each, then ${settings.whenFull === "disk" ? "the disk" : "waiting"}`;
-    note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting, ${memory}` });
+    const where = { auto: "on the GPU where it can", cpu: "on the CPU only", gpu: "on the GPU only" }[settings.hardware];
+    note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting ${where}, ${memory}` });
+    return conversion();
+  });
+
+  // Check again: what the GPU does, found out afresh (and its failures forgotten).
+  app.post(`${API}/admin/conversion/check`, { preHandler: requireAdmin }, async () => {
+    await hardware?.check();
     return conversion();
   });
 

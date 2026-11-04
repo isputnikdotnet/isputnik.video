@@ -27,10 +27,20 @@ WORKDIR /app
 # has none, so a template edit or an update cannot leave the tile blank.
 LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/icon.png"
 
-# gosu drops the entrypoint from root to the runtime user (scripts/docker-entrypoint.sh);
-# ffmpeg converts what a browser can't play as it is (src/delivery.ts, src/hls.ts).
-RUN apt-get update && apt-get install -y --no-install-recommends gosu ffmpeg \
+# gosu drops the entrypoint from root to the runtime user (scripts/docker-entrypoint.sh).
+# ffmpeg converts what a browser can't play as it is (src/delivery.ts, src/hls.ts):
+# Jellyfin's build, which carries Intel's media driver and vainfo, so a GPU passed in
+# as /dev/dri converts too (src/hardware.ts). It lives in /usr/lib/jellyfin-ffmpeg.
+RUN apt-get update && apt-get install -y --no-install-recommends gosu ca-certificates curl gnupg \
+    && install -d /etc/apt/keyrings \
+    && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+       > /etc/apt/sources.list.d/jellyfin.list \
+    && apt-get update && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+    && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+ENV FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
+ENV FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
 
 COPY --from=prod-deps /build/node_modules ./node_modules
 COPY --from=build /build/dist ./dist
@@ -38,8 +48,11 @@ COPY --from=build /build/dist ./dist
 # above dist/).
 COPY package.json ./
 
-# ffmpeg is there, with the encoders the conversion uses.
-RUN ffmpeg -hide_banner -encoders | grep -q libx264 && ffmpeg -hide_banner -encoders | grep -q " aac " && ffprobe -version > /dev/null
+# ffmpeg is there, with the encoders the conversion uses, on the CPU and the GPU,
+# and the tools the GPU check runs.
+RUN "$FFMPEG_PATH" -hide_banner -encoders | grep -q libx264 && "$FFMPEG_PATH" -hide_banner -encoders | grep -q " aac " \
+    && "$FFMPEG_PATH" -hide_banner -encoders | grep -q h264_vaapi && "$FFMPEG_PATH" -hide_banner -filters | grep -q scale_vaapi \
+    && "$FFPROBE_PATH" -version > /dev/null && test -x /usr/lib/jellyfin-ffmpeg/vainfo
 
 # Import smoke test: every production dependency must load from this tree, so a
 # missing package fails THIS build instead of the container at startup.
