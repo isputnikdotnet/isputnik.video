@@ -511,11 +511,12 @@ export class MetadataRunner {
   }
 }
 
-/** Fix the match of a show or movie by hand (a TMDB id), or give it back to the automatic one (null). */
-export function setMatch(db: Db, itemId: string, kind: "show" | "movie", tmdbId: string | null): void {
+/** Fix the match of a show or movie by hand (a TMDB id, and where on TMDB it is
+ *  when not the title's own kind), or give it back to the automatic one (null). */
+export function setMatch(db: Db, itemId: string, kind: "show" | "movie", tmdbId: string | null, tmdbKind: TmdbKind | null = null): void {
   const row = metaFor(db, [itemId]).get(itemId) ?? emptyRow(itemId, kind);
   // Another title on TMDB: a backdrop chosen from the old one's means nothing now.
-  saveRow(db, { ...row, kind, tmdb_id: tmdbId, tmdb_kind: null, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null });
+  saveRow(db, { ...row, kind, tmdb_id: tmdbId, tmdb_kind: tmdbId ? tmdbKind : null, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null });
 }
 
 /** The admin's pick of a title's TMDB backdrops, or back to the best by votes (null). */

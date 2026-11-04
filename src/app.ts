@@ -175,7 +175,8 @@ const matchSearchSchema = z.object({
   language: z.string().trim().regex(/^[a-z]{2}(-[A-Za-z]{2})?$/).default("en")
 });
 
-const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable() });
+// tmdbKind: where on TMDB the id is (a film kept here may be a TV show there); the title's own kind when left out.
+const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable(), tmdbKind: z.enum(["movie", "tv"]).optional() });
 const backdropBodySchema = z.object({ path: imagePathSchema.nullable() });
 // A mark by hand (markers.ts); a null start clears it.
 const markBodySchema = z.object({
@@ -1023,18 +1024,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
 
   // Fix match: TMDB's candidates for a title, with their posters through here.
+  // `kind` is the title's own; TMDB's other kind is searched after it, since a
+  // film kept here may be a TV show there, and each result says which it is.
   app.get(`${API}/admin/metadata/search`, { preHandler: requireAdmin }, async (request, reply) => {
     const query = matchSearchSchema.parse(request.query ?? {});
     const key = readTmdbKey(db);
     if (!key) return reply.code(409).send({ error: "No TMDB key", code: "video.tmdb_no_key" });
     try {
-      const results = await new Tmdb(key, options.fetch).search(query.kind, query.q, query.year ?? null, query.language);
-      return {
-        results: results.map(({ posterPath, ...result }) => ({
-          ...result,
-          poster: posterPath && imagePathSchema.safeParse(posterPath).success ? `${API}/admin/metadata/image${posterPath}` : null
-        }))
-      };
+      const tmdb = new Tmdb(key, options.fetch);
+      const results = [];
+      for (const kind of [query.kind, query.kind === "movie" ? "tv" : "movie"] as const) {
+        for (const { posterPath, ...result } of await tmdb.search(kind, query.q, query.year ?? null, query.language)) {
+          results.push({ ...result, kind, poster: posterPath && imagePathSchema.safeParse(posterPath).success ? `${API}/admin/metadata/image${posterPath}` : null });
+        }
+      }
+      return { results };
     } catch (err) {
       return reply.code(502).send({ error: (err as Error).message });
     }
@@ -1093,14 +1097,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // asked of TMDB at once, and the title answered as the family now sees it.
   app.put(`${API}/admin/metadata/items/:id`, { preHandler: requireAdmin }, async (request, reply) => {
     const id = itemIdSchema.parse((request.params as { id: string }).id);
-    const { tmdbId } = matchBodySchema.parse(request.body);
+    const { tmdbId, tmdbKind } = matchBodySchema.parse(request.body);
     const show = db.prepare("SELECT title, library_id FROM shows WHERE id = ?").get(id) as { title: string; library_id: string } | undefined;
     const movie = show ? undefined : db.prepare("SELECT title, library_id FROM movies WHERE id = ?").get(id) as { title: string; library_id: string } | undefined;
     const found = show ?? movie;
     if (!found) return reply.code(404).send({ error: "Not found" });
-    setMatch(db, id, show ? "show" : "movie", tmdbId);
+    setMatch(db, id, show ? "show" : "movie", tmdbId, tmdbKind ?? null);
     await metadata.refreshOne(id);
-    note(request, "info", "metadata.matched", { libraryId: found.library_id, detail: tmdbId ? `${found.title} matched by hand to TMDB ${tmdbId}` : `${found.title} matched automatically again` });
+    const where = tmdbKind && tmdbKind !== (show ? "tv" : "movie") ? (tmdbKind === "tv" ? " (a TV show there)" : " (a film there)") : "";
+    note(request, "info", "metadata.matched", { libraryId: found.library_id, detail: tmdbId ? `${found.title} matched by hand to TMDB ${tmdbId}${where}` : `${found.title} matched automatically again` });
     return show ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
   });
 

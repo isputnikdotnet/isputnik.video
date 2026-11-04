@@ -258,7 +258,7 @@ describe("with a TMDB key", () => {
     await app.scansSettled();
     const search = await app.inject({ method: "GET", url: "/video/api/admin/metadata/search?kind=movie&q=The%20Right%20Film", headers: admin });
     expect(search.json().results).toEqual([
-      { tmdbId: "404", title: "The Right Film", originalTitle: null, year: 1999, overview: "The one.", poster: "/video/api/admin/metadata/image/p404.jpg" }
+      { tmdbId: "404", kind: "movie", title: "The Right Film", originalTitle: null, year: 1999, overview: "The one.", poster: "/video/api/admin/metadata/image/p404.jpg" }
     ]);
     expect((await app.inject({ method: "GET", url: "/video/api/admin/metadata/image/p404.jpg", headers: admin })).body).toBe("image /t/p/w185/p404.jpg");
     expect((await app.inject({ method: "GET", url: "/video/api/admin/metadata/search?kind=movie&q=x", headers: mum })).statusCode).toBe(403);
@@ -302,6 +302,27 @@ describe("with a TMDB key", () => {
     // A film TMDB knows as a film is matched as before.
     const some = (await app.inject({ method: "GET", url: `/video/api/movies/${byTitle(await movies(), "Some Film").id}`, headers: mum })).json();
     expect(some).toMatchObject({ tmdbId: "101", tmdbMatch: { kind: "movie" } });
+  });
+
+  it("offers TMDB's shows to Fix match for a film, after its films, and keeps a show chosen by hand", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    // Films first, then shows, each saying which it is: TMDB's film and show ids are separate counts.
+    const search = await app.inject({ method: "GET", url: "/video/api/admin/metadata/search?kind=movie&q=Peter%27s%20Pop%20Show", headers: admin });
+    expect(search.json().results).toEqual([
+      { tmdbId: "505", kind: "tv", title: "Peter's Pop Show", originalTitle: null, year: 1985, overview: null, poster: "/video/api/admin/metadata/image/p505.jpg" }
+    ]);
+    const loose = byTitle(await movies(), "Loose Film");
+    const fixed = await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${loose.id}`, headers: admin, payload: { tmdbId: "505", tmdbKind: "tv" } });
+    expect(fixed.statusCode).toBe(200);
+    expect(fixed.json().movie).toMatchObject({ title: "Loose Film", plot: "Pop acts of the year.", tmdbId: "505", tmdbMatch: { state: "matched", locked: true, kind: "tv" } });
+    expect(tmdb.asked.some((request) => request.startsWith("/3/movie/505"))).toBe(false);
+    // The choice holds through the next pass.
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_films/metadata", headers: admin });
+    await app.scansSettled();
+    expect((await app.inject({ method: "GET", url: `/video/api/movies/${loose.id}`, headers: mum })).json()).toMatchObject({ tmdbId: "505", tmdbMatch: { locked: true, kind: "tv" } });
+    const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=metadata.matched", headers: admin })).json();
+    expect(events.events[0].detail).toBe("Loose Film matched by hand to TMDB 505 (a TV show there)");
   });
 
   it("finds a title by TMDB's name too", async () => {
