@@ -25,7 +25,13 @@ export function openDatabase(file: string): Database.Database {
 export function upgradeDatabase(db: Database.Database): void {
   // All or nothing: a widening stopped halfway would leave the marks in the old table.
   db.transaction(() => {
+    // Edits saved by 0.23.0 knew nothing of sets: the film's set then is the scan's own.
+    const editsWithoutSets = hasTable(db, "title_edits") && !hasColumn(db, "title_edits", "auto_set_name");
     addColumns(db);
+    if (editsWithoutSets) {
+      db.exec(`UPDATE title_edits SET auto_set_name = m.set_name, auto_set_tmdb_id = m.set_tmdb_id, auto_set_order = m.set_order
+        FROM movies m WHERE m.id = title_edits.item_id`);
+    }
     const widening = setAsideNarrowMarkers(db);
     db.exec(fs.readFileSync(path.join(here, "schema.sql"), "utf8"));
     if (widening) {
@@ -77,8 +83,19 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["detected_markers", "recap_end", "REAL"],
   ["detected_markers", "recap_checked", "INTEGER NOT NULL DEFAULT 0"],
   ["shows", "added_at", "TEXT"],
-  ["movies", "added_at", "TEXT"]
+  ["movies", "added_at", "TEXT"],
+  ["title_edits", "set_name", "TEXT"],
+  ["title_edits", "set_order", "INTEGER"],
+  ["title_edits", "no_set", "INTEGER NOT NULL DEFAULT 0"],
+  ["title_edits", "auto_set_name", "TEXT"],
+  ["title_edits", "auto_set_tmdb_id", "TEXT"],
+  ["title_edits", "auto_set_order", "INTEGER"]
 ];
+
+const hasTable = (db: Database.Database, table: string) =>
+  (db.prepare("SELECT name FROM pragma_table_info(?)").all(table) as unknown[]).length > 0;
+const hasColumn = (db: Database.Database, table: string, column: string) =>
+  (db.prepare("SELECT name FROM pragma_table_info(?)").all(table) as { name: string }[]).some((row) => row.name === column);
 
 function addColumns(db: Database.Database): void {
   for (const [table, column, definition] of ADDED_COLUMNS) {

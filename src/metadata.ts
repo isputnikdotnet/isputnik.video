@@ -24,6 +24,11 @@ import type { Db } from "./db.js";
 import { resolveInside } from "./media.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, type Fetch, type TmdbKind } from "./tmdb.js";
 import { countSets, markSetChecked, rebuildSets, saveSetTmdb, setsDueForTmdb } from "./sets.js";
+import { partsOfMovie } from "./playback.js";
+
+/** A name as TMDB and a folder may both write it: case, ё, apostrophes, quotes and punctuation aside. */
+export const nameKey = (name: string) =>
+  name.normalize("NFKC").toLowerCase().replace(/ё/g, "е").replace(/[\p{P}\p{S}]+/gu, " ").replace(/\s+/g, " ").trim();
 
 export type MetaKind = "show" | "movie" | "episode";
 export type ArtKind = "poster" | "backdrop" | "still";
@@ -303,10 +308,11 @@ export class MetadataRunner {
    *  concert kept as a film the same way. The names as they are first, then with
    *  their first word dropped ("Concert Peter's Pop Show"): a name of three
    *  words or more often opens with a word that isn't the title's. */
-  private async match(tmdb: Tmdb, kind: TmdbKind, title: TitleRow, row: MetaRow, language: string): Promise<{ id: string; kind: TmdbKind } | null> {
+  private async match(tmdb: Tmdb, kind: TmdbKind, title: TitleRow, row: MetaRow, language: string, inParts = false): Promise<{ id: string; kind: TmdbKind } | null> {
     if (row.locked && row.tmdb_id) return { id: row.tmdb_id, kind: row.tmdb_kind ?? kind };
     if (title.tmdb_id) return { id: title.tmdb_id, kind };
-    const kinds: TmdbKind[] = [kind, kind === "movie" ? "tv" : "movie"];
+    // A film in several files is most often a miniseries: TMDB's shows are asked first.
+    const kinds: TmdbKind[] = inParts ? ["tv", "movie"] : [kind, kind === "movie" ? "tv" : "movie"];
     if (title.imdb_id) {
       for (const where of kinds) {
         const found = await tmdb.findByImdb(where, title.imdb_id);
@@ -319,28 +325,56 @@ export class MetadataRunner {
     const trimmed = distinct(names.map((name) => name.trim().split(/\s+/)).filter((words) => words.length >= 3).map((words) => words.slice(1).join(" ")))
       .filter((query) => !names.includes(query));
     for (const queries of [names, trimmed]) {
+      // Each answer is weighed, not taken first-come: a yearless search for
+      // «Д'Артаньян и три мушкетёра» lists two later films (one of exactly that
+      // name) before the 1979 TV show it is. A result named as the title (case,
+      // ё, apostrophes and punctuation aside) within a year of it is taken at
+      // once; else the best of what came back once both kinds are asked.
+      const wanted = new Set(queries.map(nameKey));
+      const seen: { id: string; kind: TmdbKind; named: boolean; off: number | null; order: number }[] = [];
       for (const where of kinds) {
         for (const query of queries) {
           for (const year of title.year ? [title.year, null] : [null]) {
             const results = await tmdb.search(where, query, year, language);
             await sleep(PAUSE_MS);
-            // With a year, one within a year of it (release dates differ by country); without, the first.
-            const hit = title.year ? results.find((result) => result.year !== null && Math.abs(result.year - title.year!) <= 1) : results[0];
-            if (hit) return { id: hit.tmdbId, kind: where };
+            for (const result of results) {
+              const named = [result.title, result.originalTitle].some((name) => name && wanted.has(nameKey(name)));
+              const off = title.year && result.year !== null ? Math.abs(result.year - title.year) : null;
+              if (named && (off === null ? !title.year : off <= 1)) return { id: result.tmdbId, kind: where };
+              seen.push({ id: result.tmdbId, kind: where, named, off, order: seen.length });
+            }
           }
         }
       }
+      const pick =
+        // The name, though its year is further off than one (a folder dated by its rip, a re-release).
+        seen.filter((entry) => entry.named).sort((a, b) => (a.off ?? 99) - (b.off ?? 99) || a.order - b.order)[0] ??
+        // Another name within a year of it (a title translated differently).
+        (title.year ? seen.find((entry) => entry.off !== null && entry.off <= 1) : undefined) ??
+        // No year to go by: the first of the title's own kind, as before.
+        (title.year ? undefined : seen[0]);
+      if (pick) return { id: pick.id, kind: pick.kind };
     }
     return null;
   }
 
   /** One show or movie: its art beside the files, and TMDB when it is due. */
-  private async refreshTitle(tmdb: Tmdb | null, library: Library, title: TitleRow, episodes: EpisodeRow[], force: boolean, summary: MetadataSummary): Promise<void> {
+  private async refreshTitle(tmdb: Tmdb | null, library: Library, title: TitleRow, showEpisodes: EpisodeRow[], force: boolean, summary: MetadataSummary): Promise<void> {
     const { db, mediaRoot } = this.ctx;
     const kind: MetaKind = library.kind === "shows" ? "show" : "movie";
     const tmdbKind: TmdbKind = kind === "show" ? "tv" : "movie";
+    // A film in several files that TMDB has as a TV show («Д'Артаньян и три
+    // мушкетёра», three parts): its parts take that show's first season's
+    // episodes — names, descriptions, stills — kept under keys of their own
+    // (partKey), since the first part's id is the film's.
+    const filmParts = kind === "movie" && title.file ? partsOfMovie(db, { id: title.id, file: title.file }) : [];
+    const partEpisodes: EpisodeRow[] = filmParts.length > 1
+      ? filmParts.map((part) => ({ id: partKey(title.id, part.part), season: 1, episode: part.part, file: part.file }))
+      : [];
+    const episodes = kind === "movie" ? partEpisodes : showEpisodes;
     const existing = metaFor(db, [title.id, ...episodes.map((episode) => episode.id)]);
     const row: MetaRow = { ...(existing.get(title.id) ?? emptyRow(title.id, kind)), kind };
+    const asShow = () => kind === "show" || row.tmdb_kind === "tv";
 
     // Beside the files: the title's own folder; a film without one, its own name in the folder it sits in.
     const loose = kind === "movie" && title.folder === title.file;
@@ -353,10 +387,10 @@ export class MetadataRunner {
     const now = Date.now();
     let details: Awaited<ReturnType<Tmdb["details"]>> | null = null;
     const seasons = new Map<number, Awaited<ReturnType<Tmdb["season"]>>>();
-    const missingEpisode = episodes.some((episode) => !existing.has(episode.id));
-    if (tmdb && (due(row, now, force) || (kind === "show" && missingEpisode && row.tmdb_state === "matched"))) {
+    const missingEpisode = episodes.some((episode) => !existing.get(episode.id)?.checked_at);
+    if (tmdb && (due(row, now, force) || (asShow() && missingEpisode && row.tmdb_state === "matched"))) {
       try {
-        const found = await this.match(tmdb, tmdbKind, title, row, library.language);
+        const found = await this.match(tmdb, tmdbKind, title, row, library.language, partEpisodes.length > 1);
         if (found) {
           details = await tmdb.details(found.kind, found.id, library.language);
           await sleep(PAUSE_MS);
@@ -402,6 +436,12 @@ export class MetadataRunner {
     else if (row.tmdb_state === "unmatched") summary.unmatched += 1;
     else if (row.tmdb_state === "error") summary.failed += 1;
     if (row.poster) summary.posters += 1;
+
+    // A film's parts are episodes only while it is matched to a TV show; else what they had goes.
+    if (kind === "movie" && !asShow()) {
+      forgetParts(db, this.ctx.artDir, title.id);
+      return;
+    }
 
     // Each episode: its thumb beside it, else TMDB's still; TMDB's words where the scan had none.
     for (const episode of episodes) {
@@ -584,11 +624,33 @@ export function removePosterUpload(db: Db, artDir: string, itemId: string): void
   saveRow(db, { ...row, poster_upload: null, poster: null });
 }
 
+/** Where a film's part keeps what TMDB says of it as an episode. Not the part's
+ *  own id: the first part's id is the film's, whose row is the film's. */
+const PART_MARK = "-part";
+export const partKey = (movieId: string, part: number) => `${movieId}${PART_MARK}${part}`;
+
+/** The film a part key belongs to, and which part; null for any other id. */
+export function partOfKey(key: string): { movieId: string; part: number } | null {
+  const found = /^(.+)-part(\d+)$/.exec(key);
+  return found ? { movieId: found[1], part: Number(found[2]) } : null;
+}
+
+/** A film's parts' episode rows and stills, gone (it is no longer a TV show's). */
+function forgetParts(db: Db, artDir: string, movieId: string): void {
+  const rows = db.prepare("SELECT item_id, still FROM metadata WHERE item_id LIKE ? ESCAPE '\\'")
+    .all(`${movieId.replace(/[\\%_]/g, "\\$&")}${PART_MARK}%`) as { item_id: string; still: string | null }[];
+  for (const row of rows) {
+    if (row.still?.startsWith("cache:")) fs.rmSync(path.join(artDir, path.basename(row.still.slice(6))), { force: true });
+    db.prepare("DELETE FROM metadata WHERE item_id = ?").run(row.item_id);
+  }
+}
+
 /** Rows (and their images) whose item is gone; for the daily sweep. */
 export function purgeOrphanMetadata(db: Db, artDir: string): number {
   const gone = db.prepare(`
     SELECT item_id, poster, backdrop, still, poster_upload FROM metadata
     WHERE item_id NOT IN (SELECT id FROM shows) AND item_id NOT IN (SELECT id FROM movies) AND item_id NOT IN (SELECT id FROM episodes)
+      AND NOT (instr(item_id, '${PART_MARK}') > 0 AND substr(item_id, 1, instr(item_id, '${PART_MARK}') - 1) IN (SELECT id FROM movies))
   `).all() as { item_id: string; poster: string | null; backdrop: string | null; still: string | null; poster_upload: string | null }[];
   for (const row of gone) {
     for (const source of [row.poster, row.backdrop, row.still, row.poster_upload]) {

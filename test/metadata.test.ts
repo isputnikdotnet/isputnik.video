@@ -44,6 +44,20 @@ function fakeTmdb() {
     }
     if (path === "/movie/101") return json({ id: 101, title: "Some Film", overview: "A film about something.", release_date: "2010-05-01", genres: [{ name: "Drama" }], vote_average: 7.1, poster_path: "/p101.jpg", backdrop_path: "/b101.jpg" });
     if (path === "/movie/404") return json({ id: 404, title: "The Right Film", overview: "The one.", release_date: "1999-01-01", genres: [{ name: "Thriller" }], vote_average: 6, poster_path: "/p404.jpg", backdrop_path: null });
+    if (path === "/search/movie" && query.startsWith("Д'Артаньян")) return json({ results: [
+      { id: 900, title: "Три мушкетёра: Д'Артаньян", original_title: "Les Trois Mousquetaires : D'Artagnan", release_date: "2023-12-08" },
+      { id: 901, title: "Д'Артаньян и три мушкетера", original_title: "D'Artagnan et les Trois Mousquetaires", release_date: "2007-06-06" }
+    ] });
+    if (path === "/search/tv" && query.startsWith("Д'Артаньян")) return json({ results: [
+      { id: 76829, name: "Д’Артаньян и три мушкетера", original_name: "Д’Артаньян и три мушкетёра", first_air_date: "1979-12-25" },
+      { id: 902, name: "Д’Артаньян и три мушкетера", original_name: "D'Artagnan et les Trois Mousquetaires", first_air_date: "2005-02-14" }
+    ] });
+    if (path === "/tv/76829") return json({ id: 76829, name: "Д’Артаньян и три мушкетера", overview: "Мушкетёры против кардинала.", first_air_date: "1979-12-25", genres: [{ name: "Приключения" }], poster_path: "/p76829.jpg" });
+    if (path === "/tv/76829/season/1") return json({ episodes: [
+      { episode_number: 1, name: "Атос, Портос, Арамис и Д'Артаньян", overview: "Гасконец едет в Париж.", air_date: "1979-12-25", still_path: "/e1.jpg" },
+      { episode_number: 2, name: "Подвески королевы", overview: "Подвески у Бекингема.", air_date: "1979-12-26", still_path: "/e2.jpg" },
+      { episode_number: 3, name: "Приключения продолжаются", overview: "Миледи бежит.", air_date: "1979-12-27", still_path: "/e3.jpg" }
+    ] });
     if (path === "/search/tv") {
       if (query.startsWith("Counterpart")) return json({ results: [{ id: 202, name: "Counterpart", first_air_date: "2017-12-10" }] });
       // A concert kept as a film, which TMDB files as a TV show under its own name.
@@ -360,6 +374,48 @@ describe("with a TMDB key", () => {
     // A film TMDB knows as a film is matched as before.
     const some = (await app.inject({ method: "GET", url: `/video/api/movies/${byTitle(await movies(), "Some Film").id}`, headers: mum })).json();
     expect(some).toMatchObject({ tmdbId: "101", tmdbMatch: { kind: "movie" } });
+  });
+
+  it("weighs every answer by name and year: a miniseries kept as a film in three parts is the 1979 show, its parts its episodes", async () => {
+    // No year anywhere: being in parts is what says it is a miniseries.
+    for (const n of [1, 2, 3]) fixture.write(`Movies/Д'Артаньян и три мушкетёра/Д'Артаньян и три мушкетёра серия ${n}.mkv`, "x".repeat(5000 + n));
+    await setKey(GOOD_KEY);
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_films/scan", headers: admin });
+    await app.scansSettled();
+    const film = byTitle(await movies(), "Д'Артаньян и три мушкетёра");
+    const detail = (await app.inject({ method: "GET", url: `/video/api/movies/${film.id}`, headers: mum })).json();
+    // Not the 2007 film of the same Russian name, though it came first: TMDB's 1979 show.
+    expect(detail.tmdbMatch).toMatchObject({ id: "76829", kind: "tv", state: "matched" });
+    expect(detail.parts.map((part: { part: number; title: string | null; plot: string | null }) => [part.part, part.title, part.plot])).toEqual([
+      [1, "Атос, Портос, Арамис и Д'Артаньян", "Гасконец едет в Париж."],
+      [2, "Подвески королевы", "Подвески у Бекингема."],
+      [3, "Приключения продолжаются", "Миледи бежит."]
+    ]);
+    // Each part's still, served under its own key to those who may see the film.
+    const still = detail.parts[1].still as string;
+    expect(still).toMatch(new RegExp(`/video/api/art/${film.id}-part2/still\\?v=`));
+    expect((await app.inject({ method: "GET", url: still, headers: mum })).body).toBe("image /t/p/w300/e2.jpg");
+    expect((await app.inject({ method: "GET", url: still, headers: as("kid", "member", ["lib_shows"]) })).statusCode).toBe(404);
+    // The daily sweep keeps them while the film is there.
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_films/metadata", headers: admin });
+    await app.scansSettled();
+    expect((await app.inject({ method: "GET", url: `/video/api/movies/${film.id}`, headers: mum })).json().parts[2].title).toBe("Приключения продолжаются");
+
+    // Matched by hand to a film, the parts are plain parts again.
+    await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${film.id}`, headers: admin, payload: { tmdbId: "101" } });
+    const after = (await app.inject({ method: "GET", url: `/video/api/movies/${film.id}`, headers: mum })).json();
+    expect(after.parts.map((part: { title: string | null; still: string | null }) => [part.title, part.still])).toEqual([[null, null], [null, null], [null, null]]);
+  });
+
+  it("takes a title of the same name when its year is further off than one", async () => {
+    // A folder dated by something else than the première: the name decides.
+    fixture.write("Movies/Д'Артаньян и три мушкетёра (1983)/Д'Артаньян и три мушкетёра (1983).mkv", "x".repeat(5000));
+    await setKey(GOOD_KEY);
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_films/scan", headers: admin });
+    await app.scansSettled();
+    const film = byTitle(await movies(), "Д'Артаньян и три мушкетёра");
+    const detail = (await app.inject({ method: "GET", url: `/video/api/movies/${film.id}`, headers: mum })).json();
+    expect(detail.tmdbMatch).toMatchObject({ id: "76829", kind: "tv" });
   });
 
   it("offers TMDB's shows to Fix match for a film, after its films, and keeps a show chosen by hand", async () => {

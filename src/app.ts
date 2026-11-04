@@ -14,7 +14,7 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
-import { MetadataRunner, artFile, keyHint, metaFor, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
+import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -32,7 +32,7 @@ import type { LogBuffer } from "./log-buffer.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
-import { editState, saveEdit } from "./edits.js";
+import { editState, saveEdit, setNames } from "./edits.js";
 import { resolveGenres } from "./genres.js";
 import { GenreError, addKeyword, createGenre, deleteGenre, reloadGenres, genreOverview, hideWord, mergeGenre, removeKeyword, renameGenre, seedGenres, showWord } from "./genres.js";
 
@@ -759,8 +759,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // TMDB's kept in the art folder. Only for someone who may see the title.
   const serveArt = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id, kind } = request.params as { id: string; kind: string };
-    // A film's parts share its pictures.
-    const itemId = movieIdOf(db, itemIdSchema.parse(id));
+    // A film's parts share its pictures; a part's still (an episode's, from TMDB) is under its own key.
+    const askedId = itemIdSchema.parse(id);
+    const partOf = partOfKey(askedId);
+    const itemId = partOf ? partOf.movieId : movieIdOf(db, askedId);
     const artKind = artKindSchema.safeParse(kind);
     const owner = db.prepare(`
       SELECT library_id FROM shows WHERE id = @id
@@ -771,7 +773,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // Not a title: a set's own picture, for someone who sees one of its films.
     const set = owner ? null : setArtRow(db, request.identity!, itemId);
     if (!artKind.success || (!set && (!library || library.state !== "active" || !canSee(request.identity!, library.id)))) return reply.code(404).send({ error: "Not found" });
-    const file = artFile(set ?? metaFor(db, [itemId]).get(itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
+    const file = artFile(set ?? metaFor(db, [partOf ? askedId : itemId]).get(partOf ? askedId : itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
     if (!file) return reply.code(404).send({ error: "Not found" });
     const type = ART_TYPES[path.extname(file).toLowerCase()];
     if (!type) return reply.code(404).send({ error: "Not found" });
@@ -1211,8 +1213,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     sortTitle: z.string().max(300).nullable().optional(),
     year: z.number().int().min(1870).max(2200).nullable().optional(),
     plot: z.string().max(10_000).nullable().optional(),
-    genres: z.array(z.string().max(100)).max(30).nullable().optional()
+    genres: z.array(z.string().max(100)).max(30).nullable().optional(),
+    set: z.union([
+      z.object({ mode: z.literal("none") }),
+      z.object({ mode: z.literal("named"), name: z.string().trim().min(1).max(200), order: z.number().int().min(0).max(999).nullable().optional() })
+    ]).nullable().optional()
   });
+
+  app.get(`${API}/admin/sets/names`, { preHandler: requireAdmin }, async () => ({ sets: setNames(db) }));
 
   app.get(`${API}/admin/titles/:id/edit`, { preHandler: requireAdmin }, async (request, reply) => {
     const state = editState(db, itemIdSchema.parse((request.params as { id: string }).id));
@@ -1225,6 +1233,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const before = db.prepare("SELECT title, library_id, 'shows' AS kind FROM shows WHERE id = ? UNION ALL SELECT title, library_id, 'movies' FROM movies WHERE id = ?")
       .get(id, id) as { title: string; library_id: string; kind: "shows" | "movies" } | undefined;
     if (!before || !saveEdit(db, id, body)) return reply.code(404).send({ error: "Not found" });
+    // A film put into a set, moved in one or taken out: the sets are worked out again at once.
+    if (body.set !== undefined) rebuildSets(db, artDir);
     const fields = Object.keys(body).join(", ") || "nothing";
     note(request, "info", "title.edited", { libraryId: before.library_id, detail: `${before.title}: ${fields} edited` });
     const title = before.kind === "shows" ? getShow(db, request.identity!, id) : getMovie(db, request.identity!, id);

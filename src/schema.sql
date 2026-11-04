@@ -338,5 +338,13 @@ CREATE TABLE IF NOT EXISTS title_edits (
   auto_year           INTEGER,
   auto_plot           TEXT,
   auto_genres         TEXT NOT NULL DEFAULT '[]',
+  -- A film's set by hand: a name (joins TMDB's of that name) and its place in it,
+  -- or no_set = 1 for none at all, which TMDB's collection doesn't override.
+  set_name            TEXT,
+  set_order           INTEGER,
+  no_set              INTEGER NOT NULL DEFAULT 0,
+  auto_set_name       TEXT,
+  auto_set_tmdb_id    TEXT,
+  auto_set_order      INTEGER,
   updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

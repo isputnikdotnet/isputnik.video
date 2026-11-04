@@ -57,6 +57,8 @@ const partsOf = (row: Pick<SetRow, "parts"> | undefined): { tmdbId: string; rele
 
 interface FilmFacts {
   id: string;
+  /** 1 when the admin took it out of every set (edits.ts). */
+  no_set: number | null;
   set_name: string | null;
   set_overview: string | null;
   set_tmdb_id: string | null;
@@ -78,8 +80,8 @@ interface Group {
 export function rebuildSets(db: Db, artDir: string): void {
   const films = db.prepare(`
     SELECT m.id, m.set_name, m.set_overview, m.set_tmdb_id,
-           md.tmdb_id AS film_tmdb_id, md.set_tmdb_id AS tmdb_set_id, md.set_name AS tmdb_set_name
-    FROM movies m LEFT JOIN metadata md ON md.item_id = m.id
+           md.tmdb_id AS film_tmdb_id, md.set_tmdb_id AS tmdb_set_id, md.set_name AS tmdb_set_name, te.no_set
+    FROM movies m LEFT JOIN metadata md ON md.item_id = m.id LEFT JOIN title_edits te ON te.item_id = m.id
   `).all() as FilmFacts[];
 
   const byTmdb = new Map<string, Group>();
@@ -95,6 +97,7 @@ export function rebuildSets(db: Db, artDir: string): void {
     return found;
   };
   for (const film of films) {
+    if (film.no_set) continue;
     if (film.set_name) {
       const found = group(film.set_tmdb_id, film.set_name);
       found.films.push({ id: film.id, source: "nfo", tmdbId: film.film_tmdb_id });

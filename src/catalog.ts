@@ -5,7 +5,7 @@ import type { Db } from "./db.js";
 import { canSee, type Identity } from "./identity.js";
 import { browserPlayability, movieIdOf, nextUp, partsOfMovie, placeInFilm, progressFor, resumeAt } from "./playback.js";
 import { BASE_PATH } from "./config.js";
-import { artUrl, metaFor, metaGenres, type MetaRow } from "./metadata.js";
+import { artUrl, metaFor, metaGenres, partKey, type MetaRow } from "./metadata.js";
 import { parseGenres, rawGenresSql, resolveGenres, widenGenres } from "./genres.js";
 import { setOfMovie } from "./sets.js";
 
@@ -274,6 +274,8 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
   const parts = partsOfMovie(db, { id, file: movie.file as string });
   const place = placeInFilm(db, identity.id, parts);
   const partProgress = progressFor(db, identity.id, parts.map((part) => part.id));
+  // A film TMDB has as a TV show: each part is one of its episodes (metadata.ts).
+  const partMeta = parts.length < 2 ? new Map<string, MetaRow>() : metaFor(db, parts.map((part) => partKey(id, part.part)));
   return {
     id: movie.id as string,
     libraryId: movie.library_id as string,
@@ -297,6 +299,10 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
     parts: parts.length < 2 ? [] : parts.map((part) => ({
       id: part.id,
       part: part.part,
+      title: partMeta.get(partKey(id, part.part))?.title ?? null,
+      plot: partMeta.get(partKey(id, part.part))?.plot ?? null,
+      aired: partMeta.get(partKey(id, part.part))?.aired ?? null,
+      still: artUrl(API, partMeta.get(partKey(id, part.part)), "still"),
       direct: browserPlayability(part.file).direct,
       progress: partProgress.get(part.id) ?? null
     })),
