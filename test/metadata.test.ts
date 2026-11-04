@@ -60,7 +60,11 @@ function fakeTmdb() {
       { file_path: "/portrait202.jpg", iso_639_1: null, vote_average: 5.6, vote_count: 4, width: 1920, height: 1080 }
     ];
     if (path === "/tv/202") return json({ id: 202, name: "Counterpart", overview: "A spy story.", first_air_date: "2017-12-10", genres: [{ name: "Sci-Fi" }], poster_path: "/p202.jpg", backdrop_path: "/b202.jpg", images: { backdrops: backdrops202.filter((image) => image.iso_639_1 === null) } });
-    if (path === "/tv/202/images") return json({ backdrops: backdrops202 });
+    if (path === "/tv/202/images") return json({ backdrops: backdrops202, posters: [
+      { file_path: "/q202-de.jpg", iso_639_1: "de", vote_average: 9 },
+      { file_path: "/q202-en.jpg", iso_639_1: "en", vote_average: 7 },
+      { file_path: "/q202.jpg", iso_639_1: null, vote_average: 5 }
+    ] });
     if (path === "/tv/202/season/2") return json({ episodes: [
       { episode_number: 1, name: "Inside Out", overview: "Howard wakes.", still_path: "/s1.jpg" },
       { episode_number: 2, name: "Outside In", overview: "Emily returns.", still_path: "/s2.jpg" }
@@ -217,6 +221,60 @@ describe("with a TMDB key", () => {
     expect(again.body).toBe("image /t/p/w1280/portrait202.jpg");
     expect(again.url).not.toBe(chosen.url);
     expect((await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/backdrop`, headers: mum, payload: { path: null } })).statusCode).toBe(403);
+  });
+
+  it("lets an admin choose one of TMDB's posters, or upload one of their own over every other", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const id = byTitle(await shows(), "Counterpart").id as string;
+    const poster = async () => {
+      const url = (await app.inject({ method: "GET", url: `/video/api/shows/${id}`, headers: mum })).json().poster as string;
+      return (await app.inject({ method: "GET", url, headers: mum })).body;
+    };
+    expect(await poster()).toBe("image /t/p/w500/p202.jpg");
+
+    const list = (await app.inject({ method: "GET", url: `/video/api/admin/metadata/items/${id}/posters`, headers: admin })).json();
+    // The library's language (en) first, then those with no words, then any other.
+    expect(list.posters.map((image: { path: string }) => image.path)).toEqual(["/q202-en.jpg", "/q202.jpg", "/q202-de.jpg"]);
+    expect(list).toMatchObject({ uploaded: false, choice: null, current: "/p202.jpg", tmdb: true });
+
+    await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/poster`, headers: admin, payload: { path: "/q202.jpg" } });
+    expect(await poster()).toBe("image /t/p/w500/q202.jpg");
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_shows/metadata", headers: admin });
+    await app.scansSettled();
+    expect(await poster()).toBe("image /t/p/w500/q202.jpg");
+
+    // An upload: not a picture is refused; a PNG wins over the choice, through a refresh too.
+    const notPicture = await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/poster/upload`, headers: { ...admin, "content-type": "image/png" }, payload: Buffer.from("not a picture") });
+    expect(notPicture.statusCode).toBe(400);
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("our own poster")]);
+    const uploaded = await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/poster/upload`, headers: { ...admin, "content-type": "image/png" }, payload: png });
+    expect(uploaded.statusCode).toBe(200);
+    expect(await poster()).toContain("our own poster");
+    await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_shows/metadata", headers: admin });
+    await app.scansSettled();
+    expect((await app.inject({ method: "GET", url: `/video/api/admin/metadata/items/${id}/posters`, headers: admin })).json()).toMatchObject({ uploaded: true });
+    expect(await poster()).toContain("our own poster");
+
+    // Gone again: back to the chosen one; then back to TMDB's own.
+    await app.inject({ method: "DELETE", url: `/video/api/admin/metadata/items/${id}/poster/upload`, headers: admin });
+    expect(await poster()).toBe("image /t/p/w500/q202.jpg");
+    await app.inject({ method: "PUT", url: `/video/api/admin/metadata/items/${id}/poster`, headers: admin, payload: { path: null } });
+    expect(await poster()).toBe("image /t/p/w500/p202.jpg");
+    expect((await app.inject({ method: "DELETE", url: `/video/api/admin/metadata/items/${id}/poster/upload`, headers: mum })).statusCode).toBe(403);
+  });
+
+  it("gives one TMDB candidate's words for Lookup, its genres through the admin's list", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const created = (await app.inject({ method: "POST", url: "/video/api/admin/genres", headers: admin, payload: { name: "Фантастика" } })).json();
+    await app.inject({ method: "POST", url: `/video/api/admin/genres/${created.genres[0].id}/keywords`, headers: admin, payload: { word: "Sci-Fi" } });
+    const details = await app.inject({ method: "GET", url: "/video/api/admin/metadata/details?kind=tv&id=202&language=en", headers: admin });
+    expect(details.json()).toEqual({
+      tmdbId: "202", kind: "tv", title: "Counterpart", originalTitle: null, year: 2017, plot: "A spy story.",
+      genres: ["Фантастика"], poster: "/video/api/admin/metadata/image/p202.jpg"
+    });
+    expect((await app.inject({ method: "GET", url: "/video/api/admin/metadata/details?kind=tv&id=202", headers: mum })).statusCode).toBe(403);
   });
 
   it("fetches a chosen backdrop that 0.18.0 recorded without fetching, when it is chosen again", async () => {

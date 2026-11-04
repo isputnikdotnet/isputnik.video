@@ -42,6 +42,13 @@ const searchSchema = z.object({
 const genreList = z.array(z.object({ name: z.string() })).optional();
 
 const imagesSchema = z.object({
+  posters: z.array(z.object({
+    file_path: z.string(),
+    iso_639_1: z.string().nullable().optional(),
+    vote_average: z.number().nullable().optional(),
+    width: z.number().nullable().optional(),
+    height: z.number().nullable().optional()
+  }).passthrough()).default([]),
   backdrops: z.array(z.object({
     file_path: z.string(),
     iso_639_1: z.string().nullable().optional(),
@@ -274,6 +281,19 @@ export class Tmdb {
       .map((image) => ({ path: image.file_path, language: image.iso_639_1 ?? null, width: image.width ?? null, height: image.height ?? null, votes: image.vote_average ?? 0 }))
       .sort((a, b) => Number(a.language !== null) - Number(b.language !== null) || b.votes - a.votes)
       .slice(0, 40);
+  }
+
+  /** Every poster TMDB has for a title, for the admin to choose from: the
+   *  library's language's first, then those with no words, then English. */
+  async posters(kind: TmdbKind, tmdbId: string, language: string): Promise<TmdbBackdrop[]> {
+    const lang = language.slice(0, 2);
+    const found = await this.get(`/${kind}/${encodeURIComponent(tmdbId)}/images`, { include_image_language: [...new Set([lang, "null", "en"])].join(",") }, imagesSchema);
+    const rank = (image: { iso_639_1?: string | null }) => (image.iso_639_1 === lang ? 0 : !image.iso_639_1 ? 1 : 2);
+    return found.posters
+      .filter((image) => imagePathSchema.safeParse(image.file_path).success)
+      .sort((a, b) => rank(a) - rank(b) || (b.vote_average ?? 0) - (a.vote_average ?? 0))
+      .slice(0, 40)
+      .map((image) => ({ path: image.file_path, language: image.iso_639_1 ?? null, width: image.width ?? null, height: image.height ?? null, votes: image.vote_average ?? 0 }));
   }
 
   /** A collection of films: its words, its art and its parts. */

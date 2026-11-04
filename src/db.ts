@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { installGenreFunction } from "./genres.js";
 
 // The engine's SQLite file: DB_PATH, else data/video.sqlite under the repo root
 // (the image sets /config/video.sqlite). ":memory:" for the tests. The schema is
@@ -15,6 +16,7 @@ export function openDatabase(file: string): Database.Database {
   db.pragma("foreign_keys = ON");
   if (file !== ":memory:") db.pragma("journal_mode = WAL");
   upgradeDatabase(db);
+  installGenreFunction(db);
   return db;
 }
 
@@ -68,6 +70,8 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["metadata", "set_checked", "INTEGER NOT NULL DEFAULT 0"],
   ["metadata", "backdrop_choice", "TEXT"],
   ["metadata", "backdrop_picked", "INTEGER NOT NULL DEFAULT 0"],
+  ["metadata", "poster_choice", "TEXT"],
+  ["metadata", "poster_upload", "TEXT"],
   ["metadata", "tmdb_kind", "TEXT CHECK (tmdb_kind IN ('movie', 'tv'))"],
   ["detected_markers", "recap_start", "REAL"],
   ["detected_markers", "recap_end", "REAL"],

@@ -19,6 +19,7 @@ import path from "node:path";
 import type { Db } from "./db.js";
 import { isIgnoredName, isVideoFile, normalizeRelative, resolveInside } from "./media.js";
 import { episodeFromFile, episodeTitleFromFile, isExtraFile, isPartFolder, parseFolderName, partFromName, seasonFromFolder, sortTitle, type NameFacts } from "./names.js";
+import { afterScan } from "./edits.js";
 import { readNfo } from "./nfo.js";
 
 /** How long a file must have been left alone before it counts as copied. */
@@ -197,7 +198,10 @@ export function scanLibrary(db: Db, mediaRoot: string, libraryId: string, option
   const root = resolveInside(mediaRoot, library.folder);
   if (!root || !fs.statSync(root).isDirectory()) throw new ScanError(`The folder "${library.folder}" is not there on the video app`);
   const settleBefore = (options.now ?? Date.now()) - (options.settleMs ?? SETTLE_MS);
-  return library.kind === "shows" ? scanShows(db, library, root, settleBefore) : scanMovies(db, library, root, settleBefore);
+  const summary = library.kind === "shows" ? scanShows(db, library, root, settleBefore) : scanMovies(db, library, root, settleBefore);
+  // What was found is the new automatic; the admin's edits go back over it.
+  afterScan(db, library.id);
+  return summary;
 }
 
 function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: number): ScanSummary {

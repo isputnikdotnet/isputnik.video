@@ -14,7 +14,7 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
-import { MetadataRunner, artFile, keyHint, metaFor, purgeOrphanMetadata, readTmdbKey, saveTmdbKey, setBackdropChoice, setMatch, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
+import { MetadataRunner, artFile, keyHint, metaFor, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -32,6 +32,9 @@ import type { LogBuffer } from "./log-buffer.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
+import { editState, saveEdit } from "./edits.js";
+import { resolveGenres } from "./genres.js";
+import { GenreError, addKeyword, createGenre, deleteGenre, reloadGenres, genreOverview, hideWord, mergeGenre, removeKeyword, renameGenre, seedGenres, showWord } from "./genres.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -178,6 +181,8 @@ const matchSearchSchema = z.object({
 // tmdbKind: where on TMDB the id is (a film kept here may be a TV show there); the title's own kind when left out.
 const matchBodySchema = z.object({ tmdbId: z.string().regex(/^\d{1,10}$/).nullable(), tmdbKind: z.enum(["movie", "tv"]).optional() });
 const backdropBodySchema = z.object({ path: imagePathSchema.nullable() });
+/** An uploaded poster: a big phone photo fits. */
+const POSTER_UPLOAD_LIMIT = 15 * 1024 * 1024;
 // A mark by hand (markers.ts); a null start clears it.
 const markBodySchema = z.object({
   kind: z.enum(["intro", "credits", "recap"]),
@@ -392,6 +397,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return logger.child({ ...bindings, user: identity?.id ?? null, ip: clientIpFrom(raw.headers, secret, raw.socket?.remoteAddress) }, loggerOptions);
   });
 
+  // A poster the admin uploads arrives as the picture itself.
+  app.addContentTypeParser(["image/jpeg", "image/png", "image/webp"], { parseAs: "buffer", bodyLimit: POSTER_UPLOAD_LIMIT }, (_request, body, done) => done(null, body));
+
   app.decorateRequest("identity", null);
   app.decorateRequest("clientIp", "");
   app.addHook("onRequest", async (request) => {
@@ -422,6 +430,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof LibraryError) return reply.code(error.status).send({ error: error.message });
     if (error instanceof MarkError) return reply.code(400).send({ error: error.message });
+    if (error instanceof GenreError) return reply.code(error.status).send({ error: error.message });
     if (error instanceof RestoreError) {
       note(request, "warn", "restore.refused", { detail: error.message });
       return reply.code(error.status).send({ error: error.message });
@@ -1093,6 +1102,91 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return found.kind === "show" ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
   });
 
+  // Lookup (the Edit dialog): one TMDB candidate's words, to compare with the
+  // title's and take field by field; its genres as this list maps them.
+  app.get(`${API}/admin/metadata/details`, { preHandler: requireAdmin }, async (request, reply) => {
+    const query = z.object({
+      kind: z.enum(["movie", "tv"]),
+      id: z.string().regex(/^\d{1,12}$/),
+      language: z.string().regex(/^[a-z]{2}(-[A-Z]{2})?$/).default("en")
+    }).parse(request.query ?? {});
+    const key = readTmdbKey(db);
+    if (!key) return reply.code(409).send({ error: "No TMDB key", code: "video.tmdb_no_key" });
+    try {
+      const details = await new Tmdb(key, options.fetch).details(query.kind, query.id, query.language);
+      const poster = details.posterPath && imagePathSchema.safeParse(details.posterPath).success ? `${API}/admin/metadata/image${details.posterPath}` : null;
+      return {
+        tmdbId: details.tmdbId,
+        kind: query.kind,
+        title: details.title,
+        originalTitle: details.originalTitle,
+        year: details.year,
+        plot: details.plot,
+        genres: resolveGenres(db, details.genres),
+        poster
+      };
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  // Pictures (the Edit dialog): TMDB's posters for a title, where its poster
+  // comes from now, a choice among them, or one of the admin's own.
+  app.get(`${API}/admin/metadata/items/:id/posters`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    const state = posterStateOf(db, id);
+    const key = readTmdbKey(db);
+    const match = tmdbMatchOf(db, id);
+    if (!key || !match) return { posters: [], ...state, tmdb: Boolean(key) };
+    try {
+      const posters = await new Tmdb(key, options.fetch).posters(match.tmdbKind, match.tmdbId, found.language);
+      return {
+        posters: posters.map(({ path: imagePath, language }) => ({ path: imagePath, language, preview: `${API}/admin/metadata/image${imagePath}` })),
+        ...state,
+        tmdb: true
+      };
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
+  const titleAnswer = (request: FastifyRequest, id: string, kind: "show" | "movie") =>
+    kind === "show" ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
+
+  app.put(`${API}/admin/metadata/items/:id/poster`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const { path: imagePath } = backdropBodySchema.parse(request.body);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    setPosterChoice(db, id, found.kind, imagePath);
+    await metadata.refreshOne(id);
+    note(request, "info", "metadata.poster", { libraryId: found.libraryId, detail: imagePath ? `${found.title}: poster chosen by hand` : `${found.title}: TMDB's poster again` });
+    return titleAnswer(request, id, found.kind);
+  });
+
+  app.put(`${API}/admin/metadata/items/:id/poster/upload`, { preHandler: requireAdmin, bodyLimit: POSTER_UPLOAD_LIMIT }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    if (!Buffer.isBuffer(request.body) || !savePosterUpload(db, artDir, id, found.kind, request.body)) {
+      return reply.code(400).send({ error: "Send a JPEG, PNG or WebP picture" });
+    }
+    note(request, "info", "metadata.poster", { libraryId: found.libraryId, detail: `${found.title}: poster uploaded (${request.body.length} bytes)` });
+    return titleAnswer(request, id, found.kind);
+  });
+
+  app.delete(`${API}/admin/metadata/items/:id/poster/upload`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const found = titleKindOf(id);
+    if (!found) return reply.code(404).send({ error: "Not found" });
+    removePosterUpload(db, artDir, id);
+    await metadata.refreshOne(id);
+    note(request, "info", "metadata.poster", { libraryId: found.libraryId, detail: `${found.title}: uploaded poster removed` });
+    return titleAnswer(request, id, found.kind);
+  });
+
   // A match fixed by hand (a TMDB id), or handed back to the automatic one (null):
   // asked of TMDB at once, and the title answered as the family now sees it.
   app.put(`${API}/admin/metadata/items/:id`, { preHandler: requireAdmin }, async (request, reply) => {
@@ -1107,6 +1201,108 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const where = tmdbKind && tmdbKind !== (show ? "tv" : "movie") ? (tmdbKind === "tv" ? " (a TV show there)" : " (a film there)") : "";
     note(request, "info", "metadata.matched", { libraryId: found.library_id, detail: tmdbId ? `${found.title} matched by hand to TMDB ${tmdbId}${where}` : `${found.title} matched automatically again` });
     return show ? { show: getShow(db, request.identity!, id) } : { movie: getMovie(db, request.identity!, id) };
+  });
+
+  // A title's details as the admin edits them (edits.ts): each field and what it
+  // is without the edit; a save answers with the title as the family now sees it.
+  const editBodySchema = z.object({
+    title: z.string().max(300).nullable().optional(),
+    originalTitle: z.string().max(300).nullable().optional(),
+    sortTitle: z.string().max(300).nullable().optional(),
+    year: z.number().int().min(1870).max(2200).nullable().optional(),
+    plot: z.string().max(10_000).nullable().optional(),
+    genres: z.array(z.string().max(100)).max(30).nullable().optional()
+  });
+
+  app.get(`${API}/admin/titles/:id/edit`, { preHandler: requireAdmin }, async (request, reply) => {
+    const state = editState(db, itemIdSchema.parse((request.params as { id: string }).id));
+    return state ?? reply.code(404).send({ error: "Not found" });
+  });
+
+  app.put(`${API}/admin/titles/:id/edit`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = itemIdSchema.parse((request.params as { id: string }).id);
+    const body = editBodySchema.parse(request.body);
+    const before = db.prepare("SELECT title, library_id, 'shows' AS kind FROM shows WHERE id = ? UNION ALL SELECT title, library_id, 'movies' FROM movies WHERE id = ?")
+      .get(id, id) as { title: string; library_id: string; kind: "shows" | "movies" } | undefined;
+    if (!before || !saveEdit(db, id, body)) return reply.code(404).send({ error: "Not found" });
+    const fields = Object.keys(body).join(", ") || "nothing";
+    note(request, "info", "title.edited", { libraryId: before.library_id, detail: `${before.title}: ${fields} edited` });
+    const title = before.kind === "shows" ? getShow(db, request.identity!, id) : getMovie(db, request.identity!, id);
+    return { [before.kind === "shows" ? "show" : "movie"]: title, edit: editState(db, id) };
+  });
+
+  // Genres (genres.ts): the admin's list, the keywords that lead to it, the words
+  // hidden from every card. Each answer is the whole page again.
+  const genreName = z.object({ name: z.string().trim().min(1).max(80) });
+  const genreWord = z.object({ word: z.string().trim().min(1).max(100) });
+  const genreIdOf = (request: FastifyRequest) => z.string().min(1).max(100).parse((request.params as { id: string }).id);
+  const genresChanged = (request: FastifyRequest, detail: string) => {
+    note(request, "info", "genres.changed", { detail });
+    return genreOverview(db);
+  };
+  const genreNameOf = (id: string) => (db.prepare("SELECT name FROM genres WHERE id = ?").get(id) as { name: string } | undefined)?.name ?? id;
+
+  app.get(`${API}/admin/genres`, { preHandler: requireAdmin }, async () => genreOverview(db));
+
+  app.post(`${API}/admin/genres`, { preHandler: requireAdmin }, async (request) => {
+    const { name } = genreName.parse(request.body);
+    createGenre(db, name);
+    return genresChanged(request, `Genre "${name}" created`);
+  });
+
+  app.post(`${API}/admin/genres/seed`, { preHandler: requireAdmin }, async (request) => {
+    const { language } = z.object({ language: z.enum(["en", "ru"]) }).parse(request.body);
+    const count = seedGenres(db, language);
+    return genresChanged(request, `${count} genres added from TMDB's list (${language})`);
+  });
+
+  app.patch(`${API}/admin/genres/:id`, { preHandler: requireAdmin }, async (request) => {
+    const id = genreIdOf(request);
+    const before = genreNameOf(id);
+    const { name } = genreName.parse(request.body);
+    renameGenre(db, id, name);
+    return genresChanged(request, `Genre "${before}" renamed to "${name}"`);
+  });
+
+  app.delete(`${API}/admin/genres/:id`, { preHandler: requireAdmin }, async (request) => {
+    const id = genreIdOf(request);
+    const name = genreNameOf(id);
+    deleteGenre(db, id);
+    return genresChanged(request, `Genre "${name}" deleted; its words are hidden`);
+  });
+
+  app.post(`${API}/admin/genres/:id/merge`, { preHandler: requireAdmin }, async (request) => {
+    const id = genreIdOf(request);
+    const { into } = z.object({ into: z.string().min(1).max(100) }).parse(request.body);
+    const name = genreNameOf(id);
+    mergeGenre(db, id, into);
+    return genresChanged(request, `Genre "${name}" merged into "${genreNameOf(into)}"`);
+  });
+
+  app.post(`${API}/admin/genres/:id/keywords`, { preHandler: requireAdmin }, async (request) => {
+    const id = genreIdOf(request);
+    const { word } = genreWord.parse(request.body);
+    addKeyword(db, id, word);
+    return genresChanged(request, `"${word}" now leads to genre "${genreNameOf(id)}"`);
+  });
+
+  app.post(`${API}/admin/genres/:id/keywords/remove`, { preHandler: requireAdmin }, async (request) => {
+    const id = genreIdOf(request);
+    const { word } = genreWord.parse(request.body);
+    removeKeyword(db, id, word);
+    return genresChanged(request, `"${word}" no longer leads to genre "${genreNameOf(id)}"`);
+  });
+
+  app.post(`${API}/admin/genres/hidden`, { preHandler: requireAdmin }, async (request) => {
+    const { word } = genreWord.parse(request.body);
+    hideWord(db, word);
+    return genresChanged(request, `Genre word "${word}" hidden`);
+  });
+
+  app.post(`${API}/admin/genres/hidden/remove`, { preHandler: requireAdmin }, async (request) => {
+    const { word } = genreWord.parse(request.body);
+    showWord(db, word);
+    return genresChanged(request, `Genre word "${word}" shown again`);
   });
 
   app.post(`${API}/admin/libraries/:id/metadata`, { preHandler: requireAdmin }, async (request, reply) => {
@@ -1164,6 +1360,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // A copy taken during a scan says it is scanning, and nothing here is.
     db.prepare("UPDATE libraries SET scan_state = 'idle' WHERE scan_state IN ('queued', 'scanning')").run();
     hls?.configure(readConversion(db));
+    reloadGenres(db);
   };
   app.addContentTypeParser(SQLITE_CONTENT_TYPE, { parseAs: "buffer", bodyLimit: RESTORE_BODY_LIMIT }, (_request, body, done) => done(null, body));
 

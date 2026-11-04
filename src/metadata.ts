@@ -61,6 +61,10 @@ export interface MetaRow {
   backdrop_picked: number;
   /** Where on TMDB the match was found; null (before 0.21.0) means the title's own kind. */
   tmdb_kind: TmdbKind | null;
+  /** A TMDB poster the admin chose; wins over TMDB's own. */
+  poster_choice: string | null;
+  /** A poster the admin uploaded ("cache:<file>"); wins over every other. */
+  poster_upload: string | null;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -212,7 +216,8 @@ function emptyRow(itemId: string, kind: MetaKind): MetaRow {
     item_id: itemId, kind, tmdb_id: null, locked: 0, tmdb_state: "none", title: null, original_title: null, plot: null,
     year: null, aired: null, genres: "[]", rating: null, status: null, poster: null, backdrop: null, still: null,
     poster_path: null, backdrop_path: null, still_path: null, checked_at: null, error: null,
-    set_tmdb_id: null, set_name: null, set_checked: 0, backdrop_choice: null, backdrop_picked: 0, tmdb_kind: null
+    set_tmdb_id: null, set_name: null, set_checked: 0, backdrop_choice: null, backdrop_picked: 0, tmdb_kind: null,
+    poster_choice: null, poster_upload: null
   };
 }
 
@@ -220,10 +225,10 @@ function saveRow(db: Db, row: MetaRow): void {
   db.prepare(`
     INSERT INTO metadata (item_id, kind, tmdb_id, locked, tmdb_state, title, original_title, plot, year, aired, genres, rating, status,
       poster, backdrop, still, poster_path, backdrop_path, still_path, checked_at, error, set_tmdb_id, set_name, set_checked,
-      backdrop_choice, backdrop_picked, tmdb_kind)
+      backdrop_choice, backdrop_picked, tmdb_kind, poster_choice, poster_upload)
     VALUES (@item_id, @kind, @tmdb_id, @locked, @tmdb_state, @title, @original_title, @plot, @year, @aired, @genres, @rating, @status,
       @poster, @backdrop, @still, @poster_path, @backdrop_path, @still_path, @checked_at, @error, @set_tmdb_id, @set_name, @set_checked,
-      @backdrop_choice, @backdrop_picked, @tmdb_kind)
+      @backdrop_choice, @backdrop_picked, @tmdb_kind, @poster_choice, @poster_upload)
     ON CONFLICT (item_id) DO UPDATE SET kind = excluded.kind, tmdb_id = excluded.tmdb_id, locked = excluded.locked,
       tmdb_state = excluded.tmdb_state, title = excluded.title, original_title = excluded.original_title, plot = excluded.plot,
       year = excluded.year, aired = excluded.aired, genres = excluded.genres, rating = excluded.rating, status = excluded.status,
@@ -231,6 +236,7 @@ function saveRow(db: Db, row: MetaRow): void {
       backdrop_path = excluded.backdrop_path, still_path = excluded.still_path, checked_at = excluded.checked_at, error = excluded.error,
       set_tmdb_id = excluded.set_tmdb_id, set_name = excluded.set_name, set_checked = excluded.set_checked,
       backdrop_choice = excluded.backdrop_choice, backdrop_picked = excluded.backdrop_picked, tmdb_kind = excluded.tmdb_kind,
+      poster_choice = excluded.poster_choice, poster_upload = excluded.poster_upload,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).run(row);
 }
@@ -363,7 +369,7 @@ export class MetadataRunner {
             tmdb_id: details.tmdbId, tmdb_kind: found.kind, tmdb_state: "matched", title: details.title, original_title: details.originalTitle, plot: details.plot,
             year: details.year, aired: details.aired, genres: JSON.stringify(details.genres), rating: details.rating, status: details.status,
             // The admin's choice of TMDB's backdrops (Fix match) over the one picked by votes.
-            poster_path: details.posterPath, backdrop_path: row.backdrop_choice ?? details.backdropPath, error: null,
+            poster_path: row.poster_choice ?? details.posterPath, backdrop_path: row.backdrop_choice ?? details.backdropPath, error: null,
             set_tmdb_id: details.collection?.tmdbId ?? null, set_name: details.collection?.name ?? null, set_checked: 1,
             backdrop_picked: 1
           });
@@ -384,7 +390,9 @@ export class MetadataRunner {
     }
 
     try {
-      row.poster = await this.pick(tmdb, row, "poster", localPoster, row.poster_path);
+      // A poster the admin uploaded wins over the one beside the files and TMDB's.
+      const uploaded = row.poster_upload && artFile({ poster: row.poster_upload }, "poster", mediaRoot, this.ctx.artDir) ? row.poster_upload : null;
+      row.poster = uploaded ?? await this.pick(tmdb, row, "poster", localPoster, row.poster_path);
       row.backdrop = await this.pick(tmdb, row, "backdrop", localBackdrop, row.backdrop_path);
     } catch (err) {
       summary.error ??= `${title.title}: ${(err as Error).message}`;
@@ -516,7 +524,7 @@ export class MetadataRunner {
 export function setMatch(db: Db, itemId: string, kind: "show" | "movie", tmdbId: string | null, tmdbKind: TmdbKind | null = null): void {
   const row = metaFor(db, [itemId]).get(itemId) ?? emptyRow(itemId, kind);
   // Another title on TMDB: a backdrop chosen from the old one's means nothing now.
-  saveRow(db, { ...row, kind, tmdb_id: tmdbId, tmdb_kind: tmdbId ? tmdbKind : null, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null });
+  saveRow(db, { ...row, kind, tmdb_id: tmdbId, tmdb_kind: tmdbId ? tmdbKind : null, locked: tmdbId ? 1 : 0, tmdb_state: "none", checked_at: null, backdrop_choice: null, poster_choice: null });
 }
 
 /** The admin's pick of a title's TMDB backdrops, or back to the best by votes (null). */
@@ -533,14 +541,57 @@ export function tmdbMatchOf(db: Db, itemId: string): { tmdbId: string; tmdbKind:
   return { tmdbId: row.tmdb_id, tmdbKind: row.tmdb_kind ?? (row.kind === "show" ? "tv" : "movie"), choice: row.backdrop_choice, current: row.backdrop_path };
 }
 
+/** The admin's pick of a title's TMDB posters, or back to TMDB's own (null). */
+export function setPosterChoice(db: Db, itemId: string, kind: "show" | "movie", imagePath: string | null): void {
+  const row = metaFor(db, [itemId]).get(itemId) ?? emptyRow(itemId, kind);
+  saveRow(db, { ...row, kind, poster_choice: imagePath, checked_at: null });
+}
+
+/** Where a title's poster comes from now, for the Pictures tab. */
+export function posterStateOf(db: Db, itemId: string): { uploaded: boolean; choice: string | null; current: string | null } {
+  const row = metaFor(db, [itemId]).get(itemId);
+  return { uploaded: Boolean(row?.poster_upload), choice: row?.poster_choice ?? null, current: row?.poster_path ?? null };
+}
+
+const UPLOAD_TYPES: { ext: string; test: (bytes: Buffer) => boolean }[] = [
+  { ext: ".jpg", test: (bytes) => bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff },
+  { ext: ".png", test: (bytes) => bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { ext: ".webp", test: (bytes) => bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP" }
+];
+
+/** A poster the admin uploaded, kept in the art folder: shown at once, over any other.
+ *  False when the bytes are not a JPEG, PNG or WebP picture. */
+export function savePosterUpload(db: Db, artDir: string, itemId: string, kind: "show" | "movie", bytes: Buffer): boolean {
+  const type = UPLOAD_TYPES.find((each) => each.test(bytes));
+  if (!type) return false;
+  const row = metaFor(db, [itemId]).get(itemId) ?? emptyRow(itemId, kind);
+  fs.mkdirSync(artDir, { recursive: true });
+  const file = `${itemId}-poster-upload-${crypto.createHash("sha1").update(bytes).digest("hex").slice(0, 8)}${type.ext}`;
+  fs.writeFileSync(path.join(artDir, file), bytes);
+  // The kept files it replaces: an upload before it, and TMDB's (fetched again if the upload goes).
+  for (const previous of [row.poster_upload, row.poster]) {
+    if (previous?.startsWith("cache:") && previous.slice(6) !== file) fs.rmSync(path.join(artDir, path.basename(previous.slice(6))), { force: true });
+  }
+  saveRow(db, { ...row, kind, poster_upload: `cache:${file}`, poster: `cache:${file}` });
+  return true;
+}
+
+/** The uploaded poster gone: the next look (refreshOne) finds the one beside the files, or TMDB's. */
+export function removePosterUpload(db: Db, artDir: string, itemId: string): void {
+  const row = metaFor(db, [itemId]).get(itemId);
+  if (!row?.poster_upload) return;
+  fs.rmSync(path.join(artDir, path.basename(row.poster_upload.slice(6))), { force: true });
+  saveRow(db, { ...row, poster_upload: null, poster: null });
+}
+
 /** Rows (and their images) whose item is gone; for the daily sweep. */
 export function purgeOrphanMetadata(db: Db, artDir: string): number {
   const gone = db.prepare(`
-    SELECT item_id, poster, backdrop, still FROM metadata
+    SELECT item_id, poster, backdrop, still, poster_upload FROM metadata
     WHERE item_id NOT IN (SELECT id FROM shows) AND item_id NOT IN (SELECT id FROM movies) AND item_id NOT IN (SELECT id FROM episodes)
-  `).all() as { item_id: string; poster: string | null; backdrop: string | null; still: string | null }[];
+  `).all() as { item_id: string; poster: string | null; backdrop: string | null; still: string | null; poster_upload: string | null }[];
   for (const row of gone) {
-    for (const source of [row.poster, row.backdrop, row.still]) {
+    for (const source of [row.poster, row.backdrop, row.still, row.poster_upload]) {
       if (source?.startsWith("cache:")) fs.rmSync(path.join(artDir, path.basename(source.slice(6))), { force: true });
     }
     db.prepare("DELETE FROM metadata WHERE item_id = ?").run(row.item_id);

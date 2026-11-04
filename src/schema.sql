@@ -252,6 +252,10 @@ CREATE TABLE IF NOT EXISTS metadata (
   -- 1 once the backdrop was picked from TMDB's textless ones by votes (0.18.0).
   backdrop_choice TEXT,
   backdrop_picked INTEGER NOT NULL DEFAULT 0,
+  -- A TMDB poster the admin chose (poster_path follows it), and a poster the admin
+  -- uploaded (a cache: name in the art folder), which wins over every other.
+  poster_choice  TEXT,
+  poster_upload  TEXT,
   -- Where on TMDB the match was found: a film TMDB files as a TV show (a Soviet
   -- miniseries) is matched there and read from /tv. Null before 0.21.0: the
   -- title's own kind.
@@ -289,3 +293,50 @@ CREATE TABLE IF NOT EXISTS set_members (
   released   TEXT
 );
 CREATE INDEX IF NOT EXISTS set_members_set ON set_members (set_id);
+
+-- The admin's own genres (genres.ts): a title's raw genres — the .nfo's, else
+-- TMDB's — are mapped onto them. A raw word that is a keyword becomes its
+-- genre(s); a hidden one becomes nothing; any other shows as it came. Keys are
+-- genreKey(): case, spacing and ё don't count.
+CREATE TABLE IF NOT EXISTS genres (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  name_key    TEXT NOT NULL UNIQUE,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- A word that leads to a genre; one word may lead to several ("Sci-Fi & Fantasy").
+CREATE TABLE IF NOT EXISTS genre_keywords (
+  keyword_key TEXT NOT NULL,
+  keyword     TEXT NOT NULL,
+  genre_id    TEXT NOT NULL REFERENCES genres(id) ON DELETE CASCADE,
+  PRIMARY KEY (keyword_key, genre_id)
+);
+CREATE INDEX IF NOT EXISTS genre_keywords_genre ON genre_keywords (genre_id);
+
+-- Words no card shows ("TV Movie").
+CREATE TABLE IF NOT EXISTS genre_hidden (
+  keyword_key TEXT PRIMARY KEY,
+  keyword     TEXT NOT NULL
+);
+
+-- A film's or show's details as the admin edited them (edits.ts): null is
+-- automatic. auto_* keep what the scan last found, so a field can go back to it;
+-- the shows/movies row itself holds edit ?? automatic.
+CREATE TABLE IF NOT EXISTS title_edits (
+  item_id             TEXT PRIMARY KEY,
+  kind                TEXT NOT NULL CHECK (kind IN ('shows', 'movies')),
+  title               TEXT,
+  original_title      TEXT,
+  sort_title          TEXT,
+  year                INTEGER,
+  plot                TEXT,
+  genres              TEXT,
+  auto_title          TEXT NOT NULL,
+  auto_original_title TEXT,
+  auto_year           INTEGER,
+  auto_plot           TEXT,
+  auto_genres         TEXT NOT NULL DEFAULT '[]',
+  updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

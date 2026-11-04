@@ -6,15 +6,17 @@ import { canSee, type Identity } from "./identity.js";
 import { browserPlayability, movieIdOf, nextUp, partsOfMovie, placeInFilm, progressFor, resumeAt } from "./playback.js";
 import { BASE_PATH } from "./config.js";
 import { artUrl, metaFor, metaGenres, type MetaRow } from "./metadata.js";
+import { parseGenres, rawGenresSql, resolveGenres, widenGenres } from "./genres.js";
 import { setOfMovie } from "./sets.js";
 
 const API = `${BASE_PATH}/api`;
 
 /** The scan's words first (an .nfo, a folder name), TMDB's where it had none. */
 const filled = <T>(own: T | null | undefined, meta: T | null | undefined): T | null => own ?? meta ?? null;
-const genresOf = (raw: unknown, meta: MetaRow | undefined) => {
-  const own = genres(raw);
-  return own.length > 0 ? own : metaGenres(meta);
+/** A title's genres as the admin's list maps them (genres.ts). */
+const genresOf = (db: Db, raw: unknown, meta: MetaRow | undefined) => {
+  const own = parseGenres(raw);
+  return resolveGenres(db, own.length > 0 ? own : metaGenres(meta));
 };
 /** What a card shows besides the title: the poster, the year, the rating. */
 const art = (meta: MetaRow | undefined) => ({ poster: artUrl(API, meta, "poster"), rating: meta?.rating ?? null });
@@ -43,9 +45,9 @@ export interface TitleQuery {
   pageSize: number;
 }
 
-/** A title's genres as its card shows them: the scan's own, TMDB's when it had none. */
-const effectiveGenres = (table: "shows" | "movies") =>
-  `(CASE WHEN ${table}.genres != '[]' THEN ${table}.genres ELSE COALESCE((SELECT m.genres FROM metadata m WHERE m.item_id = ${table}.id), '[]') END)`;
+/** A title's genres as its card shows them: the scan's own, TMDB's when it had
+ *  none, through the admin's list (genre_names, genres.ts). */
+const effectiveGenres = (table: "shows" | "movies") => `genre_names(${rawGenresSql(table)})`;
 
 /** Every genre in some libraries of one kind. */
 function genresIn(db: Db, libraryIds: string[], kind: "shows" | "movies"): string[] {
@@ -97,7 +99,7 @@ function scope(db: Db, identity: Identity, kind: "shows" | "movies", query: List
 
 /** Which rows of a table a list takes: in these libraries, matching the search,
  *  of any of these genres. */
-function where(table: "shows" | "movies", libraries: string[], q: string | undefined, genres: string[]) {
+function where(db: Db, table: "shows" | "movies", libraries: string[], q: string | undefined, genres: string[]) {
   let sql = `library_id IN (${libraries.map(() => "?").join(", ")})`;
   const params: string[] = [...libraries];
   // The scan's title or TMDB's, either in the original too: a show filed as
@@ -106,7 +108,7 @@ function where(table: "shows" | "movies", libraries: string[], q: string | undef
     sql += " AND (title LIKE ? OR original_title LIKE ? OR id IN (SELECT m.item_id FROM metadata m WHERE m.title LIKE ? OR m.original_title LIKE ?))";
     params.push(...Array<string>(4).fill(`%${q.trim()}%`));
   }
-  const wanted = genres.map((genre) => genre.trim()).filter(Boolean);
+  const wanted = widenGenres(db, genres.map((genre) => genre.trim()).filter(Boolean));
   if (wanted.length > 0) {
     sql += ` AND EXISTS (SELECT 1 FROM json_each(${effectiveGenres(table)}) g WHERE g.value IN (${wanted.map(() => "?").join(", ")}))`;
     params.push(...wanted);
@@ -117,7 +119,7 @@ function where(table: "shows" | "movies", libraries: string[], q: string | undef
 /** One page of a list, and how many there are. A person who may see nothing gets an empty page. */
 function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: string[], query: ListQuery, map: (row: Record<string, unknown>, meta: MetaRow | undefined) => T) {
   if (libraries.length === 0) return { items: [] as T[], total: 0, page: 1, pageSize: query.pageSize };
-  const filter = where(table, libraries, query.q, query.genre ? [query.genre] : []);
+  const filter = where(db, table, libraries, query.q, query.genre ? [query.genre] : []);
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${filter.sql}`).get(...filter.params) as { n: number }).n;
   const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE ${filter.sql} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
     .all(...filter.params, query.pageSize, query.offset ?? (query.page - 1) * query.pageSize) as Record<string, unknown>[];
@@ -125,17 +127,8 @@ function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: 
   return { items: rows.map((row) => map(row, meta.get(row.id as string))), total, page: query.page, pageSize: query.pageSize };
 }
 
-const genres = (raw: unknown): string[] => {
-  try {
-    const parsed = JSON.parse(String(raw ?? "[]"));
-    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
-  } catch {
-    return [];
-  }
-};
-
 const SHOW_COLUMNS = `
-  id, library_id, title, year, imdb_id, genres,
+  id, library_id, title, year, imdb_id, ${effectiveGenres("shows")} AS genres,
   (SELECT COUNT(DISTINCT season) FROM episodes WHERE show_id = shows.id) AS seasons,
   (SELECT COUNT(*) FROM episodes WHERE show_id = shows.id) AS episodes
 `;
@@ -145,20 +138,20 @@ const showCard = (row: Record<string, unknown>, meta: MetaRow | undefined) => ({
   title: row.title as string,
   year: filled(row.year as number | null, meta?.year),
   imdbId: (row.imdb_id as string | null) ?? null,
-  genres: genresOf(row.genres, meta),
+  genres: parseGenres(row.genres),
   seasons: row.seasons as number,
   episodes: row.episodes as number,
   ...art(meta)
 });
 
-const MOVIE_COLUMNS = "id, library_id, title, year, imdb_id, genres, runtime_minutes";
+const MOVIE_COLUMNS = `id, library_id, title, year, imdb_id, ${effectiveGenres("movies")} AS genres, runtime_minutes`;
 const movieCard = (row: Record<string, unknown>, meta: MetaRow | undefined) => ({
   id: row.id as string,
   libraryId: row.library_id as string,
   title: row.title as string,
   year: filled(row.year as number | null, meta?.year),
   imdbId: (row.imdb_id as string | null) ?? null,
-  genres: genresOf(row.genres, meta),
+  genres: parseGenres(row.genres),
   runtimeMinutes: (row.runtime_minutes as number | null) ?? null,
   ...art(meta)
 });
@@ -188,7 +181,7 @@ export function listTitles(db: Db, identity: Identity, query: TitleQuery) {
       const libraries = visibleLibraries(db, identity, kind).map((row) => row.id)
         .filter((id) => query.libraries.length === 0 || query.libraries.includes(id));
       if (libraries.length === 0) return [];
-      const filter = where(kind, libraries, query.q, query.genres);
+      const filter = where(db, kind, libraries, query.q, query.genres);
       return [{ sql: `SELECT '${kind}' AS kind, id, sort_title, year, added_at, rowid AS rid FROM ${kind} WHERE ${filter.sql}`, params: filter.params }];
     });
   if (parts.length === 0) return { items: [], total: 0, page: query.page, pageSize: query.pageSize };
@@ -256,7 +249,7 @@ export function getShow(db: Db, identity: Identity, id: string) {
     plot: filled(show.plot as string | null, showMeta?.plot),
     premiered: filled(show.premiered as string | null, showMeta?.aired),
     status: filled(show.status as string | null, showMeta?.status),
-    genres: genresOf(show.genres, showMeta),
+    genres: genresOf(db, show.genres, showMeta),
     imdbId: (show.imdb_id as string | null) ?? null,
     tmdbId: filled(showMeta?.locked ? showMeta.tmdb_id : (show.tmdb_id as string | null), showMeta?.tmdb_id),
     source: show.source as "nfo" | "folder",
@@ -288,7 +281,7 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
     originalTitle: (movie.original_title as string | null) ?? null,
     year: filled(movie.year as number | null, meta?.year),
     plot: filled(movie.plot as string | null, meta?.plot),
-    genres: genresOf(movie.genres, meta),
+    genres: genresOf(db, movie.genres, meta),
     runtimeMinutes: (movie.runtime_minutes as number | null) ?? null,
     imdbId: (movie.imdb_id as string | null) ?? null,
     tmdbId: filled(meta?.locked ? meta.tmdb_id : (movie.tmdb_id as string | null), meta?.tmdb_id),
