@@ -210,12 +210,12 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
 
   const findShow = db.prepare("SELECT id FROM shows WHERE library_id = ? AND folder = ?");
   const insertShow = db.prepare(`
-    INSERT INTO shows (id, library_id, folder, title, sort_title, original_title, year, plot, premiered, status, genres, imdb_id, tmdb_id, source, added_at)
-    VALUES (@id, @library, @folder, @title, @sortTitle, @originalTitle, @year, @plot, @premiered, @status, @genres, @imdbId, @tmdbId, @source, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    INSERT INTO shows (id, library_id, folder, title, sort_title, original_title, year, plot, premiered, status, genres, imdb_id, tmdb_id, source, nfo_people, added_at)
+    VALUES (@id, @library, @folder, @title, @sortTitle, @originalTitle, @year, @plot, @premiered, @status, @genres, @imdbId, @tmdbId, @source, @people, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   `);
   const updateShow = db.prepare(`
     UPDATE shows SET title = @title, sort_title = @sortTitle, original_title = @originalTitle, year = @year, plot = @plot,
-      premiered = @premiered, status = @status, genres = @genres, imdb_id = @imdbId, tmdb_id = @tmdbId, source = @source,
+      premiered = @premiered, status = @status, genres = @genres, imdb_id = @imdbId, tmdb_id = @tmdbId, source = @source, nfo_people = @people,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = @id
   `);
@@ -257,7 +257,8 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
         genres: JSON.stringify(nfo?.genres ?? []),
         imdbId: nfo?.imdbId ?? named.imdbId,
         tmdbId: nfo?.tmdbId ?? named.tmdbId,
-        source: nfo ? "nfo" : "folder"
+        source: nfo ? "nfo" : "folder",
+        people: JSON.stringify(nfo?.people ?? [])
       };
       if (existing) updateShow.run(row);
       else {
@@ -324,13 +325,13 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
   const findMovie = db.prepare("SELECT id FROM movies WHERE library_id = ? AND folder = ?");
   const moveMovie = db.prepare("UPDATE movies SET folder = ? WHERE id = ?");
   const upsertMovie = db.prepare(`
-    INSERT INTO movies (id, library_id, folder, file, title, sort_title, original_title, year, plot, genres, imdb_id, tmdb_id, runtime_minutes, set_name, set_overview, set_tmdb_id, set_order, source, size_bytes, modified_at, added_at)
-    VALUES (@id, @library, @folder, @file, @title, @sortTitle, @originalTitle, @year, @plot, @genres, @imdbId, @tmdbId, @runtime, @setName, @setOverview, @setTmdbId, @setOrder, @source, @size, @modifiedAt, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    INSERT INTO movies (id, library_id, folder, file, title, sort_title, original_title, year, plot, genres, imdb_id, tmdb_id, runtime_minutes, set_name, set_overview, set_tmdb_id, set_order, source, nfo_people, size_bytes, modified_at, added_at)
+    VALUES (@id, @library, @folder, @file, @title, @sortTitle, @originalTitle, @year, @plot, @genres, @imdbId, @tmdbId, @runtime, @setName, @setOverview, @setTmdbId, @setOrder, @source, @people, @size, @modifiedAt, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     ON CONFLICT (library_id, folder) DO UPDATE SET
       file = excluded.file, title = excluded.title, sort_title = excluded.sort_title, original_title = excluded.original_title,
       year = excluded.year, plot = excluded.plot, genres = excluded.genres, imdb_id = excluded.imdb_id, tmdb_id = excluded.tmdb_id,
       runtime_minutes = excluded.runtime_minutes, set_name = excluded.set_name, set_overview = excluded.set_overview,
-      set_tmdb_id = excluded.set_tmdb_id, set_order = excluded.set_order, source = excluded.source, size_bytes = excluded.size_bytes,
+      set_tmdb_id = excluded.set_tmdb_id, set_order = excluded.set_order, source = excluded.source, nfo_people = excluded.nfo_people, size_bytes = excluded.size_bytes,
       modified_at = excluded.modified_at, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `);
   const findPart = db.prepare("SELECT id FROM movie_parts WHERE movie_id = ? AND file = ?");
@@ -373,6 +374,7 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
         setTmdbId: nfo?.set?.tmdbId ?? null,
         setOrder: film.order,
         source: nfo ? "nfo" : "folder",
+        people: JSON.stringify(nfo?.people ?? []),
         size: film.parts.reduce((sum, { file: part }) => sum + part.size, film.main.size),
         modifiedAt: film.main.modifiedAt
       });

@@ -8,6 +8,7 @@ import { BASE_PATH } from "./config.js";
 import { artUrl, metaFor, metaGenres, partKey, type MetaRow } from "./metadata.js";
 import { parseGenres, rawGenresSql, resolveGenres, widenGenres } from "./genres.js";
 import { setOfMovie } from "./sets.js";
+import { creditsOf } from "./credits.js";
 
 const API = `${BASE_PATH}/api`;
 
@@ -257,6 +258,8 @@ export function getShow(db: Db, identity: Identity, id: string) {
     backdrop: artUrl(API, showMeta, "backdrop"),
     ...matchOf(showMeta),
     seasons: [...seasons.values()],
+    /** The show's regulars, and who made it (credits.ts). */
+    ...creditsOf(db, id),
     /** What Play on the show starts: null once every episode is watched. */
     nextUp: next ? { id: next.id, season: next.season, episode: next.episode, title: next.title, position: resumeAt(progress.get(next.id)) } : null
   };
@@ -307,6 +310,8 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
       progress: partProgress.get(part.id) ?? null
     })),
     /** The set it is in, with the films of it this person may see. */
-    set: setOfMovie(db, identity, movie.id as string)
+    set: setOfMovie(db, identity, movie.id as string),
+    /** Cast in billing order, crew by job (credits.ts). */
+    ...creditsOf(db, movie.id as string)
   };
 }

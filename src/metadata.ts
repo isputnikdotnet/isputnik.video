@@ -25,6 +25,7 @@ import { resolveInside } from "./media.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, type Fetch, type TmdbKind } from "./tmdb.js";
 import { countSets, markSetChecked, rebuildSets, saveSetTmdb, setsDueForTmdb } from "./sets.js";
 import { partsOfMovie } from "./playback.js";
+import { rebuildCredits } from "./credits.js";
 
 /** A name as TMDB and a folder may both write it: case, ё, apostrophes, quotes and punctuation aside. */
 export const nameKey = (name: string) =>
@@ -70,6 +71,9 @@ export interface MetaRow {
   poster_choice: string | null;
   /** A poster the admin uploaded ("cache:<file>"); wins over every other. */
   poster_upload: string | null;
+  /** TMDB's cast and crew (credits.ts), and 1 once asked for them (0.26.0). */
+  people: string;
+  people_checked: number;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -222,7 +226,7 @@ function emptyRow(itemId: string, kind: MetaKind): MetaRow {
     year: null, aired: null, genres: "[]", rating: null, status: null, poster: null, backdrop: null, still: null,
     poster_path: null, backdrop_path: null, still_path: null, checked_at: null, error: null,
     set_tmdb_id: null, set_name: null, set_checked: 0, backdrop_choice: null, backdrop_picked: 0, tmdb_kind: null,
-    poster_choice: null, poster_upload: null
+    poster_choice: null, poster_upload: null, people: "[]", people_checked: 0
   };
 }
 
@@ -230,10 +234,10 @@ function saveRow(db: Db, row: MetaRow): void {
   db.prepare(`
     INSERT INTO metadata (item_id, kind, tmdb_id, locked, tmdb_state, title, original_title, plot, year, aired, genres, rating, status,
       poster, backdrop, still, poster_path, backdrop_path, still_path, checked_at, error, set_tmdb_id, set_name, set_checked,
-      backdrop_choice, backdrop_picked, tmdb_kind, poster_choice, poster_upload)
+      backdrop_choice, backdrop_picked, tmdb_kind, poster_choice, poster_upload, people, people_checked)
     VALUES (@item_id, @kind, @tmdb_id, @locked, @tmdb_state, @title, @original_title, @plot, @year, @aired, @genres, @rating, @status,
       @poster, @backdrop, @still, @poster_path, @backdrop_path, @still_path, @checked_at, @error, @set_tmdb_id, @set_name, @set_checked,
-      @backdrop_choice, @backdrop_picked, @tmdb_kind, @poster_choice, @poster_upload)
+      @backdrop_choice, @backdrop_picked, @tmdb_kind, @poster_choice, @poster_upload, @people, @people_checked)
     ON CONFLICT (item_id) DO UPDATE SET kind = excluded.kind, tmdb_id = excluded.tmdb_id, locked = excluded.locked,
       tmdb_state = excluded.tmdb_state, title = excluded.title, original_title = excluded.original_title, plot = excluded.plot,
       year = excluded.year, aired = excluded.aired, genres = excluded.genres, rating = excluded.rating, status = excluded.status,
@@ -242,6 +246,7 @@ function saveRow(db: Db, row: MetaRow): void {
       set_tmdb_id = excluded.set_tmdb_id, set_name = excluded.set_name, set_checked = excluded.set_checked,
       backdrop_choice = excluded.backdrop_choice, backdrop_picked = excluded.backdrop_picked, tmdb_kind = excluded.tmdb_kind,
       poster_choice = excluded.poster_choice, poster_upload = excluded.poster_upload,
+      people = excluded.people, people_checked = excluded.people_checked,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `).run(row);
 }
@@ -258,8 +263,9 @@ function due(row: MetaRow | undefined, now: number, force: boolean): boolean {
       return age > RECHECK_UNMATCHED;
     case "matched":
       // A film matched before sets came in: asked once more for its collection;
-      // a title whose backdrop was TMDB's default, once more for a better one.
-      return age > RECHECK_MATCHED || (row.kind === "movie" && !row.set_checked) || (row.kind !== "episode" && !row.backdrop_picked);
+      // a title whose backdrop was TMDB's default, once more for a better one;
+      // one matched before cast and crew, once more for them.
+      return age > RECHECK_MATCHED || (row.kind === "movie" && !row.set_checked) || (row.kind !== "episode" && (!row.backdrop_picked || !row.people_checked));
   }
 }
 
@@ -405,10 +411,10 @@ export class MetadataRunner {
             // The admin's choice of TMDB's backdrops (Fix match) over the one picked by votes.
             poster_path: row.poster_choice ?? details.posterPath, backdrop_path: row.backdrop_choice ?? details.backdropPath, error: null,
             set_tmdb_id: details.collection?.tmdbId ?? null, set_name: details.collection?.name ?? null, set_checked: 1,
-            backdrop_picked: 1
+            backdrop_picked: 1, people: JSON.stringify(details.people), people_checked: 1
           });
         } else {
-          Object.assign(row, { tmdb_state: "unmatched", tmdb_kind: null, error: null, set_tmdb_id: null, set_name: null, set_checked: 1 });
+          Object.assign(row, { tmdb_state: "unmatched", tmdb_kind: null, error: null, set_tmdb_id: null, set_name: null, set_checked: 1, people: "[]", people_checked: 1 });
         }
       } catch (err) {
         const message = err instanceof TmdbError ? err.message : (err as Error).message;
@@ -432,6 +438,8 @@ export class MetadataRunner {
       summary.error ??= `${title.title}: ${(err as Error).message}`;
     }
     saveRow(db, row);
+    // Its cast and crew, from its .nfo and what TMDB said just now.
+    rebuildCredits(db, this.ctx.artDir, [title.id]);
     if (row.tmdb_state === "matched") summary.matched += 1;
     else if (row.tmdb_state === "unmatched") summary.unmatched += 1;
     else if (row.tmdb_state === "error") summary.failed += 1;

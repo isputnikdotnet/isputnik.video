@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS shows (
   premiered     TEXT,
   status        TEXT,
   genres        TEXT NOT NULL DEFAULT '[]',   -- JSON array of strings
+  nfo_people    TEXT NOT NULL DEFAULT '[]',   -- the .nfo's <actor>/<director>/<credits> (credits.ts)
   imdb_id       TEXT,
   tmdb_id       TEXT,
   -- 'nfo' when tvshow.nfo described it, 'folder' when only its name did.
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS movies (
   year          INTEGER,
   plot          TEXT,
   genres        TEXT NOT NULL DEFAULT '[]',
+  nfo_people    TEXT NOT NULL DEFAULT '[]',
   imdb_id       TEXT,
   tmdb_id       TEXT,
   runtime_minutes INTEGER,
@@ -260,6 +262,10 @@ CREATE TABLE IF NOT EXISTS metadata (
   -- miniseries) is matched there and read from /tv. Null before 0.21.0: the
   -- title's own kind.
   tmdb_kind      TEXT CHECK (tmdb_kind IN ('movie', 'tv')),
+  -- TMDB's cast and crew of a show or film (credits.ts), and 1 once asked for
+  -- them (0.26.0), so titles matched before are asked once more.
+  people         TEXT NOT NULL DEFAULT '[]',
+  people_checked INTEGER NOT NULL DEFAULT 0,
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -348,3 +354,31 @@ CREATE TABLE IF NOT EXISTS title_edits (
   auto_set_order      INTEGER,
   updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- People in films and shows (credits.ts): one row per person, worked out again
+-- from the titles' .nfo files and TMDB's credits after every scan and metadata
+-- pass. The id is TMDB's ("t123") where it is known, else made from the name
+-- ("n…"), so a person's address stays while they are in the library.
+CREATE TABLE IF NOT EXISTS people (
+  id            TEXT PRIMARY KEY,
+  tmdb_id       TEXT UNIQUE,
+  name          TEXT NOT NULL,
+  name_key      TEXT NOT NULL,
+  -- TMDB's picture of them, and where it is kept once fetched ("cache:<file>").
+  profile_path  TEXT,
+  photo         TEXT
+);
+CREATE INDEX IF NOT EXISTS people_name ON people (name_key);
+
+-- Who is in a title: the cast in billing order (role: the character), and the
+-- crew (role: director, writer, composer or creator).
+CREATE TABLE IF NOT EXISTS credits (
+  item_id    TEXT NOT NULL,
+  person_id  TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('cast', 'crew')),
+  role       TEXT NOT NULL DEFAULT '',
+  position   INTEGER NOT NULL,
+  source     TEXT NOT NULL CHECK (source IN ('nfo', 'tmdb')),
+  PRIMARY KEY (item_id, person_id, kind, role)
+);
+CREATE INDEX IF NOT EXISTS credits_person ON credits (person_id);

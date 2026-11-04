@@ -33,6 +33,7 @@ import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
 import { editState, saveEdit, setNames } from "./edits.js";
+import { getPerson, keepPhoto, personVisible, photoFile, rebuildCredits, searchPeople } from "./credits.js";
 import { resolveGenres } from "./genres.js";
 import { GenreError, addKeyword, createGenre, deleteGenre, reloadGenres, genreOverview, hideWord, mergeGenre, removeKeyword, renameGenre, seedGenres, showWord } from "./genres.js";
 
@@ -387,6 +388,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     purgeOrphanDetected(db);
     purgeOrphanMetadata(db, artDir);
     rebuildSets(db, artDir);
+    rebuildCredits(db, artDir);
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -479,6 +481,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         const summary = scanLibrary(db, options.mediaRoot, libraryId, options.scan);
         // Sets the .nfo files name show at once; TMDB's follow with the metadata pass.
         rebuildSets(db, artDir);
+        // So does the cast an .nfo names.
+        rebuildCredits(db, artDir);
         setScanState(db, libraryId, "idle");
         const growing = summary.growing > 0 ? `, ${summary.growing} file(s) still being copied left for later` : "";
         const unnumbered = summary.unnumbered > 0 ? `, ${summary.unnumbered} file(s) without a season and episode in the name` : "";
@@ -565,6 +569,39 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // Film sets (sets.ts): those the person sees two or more films of, and one set in order.
   app.get(`${API}/sets`, { preHandler: requireIdentity }, async (request) => listSets(db, request.identity!, setListQuerySchema.parse(request.query ?? {})));
+
+  // Cast and crew (credits.ts): a person with what they are in, people found by
+  // name, and their picture — each only through titles this person may see.
+  const personIdSchema = z.string().regex(/^[tn][A-Za-z0-9_-]{1,40}$/);
+
+  app.get(`${API}/people`, { preHandler: requireIdentity }, async (request) => {
+    const query = z.object({ q: z.string().max(100).default(""), limit: z.coerce.number().int().min(1).max(50).default(20) }).parse(request.query ?? {});
+    return { people: searchPeople(db, request.identity!, query.q, query.limit) };
+  });
+
+  app.get(`${API}/people/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const person = getPerson(db, request.identity!, personIdSchema.parse((request.params as { id: string }).id));
+    return person ?? reply.code(404).send({ error: "No such person" });
+  });
+
+  // Fetched from TMDB the first time someone looks, then kept: a library's
+  // cast runs to thousands of people, most never looked at.
+  app.get(`${API}/people/:id/photo`, { preHandler: requireIdentity }, async (request, reply) => {
+    const person = personVisible(db, request.identity!, personIdSchema.parse((request.params as { id: string }).id));
+    if (!person) return reply.code(404).send({ error: "Not found" });
+    let file = photoFile(artDir, person);
+    if (!file) {
+      const key = readTmdbKey(db);
+      if (!key || !person.profile_path || !imagePathSchema.safeParse(person.profile_path).success) return reply.code(404).send({ error: "Not found" });
+      try {
+        file = keepPhoto(db, artDir, person, await new Tmdb(key, options.fetch).image(person.profile_path, IMAGE_SIZES.thumb));
+      } catch {
+        return reply.code(404).send({ error: "Not found" });
+      }
+    }
+    const type = ART_TYPES[path.extname(file).toLowerCase()] ?? "image/jpeg";
+    return reply.header("Content-Type", type).header("Cache-Control", "private, max-age=86400").send(await fs.promises.readFile(file));
+  });
 
   app.get(`${API}/sets/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const set = getSet(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));

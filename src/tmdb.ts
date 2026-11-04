@@ -59,6 +59,20 @@ const imagesSchema = z.object({
   }).passthrough()).default([])
 }).passthrough();
 
+const castList = z.array(z.object({
+  id: z.number(),
+  name: z.string(),
+  character: z.string().nullable().optional(),
+  order: z.number().optional(),
+  profile_path: z.string().nullable().optional()
+}).passthrough()).default([]);
+const crewList = z.array(z.object({
+  id: z.number(),
+  name: z.string(),
+  job: z.string().nullable().optional(),
+  profile_path: z.string().nullable().optional()
+}).passthrough()).default([]);
+
 const movieSchema = z.object({
   id: z.number(),
   title: z.string().optional(),
@@ -71,7 +85,8 @@ const movieSchema = z.object({
   poster_path: z.string().nullable().optional(),
   backdrop_path: z.string().nullable().optional(),
   images: imagesSchema.optional(),
-  belongs_to_collection: z.object({ id: z.number(), name: z.string().optional() }).passthrough().nullable().optional()
+  belongs_to_collection: z.object({ id: z.number(), name: z.string().optional() }).passthrough().nullable().optional(),
+  credits: z.object({ cast: castList, crew: crewList }).passthrough().optional()
 }).passthrough();
 
 const collectionSchema = z.object({
@@ -94,7 +109,24 @@ const showSchema = z.object({
   status: z.string().nullable().optional(),
   poster_path: z.string().nullable().optional(),
   backdrop_path: z.string().nullable().optional(),
-  images: imagesSchema.optional()
+  images: imagesSchema.optional(),
+  created_by: z.array(z.object({ id: z.number(), name: z.string(), profile_path: z.string().nullable().optional() }).passthrough()).default([]),
+  // A show's regulars across all its seasons, each with the parts they played.
+  aggregate_credits: z.object({
+    cast: z.array(z.object({
+      id: z.number(),
+      name: z.string(),
+      order: z.number().optional(),
+      profile_path: z.string().nullable().optional(),
+      roles: z.array(z.object({ character: z.string().nullable().optional(), episode_count: z.number().optional() }).passthrough()).default([])
+    }).passthrough()).default([]),
+    crew: z.array(z.object({
+      id: z.number(),
+      name: z.string(),
+      profile_path: z.string().nullable().optional(),
+      jobs: z.array(z.object({ job: z.string().nullable().optional() }).passthrough()).default([])
+    }).passthrough()).default([])
+  }).passthrough().optional()
 }).passthrough();
 
 const seasonSchema = z.object({
@@ -156,6 +188,50 @@ export interface TmdbDetails {
   backdropPath: string | null;
   /** The collection a film belongs to (sets.ts); always null for a show. */
   collection: { tmdbId: string; name: string | null } | null;
+  /** Its cast, in billing order, and the crew a family looks for (credits.ts). */
+  people: TmdbPerson[];
+}
+
+/** What people do in a title, as credits.ts keeps it. */
+export type CrewJob = "director" | "writer" | "composer" | "creator";
+
+export interface TmdbPerson {
+  tmdbId: string;
+  name: string;
+  kind: "cast" | "crew";
+  /** The character played, for the cast; the job, for the crew. */
+  role: string | null;
+  profilePath: string | null;
+}
+
+/** How many of a title's cast are kept: the billed ones, not every extra. */
+export const CAST_KEPT = 20;
+
+/** TMDB's crew jobs, as the few a title page shows. */
+const JOBS: Record<string, CrewJob> = {
+  "Director": "director",
+  "Screenplay": "writer",
+  "Writer": "writer",
+  "Story": "writer",
+  "Novel": "writer",
+  "Original Music Composer": "composer",
+  "Music": "composer",
+  "Creator": "creator"
+};
+
+const profileOf = (raw: string | null | undefined) => (raw && imagePathSchema.safeParse(raw).success ? raw : null);
+
+/** Each person once per job, in the order they came. */
+function crewOf(entries: { id: number; name: string; job?: string | null; profile_path?: string | null }[]): TmdbPerson[] {
+  const seen = new Set<string>();
+  const out: TmdbPerson[] = [];
+  for (const entry of entries) {
+    const job = entry.job ? JOBS[entry.job] : undefined;
+    if (!job || seen.has(`${entry.id}:${job}`)) continue;
+    seen.add(`${entry.id}:${job}`);
+    out.push({ tmdbId: String(entry.id), name: entry.name, kind: "crew", role: job, profilePath: profileOf(entry.profile_path) });
+  }
+  return out;
 }
 
 export interface TmdbCollection {
@@ -234,9 +310,9 @@ export class Tmdb {
 
   async details(kind: TmdbKind, tmdbId: string, language: string): Promise<TmdbDetails> {
     // The pictures with no words on them come along in the same request.
-    const withImages = { language, append_to_response: "images", include_image_language: "null" };
+    const withImages = (credits: string) => ({ language, append_to_response: `images,${credits}`, include_image_language: "null" });
     if (kind === "movie") {
-      const movie = await this.get(`/movie/${encodeURIComponent(tmdbId)}`, withImages, movieSchema);
+      const movie = await this.get(`/movie/${encodeURIComponent(tmdbId)}`, withImages("credits"), movieSchema);
       return {
         tmdbId: String(movie.id),
         title: text(movie.title),
@@ -249,12 +325,17 @@ export class Tmdb {
         status: null,
         posterPath: movie.poster_path ?? null,
         backdropPath: bestBackdrop(movie.images) ?? movie.backdrop_path ?? null,
+        people: [
+          ...[...(movie.credits?.cast ?? [])].sort((a, b) => (a.order ?? 999) - (b.order ?? 999)).slice(0, CAST_KEPT)
+            .map((entry) => ({ tmdbId: String(entry.id), name: entry.name, kind: "cast" as const, role: text(entry.character), profilePath: profileOf(entry.profile_path) })),
+          ...crewOf(movie.credits?.crew ?? [])
+        ],
         collection: movie.belongs_to_collection
           ? { tmdbId: String(movie.belongs_to_collection.id), name: text(movie.belongs_to_collection.name) }
           : null
       };
     }
-    const show = await this.get(`/tv/${encodeURIComponent(tmdbId)}`, withImages, showSchema);
+    const show = await this.get(`/tv/${encodeURIComponent(tmdbId)}`, withImages("aggregate_credits"), showSchema);
     return {
       tmdbId: String(show.id),
       title: text(show.name),
@@ -267,6 +348,13 @@ export class Tmdb {
       status: text(show.status),
       posterPath: show.poster_path ?? null,
       backdropPath: bestBackdrop(show.images) ?? show.backdrop_path ?? null,
+      people: [
+        ...[...(show.aggregate_credits?.cast ?? [])].sort((a, b) => (a.order ?? 999) - (b.order ?? 999)).slice(0, CAST_KEPT)
+          .map((entry) => ({ tmdbId: String(entry.id), name: entry.name, kind: "cast" as const, role: text(entry.roles[0]?.character), profilePath: profileOf(entry.profile_path) })),
+        ...crewOf(show.created_by.map((entry) => ({ ...entry, job: "Creator" }))),
+        ...crewOf((show.aggregate_credits?.crew ?? []).flatMap((entry) => entry.jobs.map((job) => ({ ...entry, job: job.job })))
+          .filter((entry) => entry.job === "Original Music Composer"))
+      ],
       collection: null
     };
   }

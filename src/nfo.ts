@@ -13,7 +13,7 @@ const parser = new XMLParser({
   parseTagValue: false,
   trimValues: true,
   // Genres, ids and actors repeat; read them as lists even when there is one.
-  isArray: (name) => ["genre", "uniqueid", "actor"].includes(name)
+  isArray: (name) => ["genre", "uniqueid", "actor", "director", "credits"].includes(name)
 });
 
 export interface NfoFacts {
@@ -32,6 +32,42 @@ export interface NfoFacts {
   tmdbId: string | null;
   /** The film's set (<set>), as Kodi and Emby write it; null when it has none. */
   set: { name: string; overview: string | null; tmdbId: string | null } | null;
+  /** <actor> in its order, then <director> and <credits> (writers): credits.ts. */
+  people: NfoPerson[];
+}
+
+export interface NfoPerson {
+  name: string;
+  kind: "cast" | "crew";
+  /** The character, for the cast; "director" or "writer", for the crew. */
+  role: string | null;
+  tmdbId: string | null;
+  /** A TMDB picture's path when <thumb> is one of TMDB's (image.tmdb.org/t/p/…/x.jpg). */
+  profilePath: string | null;
+}
+
+const TMDB_IMAGE = /^https?:\/\/image\.tmdb\.org\/t\/p\/[a-z0-9]+(\/[A-Za-z0-9_-]{1,64}\.(?:jpg|jpeg|png|webp))$/;
+
+function peopleOf(node: Record<string, unknown>): NfoPerson[] {
+  const actors = ((node.actor as unknown[] | undefined) ?? [])
+    .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+    .map((entry, at) => ({ entry, at, order: int(entry.order) }))
+    .sort((a, b) => (a.order ?? 999) - (b.order ?? 999) || a.at - b.at)
+    .flatMap(({ entry }): NfoPerson[] => {
+      const name = text(entry.name);
+      if (!name) return [];
+      const tmdbId = text(entry.tmdbid);
+      const thumb = TMDB_IMAGE.exec(text(entry.thumb) ?? "");
+      return [{ name, kind: "cast", role: text(entry.role), tmdbId: tmdbId && TMDB_ID.test(tmdbId) ? tmdbId : null, profilePath: thumb ? thumb[1] : null }];
+    });
+  const crew = (tag: "director" | "credits", role: "director" | "writer"): NfoPerson[] =>
+    ((node[tag] as unknown[] | undefined) ?? []).flatMap((entry) => {
+      const name = text(entry);
+      if (!name) return [];
+      const tmdbId = typeof entry === "object" && entry ? text((entry as Record<string, unknown>)["@tmdbid"]) : null;
+      return [{ name, kind: "crew" as const, role, tmdbId: tmdbId && TMDB_ID.test(tmdbId) ? tmdbId : null, profilePath: null }];
+    });
+  return [...actors, ...crew("director", "director"), ...crew("credits", "writer")];
 }
 
 const TMDB_ID = /^\d{1,10}$/;
@@ -118,6 +154,7 @@ export function readNfo(file: string, root: "tvshow" | "episodedetails" | "movie
     episode: int(node.episode),
     imdbId: imdb && /^tt\d{5,10}$/.test(imdb) ? imdb : null,
     tmdbId: tmdb && TMDB_ID.test(tmdb) ? tmdb : null,
-    set: root === "movie" ? setOf(node, idOf) : null
+    set: root === "movie" ? setOf(node, idOf) : null,
+    people: root === "episodedetails" ? [] : peopleOf(node)
   };
 }
