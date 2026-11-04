@@ -15,7 +15,7 @@ import { buildPlan, ffmpegArgs } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 const quiet = { info: () => undefined, warn: () => undefined };
-const tools = { ffmpeg: "/usr/lib/jellyfin-ffmpeg/ffmpeg", ffprobe: "/usr/lib/jellyfin-ffmpeg/ffprobe" };
+const tools = { ffmpeg: "ffmpeg", ffprobe: "ffprobe" };
 
 const film = (codec: string, pixelFormat: string, height = 1080, width = 1920): MediaInfo => ({
   container: "matroska,webm", start: 0, duration: 60,
@@ -143,7 +143,7 @@ describe("finding out what the GPU does", () => {
     const calls: string[][] = [];
     const caps = await detectGpu(tools, {
       device: "/dev/dri/renderD128",
-      vainfo: "/usr/lib/jellyfin-ffmpeg/vainfo",
+      vainfo: "/usr/bin/vainfo",
       run: async (binary, args) => {
         calls.push([binary, ...args]);
         if (binary.endsWith("vainfo")) return { ok: true, out: "vainfo: Driver version: Intel iHD driver for Intel(R) Gen Graphics - 24.1.0\n" };

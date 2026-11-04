@@ -145,7 +145,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
   return { device, driver, encode: true, decode, error: null, checkedAt };
 }
 
-/** vainfo beside ffmpeg (Jellyfin's build ships one), else on the PATH. */
+/** vainfo beside ffmpeg (a build that ships its own), else on the PATH. */
 function vainfoPath(tools: Tools): string | null {
   const beside = path.join(path.dirname(tools.ffmpeg), "vainfo");
   if (path.isAbsolute(tools.ffmpeg) && fs.existsSync(beside)) return beside;

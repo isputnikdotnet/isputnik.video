@@ -241,7 +241,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const hardware = tools ? new Hardware(() => (options.detectGpu ?? detectGpu)(tools), engineLog) : null;
   const hls = tools ? new HlsSessions(tools, options.transcodeDir ?? null, engineLog, hardware) : null;
   hls?.configure(readConversion(db));
-  void toolsReady.then((ok) => { if (ok) hardware?.configure(readConversion(db).hardware); });
+  // Not once the app has closed (a short test can close before ffmpeg answers).
+  let closed = false;
+  void toolsReady.then((ok) => { if (ok && !closed) hardware?.configure(readConversion(db).hardware); });
   const subtitleCache = tools ? new SubtitleCache(tools) : null;
 
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
@@ -356,6 +358,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   }
 
   app.addHook("onClose", async () => {
+    closed = true;
     clearInterval(daily);
     hls?.close();
     detectStop.abort();
