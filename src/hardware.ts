@@ -18,7 +18,13 @@ export type HardwareMode = "auto" | "cpu" | "gpu";
 
 /** Codecs the decode test knows, by the name delivery and the probe use, with
  *  10-bit apart: a GPU can decode 8-bit HEVC and not 10-bit. */
-export type DecodeKey = "h264" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video";
+export type DecodeKey = "h264" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video" | "vc1";
+
+/** Codecs ffmpeg can decode but not make a sample of: what vainfo lists for them
+ *  is taken as it says (a VAAPI decode profile, VAEntrypointVLD). */
+const LISTED_ONLY: { key: DecodeKey; profile: RegExp }[] = [
+  { key: "vc1", profile: /VAProfileVC1(Simple|Main|Advanced)\s*:\s*VAEntrypointVLD/ }
+];
 
 export interface GpuCapabilities {
   /** The render node tried, e.g. /dev/dri/renderD128; null when there is none. */
@@ -84,6 +90,9 @@ export function decodeKeyOf(info: MediaInfo): DecodeKey | null {
     case "vp9": return tenBit ? "vp9_10" : "vp9";
     case "av1": return tenBit ? null : "av1";
     case "mpeg2video": return "mpeg2video";
+    // WMV3 is VC-1's Main profile.
+    case "vc1":
+    case "wmv3": return "vc1";
     default: return null;
   }
 }
@@ -107,10 +116,12 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
   }
 
   let driver: string | null = null;
+  let profiles = "";
   const vainfo = options.vainfo === undefined ? vainfoPath(tools) : options.vainfo;
   if (vainfo) {
     const answer = await run(vainfo, ["--display", "drm", "--device", device], TEST_TIMEOUT_MS);
     driver = answer.out.match(/Driver version:\s*(.+)/)?.[1]?.trim() ?? null;
+    profiles = answer.out;
   }
 
   // The encode a conversion makes: H.264 on the GPU, with keyframes forced.
@@ -142,6 +153,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }
+  for (const listed of LISTED_ONLY) if (listed.profile.test(profiles)) decode.push(listed.key);
   return { device, driver, encode: true, decode, error: null, checkedAt };
 }
 

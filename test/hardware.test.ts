@@ -43,7 +43,9 @@ describe("which codec a film's picture is, for the decode test", () => {
     expect(decodeKeyOf(film("hevc", "yuv420p"))).toBe("hevc");
     expect(decodeKeyOf(film("vp9", "yuv420p10le"))).toBe("vp9_10");
     expect(decodeKeyOf(film("h264", "yuv420p10le"))).toBeNull();
-    expect(decodeKeyOf(film("vc1", "yuv420p"))).toBeNull();
+    expect(decodeKeyOf(film("vc1", "yuv420p"))).toBe("vc1");
+    expect(decodeKeyOf(film("wmv3", "yuv420p"))).toBe("vc1");
+    expect(decodeKeyOf(film("mpeg4", "yuv420p"))).toBeNull();
   });
 });
 
@@ -146,7 +148,9 @@ describe("finding out what the GPU does", () => {
       vainfo: "/usr/bin/vainfo",
       run: async (binary, args) => {
         calls.push([binary, ...args]);
-        if (binary.endsWith("vainfo")) return { ok: true, out: "vainfo: Driver version: Intel iHD driver for Intel(R) Gen Graphics - 24.1.0\n" };
+        if (binary.endsWith("vainfo")) {
+          return { ok: true, out: "vainfo: Driver version: Intel iHD driver for Intel(R) Gen Graphics - 24.1.0\n      VAProfileVC1Advanced            : VAEntrypointVLD\n" };
+        }
         const joined = args.join(" ");
         // No AV1 encoder in this ffmpeg; HEVC 10-bit made, but not decoded on the GPU.
         if (joined.includes("libsvtav1")) return { ok: false, out: "Unknown encoder 'libsvtav1'" };
@@ -155,7 +159,8 @@ describe("finding out what the GPU does", () => {
       }
     });
     expect(caps).toMatchObject({ device: "/dev/dri/renderD128", driver: "Intel iHD driver for Intel(R) Gen Graphics - 24.1.0", encode: true, error: null });
-    expect(caps.decode).toEqual(["h264", "hevc", "hevc10", "vp9", "mpeg2video"]);
+    // VC-1 can't be sampled (ffmpeg has no encoder for it): vainfo's word for it is taken.
+    expect(caps.decode).toEqual(["h264", "hevc", "hevc10", "vp9", "mpeg2video", "vc1"]);
     expect(calls.find((call) => call.includes("h264_vaapi"))).toEqual(expect.arrayContaining(["-force_key_frames", "0,0.5"]));
   });
 
