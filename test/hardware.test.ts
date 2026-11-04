@@ -4,22 +4,23 @@
 // here really fails, which is what the fallback test relies on.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
-import { findTools, type MediaInfo } from "../src/ffmpeg.js";
+import { findTools, probe, type MediaInfo } from "../src/ffmpeg.js";
 import { Hardware, decodeKeyOf, detectGpu, findDevice, type GpuCapabilities } from "../src/hardware.js";
-import { buildPlan, ffmpegArgs } from "../src/hls.js";
+import { buildPlan, cpuTonemap, ffmpegArgs } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 const quiet = { info: () => undefined, warn: () => undefined };
 const tools = { ffmpeg: "ffmpeg", ffprobe: "ffprobe" };
 
-const film = (codec: string, pixelFormat: string, height = 1080, width = 1920): MediaInfo => ({
+const film = (codec: string, pixelFormat: string, height = 1080, width = 1920, colorTransfer: string | null = null): MediaInfo => ({
   container: "matroska,webm", start: 0, duration: 60,
-  video: { index: 0, codec, profile: null, pixelFormat, width, height },
+  video: { index: 0, codec, profile: null, pixelFormat, width, height, colorTransfer, colorPrimaries: colorTransfer ? "bt2020" : null },
   audio: [{ index: 1, codec: "aac", channels: 2, language: null, title: null, default: true }],
   subtitles: [{ index: 2, codec: "hdmv_pgs_subtitle", language: "eng", title: null, default: false, forced: false, width: 1920, height: 1080 }],
   chapters: []
@@ -53,20 +54,37 @@ describe("where a film is converted", () => {
   it("goes all on the GPU when it decodes the codec", async () => {
     const hardware = await hardwareWith(found());
     const info = film("hevc", "yuv420p10le", 2160, 3840);
-    expect(hardware.choose(info, decideDelivery(info, ".mkv"))).toEqual({ device: "/dev/dri/renderD128", decode: true });
+    expect(hardware.choose(info, decideDelivery(info, ".mkv"))).toEqual({ device: "/dev/dri/renderD128", decode: true, tonemap: false, overlay: false });
   });
 
   it("decodes on the CPU what the GPU can't, and still encodes on the GPU", async () => {
     // A Kaby Lake: no AV1.
     const hardware = await hardwareWith(found());
     const info = film("av1", "yuv420p");
-    expect(hardware.choose(info, decideDelivery(info, ".mkv"))).toEqual({ device: "/dev/dri/renderD128", decode: false });
+    expect(hardware.choose(info, decideDelivery(info, ".mkv"))).toEqual({ device: "/dev/dri/renderD128", decode: false, tonemap: false, overlay: false });
   });
 
   it("decodes on the CPU when a subtitle is drawn in", async () => {
     const hardware = await hardwareWith(found());
     const info = film("hevc", "yuv420p");
-    expect(hardware.choose(info, decideDelivery(info, ".mkv", null, 2))).toEqual({ device: "/dev/dri/renderD128", decode: false });
+    expect(hardware.choose(info, decideDelivery(info, ".mkv", null, 2))).toEqual({ device: "/dev/dri/renderD128", decode: false, tonemap: false, overlay: false });
+  });
+
+  it("draws the subtitle on the GPU too, where it can, and decodes there for it (H3)", async () => {
+    const hardware = await hardwareWith(found({ overlay: true }));
+    const info = film("hevc", "yuv420p");
+    expect(hardware.choose(info, decideDelivery(info, ".mkv", null, 2))).toEqual({ device: "/dev/dri/renderD128", decode: true, tonemap: false, overlay: true });
+    // A codec it can't decode: the CPU decodes and draws, the GPU encodes.
+    const av1 = film("av1", "yuv420p");
+    expect(hardware.choose(av1, decideDelivery(av1, ".mkv", null, 2))).toMatchObject({ decode: false, overlay: false });
+  });
+
+  it("decodes HDR on the GPU only where it tone-maps it there (H2)", async () => {
+    const info = film("hevc", "yuv420p10le", 2160, 3840, "smpte2084");
+    const delivery = decideDelivery(info, ".mkv");
+    expect((await hardwareWith(found({ tonemap: true }))).choose(info, delivery)).toEqual({ device: "/dev/dri/renderD128", decode: true, tonemap: true, overlay: false });
+    // Kaby Lake may decode 10-bit HEVC and still not tone-map: the CPU does both, the GPU encodes.
+    expect((await hardwareWith(found({ tonemap: false }))).choose(info, delivery)).toEqual({ device: "/dev/dri/renderD128", decode: false, tonemap: false, overlay: false });
   });
 
   it("needs neither for a picture that goes through as it is", async () => {
@@ -124,11 +142,68 @@ describe("ffmpeg's arguments on the GPU", () => {
     expect(burned).not.toContain("-vf");
   });
 
+  it("tone-maps HDR on the GPU, before scaling", () => {
+    const args = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084")), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true, tonemap: true });
+    expect(args[args.indexOf("-vf") + 1]).toBe("tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=1080:format=nv12");
+  });
+
+  it("tone-maps HDR on the CPU when the GPU can't, and uploads it to be encoded", () => {
+    const args = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084")), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: false });
+    expect(args).not.toContain("-hwaccel");
+    expect(args[args.indexOf("-vf") + 1]).toBe(`scale=-2:1080,${cpuTonemap("pq")},format=nv12,hwupload`);
+  });
+
+  it("draws the subtitle on the GPU over a picture tone-mapped and scaled there", () => {
+    const args = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084"), 2), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true, tonemap: true, overlay: true });
+    expect(args[args.indexOf("-filter_complex") + 1]).toBe(
+      "[0:0]tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=1080:format=nv12[m];" +
+      "[0:2]scale=1920:1080,format=bgra,hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]"
+    );
+    expect(args).toContain("-hwaccel");
+    expect(args).not.toContain("-vf");
+  });
+
   it("is the CPU's, as before, with no GPU", () => {
     const args = ffmpegArgs(plan(film("hevc", "yuv420p")), 0, "/tmp/s").join(" ");
     expect(args).toContain("-c:v libx264");
     expect(args).not.toContain("vaapi");
   });
+});
+
+describe("HDR on the CPU", () => {
+  const plan = (info: MediaInfo, burn: number | null = null) => buildPlan("m1", "/media/film.mkv", info, decideDelivery(info, ".mkv", null, burn), null);
+
+  it("tone-maps PQ and HLG, after scaling, and before a subtitle is drawn", () => {
+    const pq = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084")), 0, "/tmp/s");
+    expect(pq[pq.indexOf("-vf") + 1]).toBe(`scale=-2:1080,${cpuTonemap("pq")}`);
+    expect(cpuTonemap("hlg")).toContain("tin=arib-std-b67");
+    const burned = ffmpegArgs(plan(film("hevc", "yuv420p10le", 1080, 1920, "smpte2084"), 2), 0, "/tmp/s");
+    expect(burned[burned.indexOf("-filter_complex") + 1]).toBe(`[0:0]${cpuTonemap("pq")}[pic];[pic][0:2]overlay=eof_action=pass[v]`);
+  });
+
+  it("leaves an SDR picture as it was", () => {
+    const args = ffmpegArgs(plan(film("hevc", "yuv420p10le")), 0, "/tmp/s").join(" ");
+    expect(args).not.toContain("zscale");
+  });
+
+  it("really runs: a 10-bit HDR10 film is found HDR and converted to SDR", async () => {
+    const realTools = findTools();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-hdr-"));
+    try {
+      const file = path.join(dir, "hdr.mkv");
+      execFileSync(realTools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "1",
+        "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", file]);
+      const info = await probe(realTools, file);
+      expect(info.video).toMatchObject({ colorTransfer: "smpte2084", colorPrimaries: "bt2020" });
+      const out = path.join(dir, "sdr.mp4");
+      execFileSync(realTools.ffmpeg, ["-v", "error", "-i", file, "-vf", cpuTonemap("pq"), "-c:v", "libx264", "-preset", "ultrafast", out]);
+      const converted = await probe(realTools, out);
+      expect(converted.video).toMatchObject({ pixelFormat: "yuv420p" });
+      expect(converted.video?.colorTransfer).not.toBe("smpte2084");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe("finding out what the GPU does", () => {
@@ -162,6 +237,27 @@ describe("finding out what the GPU does", () => {
     // VC-1 can't be sampled (ffmpeg has no encoder for it): vainfo's word for it is taken.
     expect(caps.decode).toEqual(["h264", "hevc", "hevc10", "vp9", "mpeg2video", "vc1"]);
     expect(calls.find((call) => call.includes("h264_vaapi"))).toEqual(expect.arrayContaining(["-force_key_frames", "0,0.5"]));
+    // 10-bit HEVC decodes, so tone mapping was tried; and drawing a subtitle.
+    expect(caps).toMatchObject({ tonemap: true, overlay: true });
+    expect(calls.some((call) => call.join(" ").includes("tonemap_vaapi"))).toBe(true);
+    expect(calls.some((call) => call.join(" ").includes("overlay_vaapi"))).toBe(true);
+  });
+
+  it("doesn't try tone mapping where 10-bit HEVC doesn't decode, and says what failed", async () => {
+    const calls: string[] = [];
+    const caps = await detectGpu(tools, {
+      device: "/dev/dri/renderD128", vainfo: null,
+      run: async (_binary, args) => {
+        const joined = args.join(" ");
+        calls.push(joined);
+        if (joined.includes("-hwaccel") && joined.includes("hevc10")) return { ok: false, out: "no" };
+        if (joined.includes("overlay_vaapi")) return { ok: false, out: "No such filter: 'overlay_vaapi'" };
+        return { ok: true, out: "" };
+      }
+    });
+    expect(caps).toMatchObject({ encode: true, tonemap: false, overlay: false });
+    expect(caps.decode).not.toContain("hevc10");
+    expect(calls.some((call) => call.includes("tonemap_vaapi"))).toBe(false);
   });
 
   it("uses no GPU that can't encode, and says why", async () => {
@@ -186,8 +282,14 @@ describe("a GPU that fails part-way", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     execFileSync(realTools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
       "-t", "8", "-c:v", "mpeg2video", "-c:a", "aac", file]);
+    // And an HDR10 film: HEVC 10-bit, PQ.
+    const hdr = path.join(fixture.root, "Movies", "Bright Night (2024)", "Bright Night (2024).mkv");
+    fs.mkdirSync(path.dirname(hdr), { recursive: true });
+    execFileSync(realTools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-t", "8", "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", "-c:a", "aac", hdr]);
     const hourAgo = new Date(Date.now() - 3600_000);
     fs.utimesSync(file, hourAgo, hourAgo);
+    fs.utimesSync(hdr, hourAgo, hourAgo);
     // Told there is a GPU that decodes MPEG-2: there isn't, so the GPU run fails.
     app = await buildApp({
       gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null, fastify: { logger: false },
@@ -210,8 +312,18 @@ describe("a GPU that fails part-way", () => {
     expect(play.playback.mode).toBe("transcode");
     const segment = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers });
     expect(segment.statusCode).toBe(200);
-    expect((await conversion()).usage.viewers).toMatchObject([{ user: "Mum", mode: "transcode", converter: "cpu" }]);
+    expect((await conversion()).usage.viewers).toMatchObject([{ user: "Mum", mode: "transcode", converter: "cpu", hdr: false }]);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+  }, 60_000);
+
+  it("tone-maps an HDR film on the CPU when the GPU run fails, and marks it HDR", async () => {
+    const hdrId = ((await app.inject({ method: "GET", url: "/video/api/movies", headers })).json().items as { id: string; title: string }[]).find((item) => item.title === "Bright Night")!.id;
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${hdrId}`, headers })).json().playback.mode).toBe("transcode");
+    const segment = await app.inject({ method: "GET", url: `/video/api/hls/${hdrId}/0.ts`, headers });
+    expect(segment.statusCode).toBe(200);
+    const viewers = (await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers: admin })).json().usage.viewers as { title: string; converter: string; hdr: boolean }[];
+    expect(viewers.find((viewer) => viewer.title.startsWith("Bright Night"))).toMatchObject({ converter: "cpu", hdr: true });
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${hdrId}`, headers });
   }, 60_000);
 
   it("keeps the admin's choice, keeps it when an older home leaves it out, and checks again on asking", async () => {

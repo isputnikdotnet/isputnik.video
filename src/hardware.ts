@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Delivery } from "./delivery.js";
-import type { MediaInfo, Tools } from "./ffmpeg.js";
+import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 
 /** Automatic: the GPU where it can, else the CPU. GPU only: no CPU fallback. */
 export type HardwareMode = "auto" | "cpu" | "gpu";
@@ -34,6 +34,10 @@ export interface GpuCapabilities {
   /** Encodes H.264 with keyframes where asked: what a GPU conversion needs. */
   encode: boolean;
   decode: DecodeKey[];
+  /** Tone-maps HDR to SDR (tonemap_vaapi) on what it decodes: else the CPU does (H2). */
+  tonemap?: boolean;
+  /** Draws an image subtitle over the picture (overlay_vaapi): else the CPU does (H3). */
+  overlay?: boolean;
   /** Why the GPU is not used, when it isn't. */
   error: string | null;
   checkedAt: string;
@@ -43,7 +47,14 @@ export interface GpuCapabilities {
 export interface GpuRun {
   device: string;
   decode: boolean;
+  /** An HDR picture tone-mapped on the GPU (it is decoded there too). */
+  tonemap?: boolean;
+  /** The subtitle drawn in on the GPU (the picture is decoded there too). */
+  overlay?: boolean;
 }
+
+/** The GPU's tone mapping, HDR → SDR in BT.709, as conversions and the test run it. */
+export const TONEMAP_VAAPI = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709";
 
 /** A sample of each codec, as the CPU makes it, for the decode test. */
 const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
@@ -154,7 +165,38 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
     fs.rmSync(work, { recursive: true, force: true });
   }
   for (const listed of LISTED_ONLY) if (listed.profile.test(profiles)) decode.push(listed.key);
-  return { device, driver, encode: true, decode, error: null, checkedAt };
+
+  // Tone mapping: a 10-bit HDR10 sample, decoded and tone-mapped on the GPU and
+  // encoded there. Only where 10-bit HEVC decodes on it at all (Kaby Lake: maybe).
+  let tonemap = false;
+  // Drawing a subtitle: a picture with alpha laid over the film on the GPU.
+  let overlay = false;
+  const extra = fs.mkdtempSync(path.join(options.workDir ?? os.tmpdir(), "isputnik-gpu-"));
+  try {
+    if (decode.includes("hevc10")) {
+      const file = path.join(extra, "hdr.mp4");
+      const made = await run(tools.ffmpeg, [
+        "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "0.5",
+        "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", file
+      ], TEST_TIMEOUT_MS);
+      if (made.ok) {
+        tonemap = (await run(tools.ffmpeg, [
+          "-hide_banner", "-v", "error", ...deviceArgs(device), "-hwaccel", "vaapi", "-hwaccel_device", "va", "-hwaccel_output_format", "vaapi",
+          "-i", file, "-vf", TONEMAP_VAAPI, "-c:v", "h264_vaapi", "-f", "null", "-"
+        ], TEST_TIMEOUT_MS)).ok;
+      }
+    }
+    overlay = (await run(tools.ffmpeg, [
+      "-hide_banner", "-v", "error", ...deviceArgs(device),
+      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "color=c=white@0.5:size=640x360:rate=25",
+      "-filter_complex", "[0:v]format=nv12,hwupload[m];[1:v]format=bgra,hwupload[s];[m][s]overlay_vaapi=eof_action=pass[v]",
+      "-map", "[v]", "-t", "0.5", "-c:v", "h264_vaapi", "-f", "null", "-"
+    ], TEST_TIMEOUT_MS)).ok;
+  } finally {
+    fs.rmSync(extra, { recursive: true, force: true });
+  }
+  return { device, driver, encode: true, decode, tonemap, overlay, error: null, checkedAt };
 }
 
 /** vainfo beside ffmpeg (a build that ships its own), else on the PATH. */
@@ -205,7 +247,7 @@ export class Hardware {
         this.caps = caps;
         this.failures = [];
         if (caps.error) this.log.info({ gpu: caps }, `Converting on the CPU: ${caps.error}`);
-        else this.log.info({ gpu: caps }, `Converting on the GPU (${caps.device}${caps.driver ? `, ${caps.driver}` : ""}); it decodes ${caps.decode.join(", ") || "nothing"}`);
+        else this.log.info({ gpu: caps }, `Converting on the GPU (${caps.device}${caps.driver ? `, ${caps.driver}` : ""}); it decodes ${caps.decode.join(", ") || "nothing"}${caps.tonemap ? "; tone-maps HDR" : ""}${caps.overlay ? "; draws subtitles" : ""}`);
       })
       .catch((err: unknown) => {
         this.caps = { device: null, driver: null, encode: false, decode: [], error: `Checking the GPU failed: ${err instanceof Error ? err.message : String(err)}`, checkedAt: new Date().toISOString() };
@@ -220,17 +262,23 @@ export class Hardware {
     return this.mode === "auto" && this.failures.length >= FAILURES_ALLOWED;
   }
 
-  /** Where a re-encode runs: on the GPU (and whether it decodes there too), or
-   *  null for the CPU. A picture copied as it is needs neither. */
+  /** Where a re-encode runs: on the GPU (and whether it decodes, tone-maps and
+   *  draws the subtitle there too), or null for the CPU. A picture copied as it
+   *  is needs neither. */
   choose(info: MediaInfo, delivery: Delivery): GpuRun | null {
     if (delivery.videoCopy || !info.video || this.mode === "cpu") return null;
     const caps = this.caps;
     if (!caps?.encode || !caps.device || this.setAside) return null;
     const key = decodeKeyOf(info);
-    // A subtitle drawn in is drawn on the CPU (H3 moves it): the picture is
-    // decoded there, and only the encode goes to the GPU.
-    const decode = !delivery.burn && key !== null && caps.decode.includes(key);
-    return { device: caps.device, decode };
+    const hdr = hdrOf(info.video) !== null;
+    // An HDR picture is decoded on the GPU only where it is tone-mapped there
+    // too; else the CPU decodes and tone-maps it, and the GPU encodes.
+    const canDecode = key !== null && caps.decode.includes(key) && (!hdr || caps.tonemap === true);
+    // A subtitle is drawn on the GPU where it can be; else the CPU draws it on a
+    // picture it decoded, and only the encode goes to the GPU.
+    const overlay = delivery.burn !== null && canDecode && caps.overlay === true;
+    const decode = canDecode && (delivery.burn === null || overlay);
+    return { device: caps.device, decode, tonemap: decode && hdr, overlay };
   }
 
   /** A GPU run failed: whether to run it again on the CPU (not in GPU only). */

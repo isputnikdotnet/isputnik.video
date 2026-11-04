@@ -57,6 +57,17 @@ export interface VideoStream {
   pixelFormat: string | null;
   width: number;
   height: number;
+  /** ffprobe's color_transfer: "smpte2084" (HDR10, PQ), "arib-std-b67" (HLG)… */
+  colorTransfer: string | null;
+  colorPrimaries: string | null;
+}
+
+/** HDR, and which kind: a picture made for a bright screen, which looks grey and
+ *  washed out squeezed into 8 bits as it is, so it is tone-mapped on the way. */
+export function hdrOf(video: VideoStream | null): "pq" | "hlg" | null {
+  if (video?.colorTransfer === "smpte2084") return "pq";
+  if (video?.colorTransfer === "arib-std-b67") return "hlg";
+  return null;
 }
 
 export interface AudioStream {
@@ -105,6 +116,8 @@ interface ProbeStream {
   codec_name?: string;
   profile?: string;
   pix_fmt?: string;
+  color_transfer?: string;
+  color_primaries?: string;
   width?: number;
   height?: number;
   channels?: number;
@@ -132,7 +145,9 @@ export async function probe(tools: Tools, file: string): Promise<MediaInfo> {
       profile: video.profile ?? null,
       pixelFormat: video.pix_fmt ?? null,
       width: video.width ?? 0,
-      height: video.height ?? 0
+      height: video.height ?? 0,
+      colorTransfer: video.color_transfer ?? null,
+      colorPrimaries: video.color_primaries ?? null
     } : null,
     audio: streams.filter((stream) => stream.codec_type === "audio").map((stream) => ({
       index: stream.index,

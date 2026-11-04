@@ -23,8 +23,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Delivery } from "./delivery.js";
-import type { MediaInfo, Tools } from "./ffmpeg.js";
-import { deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
+import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** How long a segment is meant to be. */
 export const SEGMENT_TARGET_S = 6;
@@ -101,6 +101,14 @@ export function playlist(plan: HlsPlan): string {
 /** The tallest picture a conversion makes; taller ones are scaled down to it. */
 const MAX_HEIGHT = 1080;
 
+/** HDR → SDR on the CPU: to linear light, into BT.709's colours, Hable's curve,
+ *  back to BT.709 8-bit. What Jellyfin and most players do without a GPU. */
+export function cpuTonemap(hdr: "pq" | "hlg"): string {
+  const transfer = hdr === "pq" ? "smpte2084" : "arib-std-b67";
+  return `zscale=tin=${transfer}:min=bt2020nc:pin=bt2020:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,` +
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+}
+
 /** ffmpeg's arguments for a run that starts at segment `from`. `gpu`: the
  *  picture is encoded on the GPU (hardware.ts), and decoded there too when
  *  it says so; null keeps it all on the CPU. */
@@ -124,14 +132,30 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * MAX_HEIGHT) / info.video.height / 2) * 2) : 0;
   // A picture drawn or scaled on the CPU goes up to the GPU to be encoded.
   const upload = gpu ? ",format=nv12,hwupload" : "";
-  if (info.video && burn) {
+  // HDR tone-mapped on the CPU, unless the GPU decodes and tone-maps it (H2).
+  const hdr = delivery.videoCopy ? null : hdrOf(info.video);
+  const cpuTone = hdr && !gpu?.tonemap ? cpuTonemap(hdr) : null;
+  const gpuScale = shrink ? `scale_vaapi=w=${shrunkWidth}:h=${MAX_HEIGHT}:format=nv12` : "scale_vaapi=format=nv12";
+  if (info.video && burn && gpu?.overlay) {
+    // All on the GPU (H3): the picture tone-mapped and scaled there, the
+    // subtitle's canvas fitted to it on the CPU (a few small images), uploaded
+    // with its alpha, and laid over it.
+    const outW = shrink ? shrunkWidth : info.video.width;
+    const outH = shrink ? MAX_HEIGHT : info.video.height;
+    const main = `[0:${info.video.index}]${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}[m];`;
+    const sub = `[0:${burn.index}]scale=${outW}:${outH},format=bgra,hwupload[sub];`;
+    args.push("-filter_complex", `${main}${sub}[m][sub]overlay_vaapi=eof_action=pass[v]`, "-map", "[v]");
+  } else if (info.video && burn) {
     // The subtitle drawn over the picture, its canvas fitted to the picture
-    // first (a 1080p PGS track on a cropped or 720p film).
+    // first (a 1080p PGS track on a cropped or 720p film). An HDR picture is
+    // tone-mapped before, so the subtitle keeps its own colours.
     const { width, height } = info.video;
     const fit = burn.width > 0 && burn.height > 0 && (burn.width !== width || burn.height !== height);
+    const tone = cpuTone ? `[0:${info.video.index}]${cpuTone}[pic];` : "";
+    const picture = cpuTone ? "[pic]" : `[0:${info.video.index}]`;
     const sub = fit ? `[0:${burn.index}]scale=${width}:${height}[sub];` : "";
-    const over = `[0:${info.video.index}]${fit ? "[sub]" : `[0:${burn.index}]`}overlay=eof_action=pass`;
-    args.push("-filter_complex", `${sub}${over}${shrink ? `,scale=-2:${MAX_HEIGHT}` : ""}${upload}[v]`, "-map", "[v]");
+    const over = `${picture}${fit ? "[sub]" : `[0:${burn.index}]`}overlay=eof_action=pass`;
+    args.push("-filter_complex", `${tone}${sub}${over}${shrink ? `,scale=-2:${MAX_HEIGHT}` : ""}${upload}[v]`, "-map", "[v]");
   } else if (info.video) {
     args.push("-map", `0:${info.video.index}`);
   }
@@ -144,15 +168,16 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
     // the CPU: scaled there, then uploaded. The limits are the CPU encode's.
     if (!burn) {
       args.push("-vf", gpu.decode
-        ? `scale_vaapi=${shrink ? `w=${shrunkWidth}:h=${MAX_HEIGHT}:` : ""}format=nv12`
-        : `${shrink ? `scale=-2:${MAX_HEIGHT},` : ""}format=nv12,hwupload`);
+        ? `${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}`
+        : `${shrink ? `scale=-2:${MAX_HEIGHT},` : ""}${cpuTone ? `${cpuTone},` : ""}format=nv12,hwupload`);
     }
     args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", "8M", "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high");
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   } else {
     args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "10M", "-bufsize", "20M",
       "-profile:v", "high", "-pix_fmt", "yuv420p");
-    if (shrink && !burn) args.push("-vf", `scale=-2:${MAX_HEIGHT}`);
+    const filters = [shrink ? `scale=-2:${MAX_HEIGHT}` : null, cpuTone].filter(Boolean);
+    if (filters.length > 0 && !burn) args.push("-vf", filters.join(","));
     // A keyframe on every cut, so every segment starts on one.
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   }
@@ -201,6 +226,8 @@ export interface ConversionViewer {
   mode: string;
   /** Where the picture is re-encoded; null when it goes through as it is. */
   converter: "gpu" | "cpu" | null;
+  /** An HDR picture, tone-mapped on the way. */
+  hdr: boolean;
   converting: boolean;
   memoryBytes: number;
   diskBytes: number;
@@ -436,6 +463,7 @@ export class HlsSessions {
       title: session.title,
       mode: session.plan.delivery.mode,
       converter: session.plan.delivery.videoCopy ? null : session.gpu ? "gpu" as const : "cpu" as const,
+      hdr: !session.plan.delivery.videoCopy && hdrOf(session.plan.info.video) !== null,
       converting: session.proc !== null,
       memoryBytes: session.memoryBytes,
       diskBytes: [...session.onDisk.values()].reduce((sum, size) => sum + size, 0)

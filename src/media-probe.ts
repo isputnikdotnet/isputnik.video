@@ -49,8 +49,10 @@ export class MediaProbe {
   info(itemId: string, file: ProbedFile): Promise<MediaInfo> {
     const cached = this.row(itemId, file);
     const known = cached ? (JSON.parse(cached.info) as MediaInfo) : null;
-    // A probe from before 0.6.0 kept no subtitles, one before 0.12.0 no chapters: read again, once.
-    if (known && Array.isArray(known.subtitles) && Array.isArray(known.chapters)) return Promise.resolve(known);
+    // A probe from before 0.6.0 kept no subtitles, one before 0.12.0 no chapters,
+    // one before 0.25.0 no colour (so no HDR): read again, once.
+    const fresh = known && Array.isArray(known.subtitles) && Array.isArray(known.chapters) && (!known.video || "colorTransfer" in known.video);
+    if (known && fresh) return Promise.resolve(known);
     return this.once(`info:${itemId}`, async () => {
       const info = await probe(this.tools, file.absolute);
       this.db.prepare(`
