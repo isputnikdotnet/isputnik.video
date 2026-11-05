@@ -67,6 +67,8 @@ function fakeTmdb() {
     if (path === "/tv/505") return json({ id: 505, name: "Peter's Pop Show", overview: "Pop acts of the year.", first_air_date: "1985-11-09", genres: [{ name: "Music" }], poster_path: "/p505.jpg", backdrop_path: "/b505.jpg" });
     if (path === "/tv/505/images") return json({ backdrops: [{ file_path: "/b505.jpg", iso_639_1: null, vote_average: 5, vote_count: 1, width: 1920, height: 1080 }] });
     if (path === "/find/tt33022834") return json({ movie_results: [], tv_results: [{ id: 303 }] });
+    // A show TMDB names otherwise than its folder: found only by its IMDb id.
+    if (path === "/find/tt4238994") return json({ movie_results: [], tv_results: [{ id: 66788, name: "A Show Named Otherwise", original_name: "Другое название", first_air_date: "2003-11-24", overview: "Found by its IMDb id.", poster_path: "/p66788.jpg" }] });
     // TMDB's default backdrop is the titled one; the best textless one is the portrait.
     const backdrops202 = [
       { file_path: "/b202.jpg", iso_639_1: "en", vote_average: 6, vote_count: 9, width: 1920, height: 1080 },
@@ -437,6 +439,20 @@ describe("with a TMDB key", () => {
     expect((await app.inject({ method: "GET", url: `/video/api/movies/${loose.id}`, headers: mum })).json()).toMatchObject({ tmdbId: "505", tmdbMatch: { locked: true, kind: "tv" } });
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=metadata.matched", headers: admin })).json();
     expect(events.events[0].detail).toBe("Loose Film matched by hand to TMDB 505 (a TV show there)");
+  });
+
+  it("finds a title for Fix match by its IMDb id or link, and by a TMDB link", async () => {
+    await setKey(GOOD_KEY);
+    await app.scansSettled();
+    const search = async (q: string) =>
+      (await app.inject({ method: "GET", url: `/video/api/admin/metadata/search?kind=movie&q=${encodeURIComponent(q)}&language=ru`, headers: admin })).json().results as Record<string, unknown>[];
+    const byLink = await search("https://www.imdb.com/title/tt4238994/");
+    expect(byLink).toEqual([{ tmdbId: "66788", kind: "tv", title: "A Show Named Otherwise", originalTitle: "Другое название", year: 2003, overview: "Found by its IMDb id.", poster: "/video/api/admin/metadata/image/p66788.jpg" }]);
+    expect(await search("TT4238994")).toEqual(byLink);
+    expect(tmdb.asked.some((asked) => asked.startsWith("/3/find/tt4238994") && asked.includes("external_source=imdb_id"))).toBe(true);
+    // A TMDB link names the title itself.
+    expect(await search("https://www.themoviedb.org/tv/202?language=ru-RU")).toMatchObject([{ tmdbId: "202", kind: "tv", title: "Counterpart", year: 2017 }]);
+    expect(await search("https://www.themoviedb.org/movie/999999")).toEqual([]);
   });
 
   it("finds a title by TMDB's name too", async () => {

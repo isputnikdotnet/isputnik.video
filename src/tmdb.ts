@@ -39,6 +39,12 @@ const searchSchema = z.object({
   }).passthrough())
 });
 
+/** /find/{imdbId}: what TMDB has under an IMDb id, a film or a show, with the same fields a search gives. */
+const findFullSchema = z.object({
+  movie_results: searchSchema.shape.results.default([]),
+  tv_results: searchSchema.shape.results.default([])
+}).passthrough();
+
 const genreList = z.array(z.object({ name: z.string() })).optional();
 
 const imagesSchema = z.object({
@@ -299,6 +305,22 @@ export class Tmdb {
       overview: text(result.overview),
       posterPath: result.poster_path ?? null
     }));
+  }
+
+  /** What an IMDb id is on TMDB, as search results that say which kind each is: for Fix
+   *  match, when searching by name finds nothing (a title TMDB names otherwise). */
+  async findImdb(imdbId: string, language: string): Promise<(TmdbSearchResult & { kind: TmdbKind })[]> {
+    const found = await this.get(`/find/${encodeURIComponent(imdbId)}`, { external_source: "imdb_id", language }, findFullSchema);
+    const as = (kind: TmdbKind) => (result: z.infer<typeof searchSchema>["results"][number]) => ({
+      kind,
+      tmdbId: String(result.id),
+      title: result.title ?? result.name ?? "",
+      originalTitle: result.original_title ?? result.original_name ?? null,
+      year: yearOf(result.release_date ?? result.first_air_date),
+      overview: text(result.overview),
+      posterPath: result.poster_path ?? null
+    });
+    return [...found.movie_results.map(as("movie")), ...found.tv_results.map(as("tv"))];
   }
 
   /** The TMDB id of an IMDb id, for a movie or a show; null when TMDB doesn't know it. */

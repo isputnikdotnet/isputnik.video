@@ -256,7 +256,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
   const artDir = options.artDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
   const ownsArtDir = options.artDir === undefined;
-  const metadata = new MetadataRunner({ db, mediaRoot: options.mediaRoot, artDir, fetch: options.fetch, log: { warn: (obj, msg) => app.log.warn(obj, msg) } });
+  const metadata = new MetadataRunner({ db, mediaRoot: options.mediaRoot, artDir, fetch: options.fetch, tools, log: { warn: (obj, msg) => app.log.warn(obj, msg) } });
   let metadataChain: Promise<void> = Promise.resolve();
   const metadataQueued = new Set<string>();
 
@@ -1078,8 +1078,26 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const query = matchSearchSchema.parse(request.query ?? {});
     const key = readTmdbKey(db);
     if (!key) return reply.code(409).send({ error: "No TMDB key", code: "video.tmdb_no_key" });
+    const poster = (posterPath: string | null) => (posterPath && imagePathSchema.safeParse(posterPath).success ? `${API}/admin/metadata/image${posterPath}` : null);
     try {
       const tmdb = new Tmdb(key, options.fetch);
+      // An IMDb id or link ("tt4238994", imdb.com/title/tt4238994/): what TMDB has under it,
+      // for a title its name doesn't find. A TMDB link (themoviedb.org/tv/76829): that title.
+      const imdb = /(?:^|[^a-z0-9])(tt\d{5,10})(?![0-9])/i.exec(query.q)?.[1]?.toLowerCase();
+      if (imdb) {
+        return { results: (await tmdb.findImdb(imdb, query.language)).map(({ posterPath, ...result }) => ({ ...result, poster: poster(posterPath) })) };
+      }
+      const link = /themoviedb\.org\/(movie|tv)\/(\d{1,10})/i.exec(query.q);
+      if (link) {
+        const kind = link[1].toLowerCase() as "movie" | "tv";
+        try {
+          const found = await tmdb.details(kind, link[2], query.language);
+          return { results: [{ tmdbId: found.tmdbId, kind, title: found.title ?? "", originalTitle: found.originalTitle, year: found.year, overview: found.plot, poster: poster(found.posterPath) }] };
+        } catch (err) {
+          if (err instanceof TmdbError && err.status === 404) return { results: [] };
+          throw err;
+        }
+      }
       const results = [];
       for (const kind of [query.kind, query.kind === "movie" ? "tv" : "movie"] as const) {
         for (const { posterPath, ...result } of await tmdb.search(kind, query.q, query.year ?? null, query.language)) {

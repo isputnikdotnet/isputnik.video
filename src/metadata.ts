@@ -26,6 +26,8 @@ import { IMAGE_SIZES, Tmdb, TmdbError, type Fetch, type TmdbKind } from "./tmdb.
 import { countSets, markSetChecked, rebuildSets, saveSetTmdb, setsDueForTmdb } from "./sets.js";
 import { partsOfMovie } from "./playback.js";
 import { rebuildCredits } from "./credits.js";
+import { execFile } from "node:child_process";
+import type { Tools } from "./ffmpeg.js";
 
 /** A name as TMDB and a folder may both write it: case, ё, apostrophes, quotes and punctuation aside. */
 export const nameKey = (name: string) =>
@@ -79,6 +81,10 @@ export interface MetaRow {
 const DAY = 24 * 60 * 60 * 1000;
 const RECHECK_MATCHED = 30 * DAY;
 const RECHECK_UNMATCHED = 7 * DAY;
+/** Where an episode's own picture is taken from: a few minutes in, past its titles; nearer
+ *  the start for a short one (ffmpeg makes nothing when it seeks past the end). */
+const FRAME_AT_SECONDS = [300, 60, 5];
+const FRAME_TIMEOUT_MS = 30_000;
 /** Between two requests to TMDB. */
 const PAUSE_MS = 60;
 
@@ -177,6 +183,8 @@ export interface MetadataContext {
   mediaRoot: string;
   artDir: string;
   fetch?: Fetch;
+  /** ffmpeg, to take a frame of an episode nothing else has a picture of; null: none taken. */
+  tools?: Tools | null;
   log: { warn(obj: object, msg: string): void };
 }
 
@@ -288,6 +296,35 @@ export class MetadataRunner {
     fs.writeFileSync(path.join(this.ctx.artDir, file), bytes);
     if (previous?.startsWith("cache:") && previous.slice(6) !== file) fs.rmSync(path.join(this.ctx.artDir, previous.slice(6)), { force: true });
     return `cache:${file}`;
+  }
+
+  /** A frame of a video for its picture, kept in the art folder: one taken before is
+   *  kept; else one a few minutes in, past the opening titles (a short one, nearer the
+   *  start). Null without ffmpeg, or when no frame can be read. */
+  private async frame(itemId: string, current: string | null, relative: string): Promise<string | null> {
+    const tools = this.ctx.tools;
+    if (!tools) return null;
+    const which = crypto.createHash("sha1").update(relative).digest("hex").slice(0, 8);
+    const file = `${itemId}-frame-${which}.jpg`;
+    const target = path.join(this.ctx.artDir, file);
+    if (current === `cache:${file}` && fs.existsSync(target)) return current;
+    const absolute = resolveInside(this.ctx.mediaRoot, relative);
+    if (!absolute || !fs.existsSync(absolute)) return null;
+    fs.mkdirSync(this.ctx.artDir, { recursive: true });
+    for (const at of FRAME_AT_SECONDS) {
+      const ok = await new Promise<boolean>((resolve) => {
+        execFile(tools.ffmpeg, [
+          "-hide_banner", "-v", "error", "-y", "-ss", String(at), "-i", absolute,
+          "-frames:v", "1", "-an", "-sn", "-vf", "scale=-2:360", "-q:v", "4", target
+        ], { timeout: FRAME_TIMEOUT_MS, windowsHide: true }, (err) => resolve(!err));
+      });
+      if (ok && fs.existsSync(target) && fs.statSync(target).size > 0) {
+        if (current?.startsWith("cache:") && current.slice(6) !== file) fs.rmSync(path.join(this.ctx.artDir, path.basename(current.slice(6))), { force: true });
+        return `cache:${file}`;
+      }
+    }
+    fs.rmSync(target, { force: true });
+    return null;
   }
 
   /** The picture to show: one beside the files, else TMDB's (fetched if it isn't
@@ -463,8 +500,12 @@ export class MetadataRunner {
       const episodeDir = path.posix.dirname(posix(dir, episode.file));
       const episodeStem = path.basename(episode.file, path.extname(episode.file));
       const localThumb = findImage(mediaRoot, episodeDir, [`${episodeStem}-thumb`, episodeStem]);
+      const before = own.still;
       try {
         own.still = await this.pick(tmdb, own, "still", localThumb, own.still_path);
+        // Nothing beside the file and nothing on TMDB (an old series often has no
+        // episode pictures there): a frame of the episode itself, as Plex and Jellyfin do.
+        own.still ??= await this.frame(own.item_id, before, posix(dir, episode.file));
       } catch (err) {
         summary.error ??= `${title.title} S${episode.season}E${episode.episode}: ${(err as Error).message}`;
       }
