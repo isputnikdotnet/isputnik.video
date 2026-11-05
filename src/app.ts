@@ -192,6 +192,11 @@ const markBodySchema = z.object({
   end: z.number().min(0).max(24 * 3600).nullable().default(null)
 });
 
+/** Video a device player can't be trusted with as it is (`original` in /play): MPEG-4 Part 2
+ *  (DivX, XviD) and Microsoft's MPEG-4 v1–v3. */
+const ORIGINAL_UNSAFE = new Set(["mpeg4", "msmpeg4v1", "msmpeg4v2", "msmpeg4v3"]);
+const originalUnsafe = (codec: string | null) => codec !== null && ORIGINAL_UNSAFE.has(codec);
+
 const ART_TYPES: Record<string, string> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
 const continueQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
@@ -624,12 +629,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
     const stream = `${API}/stream/${item.id}`;
     let markers = readMarks(db, item);
+    let probedVideoCodec: string | null = null;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
     let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null } =
       { mode: "none", reasons: [], url: null, duration: null, busy: null };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
+      probedVideoCodec = probed?.video?.codec ?? null;
       markers = findMarkers(probed, file.absolute, markers, detectedMarkers(readDetected(db, item.id, file)));
       const tracks = probed ? listSubtitles(probed, file.absolute) : [];
       const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
@@ -666,7 +673,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       sizeBytes: file?.size ?? null,
       // `original` is for a player that decides for itself what its device decodes
       // (home's TV app): it tries the file as it is, and `url` is its way out.
-      playback: { ...playback, original: file ? stream : null },
+      // Not for DivX/XviD and Microsoft's older MPEG-4: Android's decoders get them wrong,
+      // often without an error to fall back on (XviD's "packed" B-frames come out late or
+      // twice, and the picture judders), so such a player is sent to the converted copy.
+      playback: { ...playback, original: file && !originalUnsafe(probedVideoCodec) ? stream : null },
       audioTracks,
       subtitleTracks,
       markers,

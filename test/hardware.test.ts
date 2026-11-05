@@ -287,9 +287,15 @@ describe("a GPU that fails part-way", () => {
     fs.mkdirSync(path.dirname(hdr), { recursive: true });
     execFileSync(realTools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
       "-t", "8", "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", "-c:a", "aac", hdr]);
+    // And an XviD AVI with B-frames, as old rips are.
+    const xvid = path.join(fixture.root, "Movies", "Old Rip (1973)", "Old Rip (1973).avi");
+    fs.mkdirSync(path.dirname(xvid), { recursive: true });
+    execFileSync(realTools.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-t", "4", "-c:v", "mpeg4", "-vtag", "XVID", "-bf", "1", "-c:a", "ac3", xvid]);
     const hourAgo = new Date(Date.now() - 3600_000);
     fs.utimesSync(file, hourAgo, hourAgo);
     fs.utimesSync(hdr, hourAgo, hourAgo);
+    fs.utimesSync(xvid, hourAgo, hourAgo);
     // Told there is a GPU that decodes MPEG-2: there isn't, so the GPU run fails.
     app = await buildApp({
       gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null, fastify: { logger: false },
@@ -314,6 +320,16 @@ describe("a GPU that fails part-way", () => {
     expect(segment.statusCode).toBe(200);
     expect((await conversion()).usage.viewers).toMatchObject([{ user: "Mum", mode: "transcode", converter: "cpu", hdr: false }]);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+  }, 60_000);
+
+  it("offers a TV the file as it is, but never a DivX/XviD one: its decoders get them wrong", async () => {
+    const films = (await app.inject({ method: "GET", url: "/video/api/movies", headers })).json().items as { id: string; title: string }[];
+    const play = async (title: string) => (await app.inject({ method: "GET", url: `/video/api/play/${films.find((item) => item.title === title)!.id}`, headers })).json();
+    expect((await play("Old Tape")).playback.original).toMatch(/^\/video\/api\/stream\//);
+    const rip = await play("Old Rip");
+    expect(rip.playback.original).toBeNull();
+    expect(rip.playback.mode).toBe("transcode");
+    expect(rip.playback.url).toMatch(/\/index\.m3u8$/);
   }, 60_000);
 
   it("tone-maps an HDR film on the CPU when the GPU run fails, and marks it HDR", async () => {
