@@ -482,17 +482,22 @@ export class MetadataRunner {
     else if (row.tmdb_state === "error") summary.failed += 1;
     if (row.poster) summary.posters += 1;
 
-    // A film's parts are episodes only while it is matched to a TV show; else what they had goes.
-    if (kind === "movie" && !asShow()) {
+    // A film's parts are TMDB's episodes only while it is matched to a TV show. In
+    // one file it has no parts; matched as a film («Водитель автобуса», two parts)
+    // they keep no words of TMDB's, but still get a picture of their own below.
+    if (kind === "movie" && filmParts.length < 2) {
       forgetParts(db, this.ctx.artDir, title.id);
       return;
     }
+    const partsOfFilm = kind === "movie" && !asShow();
 
     // Each episode: its thumb beside it, else TMDB's still; TMDB's words where the scan had none.
     for (const episode of episodes) {
       const own: MetaRow = { ...(existing.get(episode.id) ?? emptyRow(episode.id, "episode")), kind: "episode" };
       const fromTmdb = seasons.get(episode.season)?.find((entry) => entry.episode === episode.episode);
-      if (fromTmdb) {
+      if (partsOfFilm) {
+        Object.assign(own, { tmdb_state: "none", title: null, plot: null, aired: null, still_path: null });
+      } else if (fromTmdb) {
         Object.assign(own, { tmdb_state: "matched", title: fromTmdb.title, plot: fromTmdb.plot, aired: fromTmdb.aired, still_path: fromTmdb.stillPath });
       } else if (seasons.size > 0) {
         own.tmdb_state = "unmatched";
@@ -506,6 +511,8 @@ export class MetadataRunner {
         // Nothing beside the file and nothing on TMDB (an old series often has no
         // episode pictures there): a frame of the episode itself, as Plex and Jellyfin do.
         own.still ??= await this.frame(own.item_id, before, posix(dir, episode.file));
+        // TMDB's still it had (the film was a show there), gone with nothing in its place.
+        if (before?.startsWith("cache:") && own.still !== before) fs.rmSync(path.join(this.ctx.artDir, path.basename(before.slice(6))), { force: true });
       } catch (err) {
         summary.error ??= `${title.title} S${episode.season}E${episode.episode}: ${(err as Error).message}`;
       }

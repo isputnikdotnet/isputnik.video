@@ -84,3 +84,31 @@ describe("an episode's own picture", () => {
     expect(fs.readdirSync(artDir).filter((name) => name.includes("-frame-")).map((name) => [name, fs.statSync(path.join(artDir, name)).mtimeMs])).toEqual(before);
   }, 60_000);
 });
+
+// A film in two files that TMDB has as a film, not a show («Водитель автобуса»):
+// its parts have no episode pictures to take, so each is a frame of its own file.
+describe("a film's parts' pictures", () => {
+  const family = { ...mum, "x-isputnik-libraries": "lib_films" };
+  it("is a frame of each part", async () => {
+    const dir = path.join(fixture.root, "Films", "Bus Driver (1983)");
+    fs.mkdirSync(dir, { recursive: true });
+    const hourAgo = new Date(Date.now() - 3600_000);
+    for (const n of [1, 2]) {
+      const target = path.join(dir, `Bus Driver (1983) part${n}.mkv`);
+      execFileSync(findTools().ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "8", "-c:v", "libx264", "-pix_fmt", "yuv420p", target]);
+      fs.utimesSync(target, hourAgo, hourAgo);
+    }
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films", kind: "movies", folder: "Films" } });
+    await app.scansSettled();
+    const film = async () => {
+      const items = (await app.inject({ method: "GET", url: "/video/api/movies", headers: family })).json().items as { id: string }[];
+      return (await app.inject({ method: "GET", url: `/video/api/movies/${items[0].id}`, headers: family })).json() as { parts: { still: string | null }[] };
+    };
+    await expect.poll(async () => (await film()).parts.map((part) => part.still !== null), { timeout: 30_000 }).toEqual([true, true]);
+    const [first, second] = (await film()).parts;
+    expect(second.still).not.toBe(first.still);
+    const picture = await app.inject({ method: "GET", url: first.still!, headers: family });
+    expect(picture.statusCode).toBe(200);
+    expect(picture.rawPayload.subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
+  }, 90_000);
+});
