@@ -212,7 +212,7 @@ export function getShow(db: Db, identity: Identity, id: string) {
   if (!show || !canSee(identity, show.library_id as string)) return null;
   const episodes = db.prepare("SELECT id, season, episode, title, plot, aired, runtime_minutes, file FROM episodes WHERE show_id = ? ORDER BY season, episode, file")
     .all(id) as { id: string; season: number; episode: number; title: string | null; plot: string | null; aired: string | null; runtime_minutes: number | null; file: string }[];
-  const progress = progressFor(db, identity.id, episodes.map((episode) => episode.id));
+  const progress = progressFor(db, identity.historyId, episodes.map((episode) => episode.id));
   const meta = metaFor(db, [id, ...episodes.map((episode) => episode.id)]);
   const showMeta = meta.get(id);
   // A show named only by its folder has its episodes named by their files
@@ -233,7 +233,7 @@ export function getShow(db: Db, identity: Identity, id: string) {
       progress: progress.get(episode.id) ?? null
     });
   }
-  const next = nextUp(db, identity.id, id);
+  const next = nextUp(db, identity.historyId, id);
   return {
     id: show.id as string,
     libraryId: show.library_id as string,
@@ -268,8 +268,8 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
   if (!movie || !canSee(identity, movie.library_id as string)) return null;
   const meta = metaFor(db, [id]).get(id);
   const parts = partsOfMovie(db, { id, file: movie.file as string });
-  const place = placeInFilm(db, identity.id, parts);
-  const partProgress = progressFor(db, identity.id, parts.map((part) => part.id));
+  const place = placeInFilm(db, identity.historyId, parts);
+  const partProgress = progressFor(db, identity.historyId, parts.map((part) => part.id));
   // A film TMDB has as a TV show: each part is one of its episodes (metadata.ts).
   const partMeta = parts.length < 2 ? new Map<string, MetaRow>() : metaFor(db, parts.map((part) => partKey(id, part.part)));
   return {

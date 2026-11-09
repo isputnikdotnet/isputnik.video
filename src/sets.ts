@@ -267,7 +267,7 @@ export function listSets(db: Db, identity: Identity, query: SetListQuery) {
   const pageRows = matching.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
   const pageFilms = pageRows.flatMap((row) => members.get(row.id)!);
   const meta = metaFor(db, pageFilms.map((member) => member.id));
-  const progress = filmProgress(db, identity.id, pageFilms);
+  const progress = filmProgress(db, identity.historyId, pageFilms);
   return {
     items: pageRows.map((row) => {
       const films = members.get(row.id)!;
@@ -314,7 +314,7 @@ export function getSet(db: Db, identity: Identity, id: string) {
   const films = row ? visibleMembers(db, identity, [id]).get(id) ?? [] : [];
   if (!row || films.length === 0) return null;
   const meta = metaFor(db, films.map((film) => film.id));
-  const progress = filmProgress(db, identity.id, films);
+  const progress = filmProgress(db, identity.historyId, films);
   const next = nextOf(films, progress);
   return {
     id: row.id,
@@ -330,7 +330,7 @@ export function getSet(db: Db, identity: Identity, id: string) {
       poster: artUrl(API, meta.get(film.id), "poster"),
       progress: progress.get(film.id) ?? null
     })),
-    next: next ? { id: placeInFilm(db, identity.id, partsOfMovie(db, next)).id, title: next.title, position: resumeAt(progress.get(next.id)) } : null
+    next: next ? { id: placeInFilm(db, identity.historyId, partsOfMovie(db, next)).id, title: next.title, position: resumeAt(progress.get(next.id)) } : null
   };
 }
 

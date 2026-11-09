@@ -8,7 +8,7 @@ import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries } from "./catalog.js";
-import { browserPlayability, continueWatching, fileOf, findItem, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { browserPlayability, continueWatching, fileOf, findItem, forgetHistory, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
@@ -25,7 +25,7 @@ import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase, upgradeDatabase } from "./db.js";
 import { RESTORE_BODY_LIMIT, RestoreError, SQLITE_CONTENT_TYPE, restoreDatabase, undoInfo, undoRestore, type RestoreTarget } from "./restore.js";
 import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, pruneEvents, recordEvent, type EventLevel } from "./events.js";
-import { canSee, clientIpFrom, devIdentity, forwardedRequestId, identityFrom, rejectionReason, type Identity } from "./identity.js";
+import { canSee, clientIpFrom, devIdentity, forwardedRequestId, historyIdFor, identityFrom, rejectionReason, type Identity } from "./identity.js";
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
 import type { LogBuffer } from "./log-buffer.js";
 import { listFolders, resolveInside } from "./media.js";
@@ -622,7 +622,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
     if (!item) return reply.code(404).send({ error: "Not found" });
     const file = fileOf(options.mediaRoot, item);
-    const progress = progressFor(db, identity.id, [item.id]).get(item.id) ?? null;
+    const progress = progressFor(db, identity.historyId, [item.id]).get(item.id) ?? null;
     // After an episode the next one; after a film its next part, else the next of its set.
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextPart(db, item) ?? nextInSet(db, identity, item.id);
     const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
@@ -907,7 +907,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
     if (!item) return reply.code(404).send({ error: "Not found" });
     const body = progressBodySchema.parse(request.body);
-    return { progress: saveProgress(db, identity.id, item, body, await creditsAt(item, body.watched)) };
+    return { progress: saveProgress(db, identity.historyId, item, body, await creditsAt(item, body.watched)) };
   });
 
   app.get(`${API}/continue`, { preHandler: requireIdentity }, async (request) => {
@@ -961,6 +961,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       note(request, "info", "library.synced", { detail: `detached ${result.detached.join(", ") || "none"}; reattached ${result.reattached.join(", ") || "none"}` });
     }
     return result;
+  });
+
+  // A household viewing profile was deleted in home: forget its watch history.
+  app.delete(`${API}/admin/history/profiles/:id`, { preHandler: requireAdmin }, async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return reply.code(400).send({ error: "Invalid profile" });
+    const removed = forgetHistory(db, historyIdFor("", id));
+    if (removed > 0) note(request, "info", "history.forgotten", { detail: `${removed} progress row(s) of a deleted viewing profile` });
+    return { removed };
   });
 
   app.post(`${API}/admin/libraries/:id/scan`, { preHandler: requireAdmin }, async (request, reply) => {

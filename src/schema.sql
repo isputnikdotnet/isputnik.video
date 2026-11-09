@@ -119,7 +119,8 @@ CREATE INDEX IF NOT EXISTS movie_parts_order ON movie_parts (movie_id, part);
 
 -- How far each person got: one row per person and episode or movie. Ids stay
 -- the same across rescans, so a rescan keeps everyone's place; the daily sweep
--- drops rows whose item is gone.
+-- drops rows whose item is gone. user_id is whose history it is (Identity.historyId):
+-- a person's id, or "profile:<id>" for one of home's household viewing profiles.
 CREATE TABLE IF NOT EXISTS progress (
   user_id     TEXT NOT NULL,
   item_id     TEXT NOT NULL,

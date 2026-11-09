@@ -277,6 +277,11 @@ export function saveProgress(
 }
 
 /** Progress whose episode or movie is gone; for the daily sweep. */
+/** A viewing profile home deleted: its history goes with it. */
+export function forgetHistory(db: Db, historyId: string): number {
+  return db.prepare("DELETE FROM progress WHERE user_id = ?").run(historyId).changes;
+}
+
 export function purgeOrphanProgress(db: Db): number {
   return db.prepare(`
     DELETE FROM progress WHERE
@@ -306,7 +311,7 @@ export interface ContinueItem {
  *  show whose latest episode was finished, the one after it. One per show. */
 export function continueWatching(db: Db, identity: Identity, limit: number): ContinueItem[] {
   // rowid breaks a tie inside one millisecond: the row written last is newest.
-  const rows = db.prepare("SELECT * FROM progress WHERE user_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 400").all(identity.id) as ProgressRow[];
+  const rows = db.prepare("SELECT * FROM progress WHERE user_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 400").all(identity.historyId) as ProgressRow[];
   const out: ContinueItem[] = [];
   const shows = new Set<string>();
   const films = new Set<string>();
@@ -323,7 +328,7 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
         const next = progress.watched ? nextPart(db, item) : null;
         const nextItem = next ? findItem(db, identity, next.id) : null;
         if (nextItem) {
-          const nextProgress = progressFor(db, identity.id, [nextItem.id]).get(nextItem.id);
+          const nextProgress = progressFor(db, identity.historyId, [nextItem.id]).get(nextItem.id);
           const position = resumeAt(nextProgress);
           out.push({ ...entryOf(nextItem), position, duration: nextProgress?.duration ?? null, resume: position > 0, updatedAt: progress.updatedAt });
           continue;
@@ -341,10 +346,10 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
       out.push({ ...entryOf(item), position: progress.position, duration: progress.duration, resume: true, updatedAt: progress.updatedAt });
       continue;
     }
-    const next = nextUp(db, identity.id, item.show!.id);
+    const next = nextUp(db, identity.historyId, item.show!.id);
     const nextItem = next ? findItem(db, identity, next.id) : null;
     if (!nextItem) continue;
-    const nextProgress = progressFor(db, identity.id, [nextItem.id]).get(nextItem.id);
+    const nextProgress = progressFor(db, identity.historyId, [nextItem.id]).get(nextItem.id);
     const position = resumeAt(nextProgress);
     out.push({ ...entryOf(nextItem), position, duration: nextProgress?.duration ?? null, resume: position > 0, updatedAt: progress.updatedAt });
   }

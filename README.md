@@ -23,6 +23,10 @@ together are grouped into sets, from the .nfo files or TMDB's collections.
   without the secret a request is anonymous.
 - `X-Isputnik-Libraries` lists the libraries the person may see. The engine keeps
   no users or permissions of its own and filters everything by that list.
+- `X-Isputnik-Profile-Id`, when present, names the household viewing profile the
+  person is watching as: watch history (progress, Continue watching, next up) is then
+  that profile's, whoever is signed in. `DELETE /video/api/admin/history/profiles/:id`
+  forgets a deleted profile's history.
 - Home tells the engine about libraries (`PUT/DELETE /video/api/admin/libraries/:id`,
   `POST …/sync`); a library missing from a sync is only detached, kept 30 days.
 - Home reads its events, log and a database copy for its backups; the engine

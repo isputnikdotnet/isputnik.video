@@ -168,6 +168,31 @@ describe("continue watching", () => {
     expect((await get("/video/api/continue", as("mum", ["lib_tv"]))).json().items.map((item: { id: string }) => item.id)).toEqual([episode(2).id]);
   });
 
+  it("keeps a viewing profile's history apart, the same whoever watches as it", async () => {
+    const kids = (who: string) => ({ ...as(who), "x-isputnik-profile-id": "kidsProfile" });
+    const some = films.find((film) => film.title === "Some Film")!;
+    // Mum, as herself, and as the Kids profile on the TV.
+    await saveProgress(some.id, { position: 1200, duration: 6700 });
+    await app.inject({ method: "PUT", url: `/video/api/progress/${episode(1).id}`, headers: kids("mum"), payload: { position: 600, duration: 2400 } });
+
+    expect((await get("/video/api/continue", as("mum"))).json().items.map((item: { id: string }) => item.id)).toEqual([some.id]);
+    // Kids' history is Kids', and Dad watching as Kids sees the same.
+    for (const who of ["mum", "dad"]) {
+      expect((await get("/video/api/continue", kids(who))).json().items.map((item: { id: string }) => item.id)).toEqual([episode(1).id]);
+    }
+    expect((await get(`/video/api/shows/${radar.id}`, kids("dad"))).json().seasons[0].episodes[0].progress).toMatchObject({ position: 600 });
+    expect((await get(`/video/api/shows/${radar.id}`, as("dad"))).json().seasons[0].episodes[0].progress).toBeNull();
+    // A header that isn't an id is ignored: the person's own history.
+    expect((await get("/video/api/continue", { ...as("mum"), "x-isputnik-profile-id": "../x" })).json().items.map((item: { id: string }) => item.id)).toEqual([some.id]);
+
+    // Home deletes the profile: its history goes, nobody else's.
+    const forgotten = await app.inject({ method: "DELETE", url: "/video/api/admin/history/profiles/kidsProfile", headers: as("admin") });
+    expect(forgotten.json()).toEqual({ removed: 1 });
+    expect((await get("/video/api/continue", kids("mum"))).json().items).toEqual([]);
+    expect((await get("/video/api/continue", as("mum"))).json().items).toHaveLength(1);
+    expect((await app.inject({ method: "DELETE", url: "/video/api/admin/history/profiles/kidsProfile", headers: as("mum") })).statusCode).toBe(403);
+  });
+
   it("drops a show once its last episode is watched", async () => {
     for (const n of [1, 2, 3]) await saveProgress(episode(n).id, { position: 2400, duration: 2400 });
     expect((await get("/video/api/continue", as("mum"))).json().items).toEqual([]);

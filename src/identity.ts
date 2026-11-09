@@ -17,6 +17,9 @@ export const USER_LANG_HEADER = "x-isputnik-user-lang";
 export const USER_THEME_HEADER = "x-isputnik-user-theme";
 export const APP_ROLE_HEADER = "x-isputnik-app-role";
 export const LIBRARIES_HEADER = "x-isputnik-libraries";
+/** The household viewing profile the person is watching as (home's
+ *  docs/tv-profiles-plan.md): whose watch history this request reads and writes. */
+export const PROFILE_HEADER = "x-isputnik-profile-id";
 /** The browser's address as the gateway saw it, so a log line names the person's machine. */
 export const CLIENT_IP_HEADER = "x-isputnik-client-ip";
 /** The home server's id for the same request, so its log line and this one match up. */
@@ -35,6 +38,21 @@ export interface Identity {
   libraries: ReadonlySet<string> | "all";
   lang: string;
   theme: string;
+  /**
+   * Whose watch history this is: the person's id, or "profile:<id>" while they watch as
+   * one of home's viewing profiles. Progress, watched marks, Continue watching and next
+   * up use this; everything about the person themself (their conversions, the log)
+   * uses `id`. A profile's history is the same whichever account is watching as it.
+   */
+  historyId: string;
+}
+
+const PROFILE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** The history a request belongs to: the profile's when a valid one is named. */
+export function historyIdFor(userId: string, profile: string | undefined): string {
+  const id = profile?.trim();
+  return id && PROFILE_ID.test(id) ? `profile:${id}` : userId;
 }
 
 export function single(value: string | string[] | undefined): string | undefined {
@@ -87,7 +105,8 @@ export function identityFrom(headers: IncomingHttpHeaders, secret: string | null
     appRole,
     libraries: librariesFrom(single(headers[LIBRARIES_HEADER])),
     lang: LANG.test(lang) ? lang : "en",
-    theme: THEME.test(theme) ? theme : "minimalist"
+    theme: THEME.test(theme) ? theme : "minimalist",
+    historyId: historyIdFor(id, single(headers[PROFILE_HEADER]))
   };
 }
 
@@ -145,7 +164,7 @@ export function checkSecret(secret: string | null, production: boolean): string 
  *  an admin who sees every library. "id:name". */
 export function devIdentity(spec: string): Identity {
   const [id = "dev", name = "Developer"] = spec.split(":");
-  return { id, name, role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "minimalist" };
+  return { id, name, role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "minimalist", historyId: id };
 }
 
 /** Whether this person may see a library. */
