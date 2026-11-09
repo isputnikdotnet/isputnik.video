@@ -2,7 +2,7 @@
 // TMDB use mapped onto it, the way home maps a book's tags onto categories. A
 // title's genres are its raw ones (the scan's, else TMDB's) passed through that
 // map, in one place — resolveGenres() — which SQL reaches as genre_names(), so the
-// cards, the filters, the Genre facet and Stremio all say the same.
+// cards, the filters, the Genre facet and the TV app all say the same.
 //
 // One raw word becomes:
 //   1. nothing, when it is hidden ("TV Movie");

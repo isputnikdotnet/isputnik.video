@@ -1,5 +1,5 @@
 // The admin's genres: raw words from the .nfo files and TMDB mapped onto a list
-// of their own — on cards, in the filters, in the Genre facet and in Stremio.
+// of their own — on cards, in the filters, in the Genre facet and on the TV app.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";

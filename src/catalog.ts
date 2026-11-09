@@ -28,8 +28,6 @@ export interface ListQuery {
   sort: "title" | "year" | "added";
   page: number;
   pageSize: number;
-  /** Rows to skip, instead of whole pages: Stremio asks with skip=<how many it has>. */
-  offset?: number;
   /** Only titles of this genre, as the card shows them (the scan's, else TMDB's). */
   genre?: string;
 }
@@ -58,11 +56,6 @@ function genresIn(db: Db, libraryIds: string[], kind: "shows" | "movies"): strin
     WHERE ${kind}.library_id IN (${libraryIds.map(() => "?").join(", ")}) AND g.type = 'text' AND trim(g.value) != ''
     ORDER BY g.value COLLATE NOCASE
   `).all(...libraryIds) as { genre: string }[]).map((row) => row.genre);
-}
-
-/** Every genre in a library, for Stremio's genre filter. */
-export function libraryGenres(db: Db, libraryId: string, kind: "shows" | "movies"): string[] {
-  return genresIn(db, [libraryId], kind);
 }
 
 /** Every genre a person can find, in films, shows or both: the Genre facet. */
@@ -123,7 +116,7 @@ function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: 
   const filter = where(db, table, libraries, query.q, query.genre ? [query.genre] : []);
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${filter.sql}`).get(...filter.params) as { n: number }).n;
   const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE ${filter.sql} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
-    .all(...filter.params, query.pageSize, query.offset ?? (query.page - 1) * query.pageSize) as Record<string, unknown>[];
+    .all(...filter.params, query.pageSize, (query.page - 1) * query.pageSize) as Record<string, unknown>[];
   const meta = metaFor(db, rows.map((row) => row.id as string));
   return { items: rows.map((row) => map(row, meta.get(row.id as string))), total, page: query.page, pageSize: query.pageSize };
 }

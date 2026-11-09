@@ -4,10 +4,6 @@
 // newest few hundred. A container that is misbehaving right now can then be
 // looked at from Control panel → Apps → Logs, without a shell on the host.
 // Lost on restart, by design: the durable record is the events table.
-//
-// A member's Stremio link carries a token in its path (/video/stremio/<token>/…):
-// it is masked here, on the way to stdout too, so no log line ever holds one.
-import { maskStremioToken } from "./stremio.js";
 
 export interface LogBuffer {
   readonly capacity: number;
@@ -28,9 +24,9 @@ export function createLogBuffer(capacity = 500, sink: Sink = process.stdout): Lo
   return {
     capacity,
     write(chunk) {
-      const masked = maskStremioToken(String(chunk));
-      sink.write(masked);
-      for (const line of masked.split("\n")) {
+      const text = String(chunk);
+      sink.write(text);
+      for (const line of text.split("\n")) {
         if (!line) continue;
         lines[next] = line;
         next = (next + 1) % capacity;

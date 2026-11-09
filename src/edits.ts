@@ -1,7 +1,7 @@
 // A film's or show's details as the admin wrote them (home's Edit dialog), over
 // what the scan found (.nfo, folder name). Kept in title_edits beside the scan's
 // own values (auto_*), and written into the shows/movies row itself, so every
-// reader — cards, search, sort, sets, Stremio, the TV app — sees them with no
+// reader — cards, search, sort, sets, the TV app — sees them with no
 // change of its own:
 //
 //   * a scan writes the found values into the row, then afterScan() takes them

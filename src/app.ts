@@ -21,7 +21,6 @@ import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan,
 import { conversionSchema, detectionSchema, readConversion, readDetection, saveConversion, saveDetection } from "./settings.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
-import { registerStremio } from "./stremio.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase, upgradeDatabase } from "./db.js";
 import { RESTORE_BODY_LIMIT, RestoreError, SQLITE_CONTENT_TYPE, restoreDatabase, undoInfo, undoRestore, type RestoreTarget } from "./restore.js";
@@ -851,20 +850,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       .send(vtt);
   };
   app.get(`${API}/subtitles/:id/:name`, { preHandler: requireIdentity }, serveSubtitle);
-
-  // Stremio on a TV (stremio.ts): the same catalog and the same bytes, in the
-  // add-on protocol, under the member's link home's gateway admitted.
-  registerStremio(app, {
-    db,
-    secret,
-    mediaRoot: options.mediaRoot,
-    version: options.version,
-    probe: async () => (mediaProbe && (await toolsReady) ? mediaProbe : null),
-    canConvert: Boolean(hls),
-    requireIdentity,
-    handlers: { stream: serveStream, hls: serveHls, art: serveArt, subtitle: serveSubtitle },
-    trackSegment
-  });
 
   /** Where a title's credits start, when a mark or the file says; not asked when
    *  the player already knows it is watched. */
