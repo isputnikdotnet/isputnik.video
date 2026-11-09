@@ -25,7 +25,10 @@ WORKDIR /app
 
 # Unraid draws the container's icon from this label when its saved template
 # has none, so a template edit or an update cannot leave the tile blank.
-LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/icon.png"
+# Shown as the package description on ghcr.io and Docker Hub; docker/metadata-action
+# sets the same label from the GitHub repository's About line, which carries the same words.
+LABEL org.opencontainers.image.description="Add-on for isputnik.home: the video engine that scans, describes and plays TV shows and movies for it. Requires the isputnik.home container; installed beside it and reached through home's /video gateway, it has no pages of its own."
+LABEL net.unraid.docker.icon="https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/brand/isputnik-video-icon.png"
 
 # gosu drops the entrypoint from root to the runtime user (scripts/docker-entrypoint.sh).
 # ffmpeg converts what a browser can't play as it is (src/delivery.ts, src/hls.ts).

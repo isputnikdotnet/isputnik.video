@@ -1,9 +1,9 @@
 {
   "name": "isputnik-video",
   "private": true,
-  "version": "0.31.0",
+  "version": "0.31.1",
   "stage": "alpha",
-  "description": "The video engine for isputnik.home: TV shows and movies, scanned, described and played behind the home server.",
+  "description": "Add-on for isputnik.home: the video engine that scans, describes and plays TV shows and movies for it. Requires the isputnik.home container; installed beside it and reached through home's /video gateway, it has no pages of its own.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
@@ -15,6 +15,7 @@
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
+    "changelog": "node scripts/changelog-md.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

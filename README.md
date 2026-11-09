@@ -1,8 +1,10 @@
 # isputnik.video
 
-The video engine for [isputnik.home](https://github.com/isputnikdotnet/isputnik.home):
-TV shows and movies, scanned, described and (from V2) played — behind the home
-server, which owns every screen and every library. This server has no pages.
+**An add-on for [isputnik.home](https://github.com/isputnikdotnet/isputnik.home):**
+its video engine. TV shows and movies, scanned, described and played behind the
+home server, which owns every screen and every library. It requires the
+isputnik.home container, is installed beside it and is reached only through
+home's `/video` gateway; this server has no pages and does nothing on its own.
 
 How the two fit together: home's `docs/video-architecture.md` (short) and
 `docs/apps-platform-plan.md` (the whole plan, phases and contract).
@@ -93,18 +95,26 @@ name (`-trailer`, `Extras/`), and a `movie.nfo` says the folder is one film.
 
 ## Running it
 
-The image is `ghcr.io/isputnikdotnet/isputnik.video` (tags `latest`, `0.4`,
-`0.4.0`); on Unraid, install it from `isputnik-video.xml`. It publishes no port:
-put it on the same user-defined Docker network as the isputnik container
-(`docker network create isputnik`), mount `/config` (the catalog) and `/media`
-(the video share, read-only) — and, if you like, `/transcode` on RAM or a fast
-disk — then:
+The image is `ghcr.io/isputnikdotnet/isputnik.video` (what the Unraid template
+pulls) and, the same bytes, `isputnikdotnet/isputnik.video` on Docker Hub; every
+release tag publishes both, and `latest` is the newest release. Mount `/config`
+(the catalog) and `/media` (the video share, read-only) — and, if you like,
+`/transcode` on RAM or a fast disk — then:
 
-1. In home, Control panel → Apps → Setup → Video: save the address
-   `http://isputnik-video:4300`.
-2. On the same page, **Generate secret**; paste it here as `GATEWAY_SECRET`. The
-   container won't start without it.
+1. In home, Control panel → Settings → Apps → Video: **Generate secret** and copy
+   it; paste it here as `GATEWAY_SECRET`. The container won't start without it.
+2. On the same page, save the address: `http://<host IP>:4300` with the port
+   published, `http://isputnik-video:4300` on a user-defined Docker network shared
+   with the isputnik container, or `http://<its IP>:4300` on br0 with a fixed IP.
+   **Test connection** says *Paired*.
 3. Add a library: Control panel → Library → Libraries → Add library → Video.
+
+**Unraid** — the repository carries a Community Applications template,
+[`isputnik-video.xml`](isputnik-video.xml), listed in CA as **isputnik-video**. It
+publishes port 4300 on `bridge` (safe: without the secret every request is
+answered 401), maps `/config` and the read-only video share, offers `/transcode`
+and `/dev/dri` for an Intel GPU, and asks for the gateway secret, which is made
+in home first because the field is required.
 
 Home's guide `docs/users/apps.md` has the whole walk-through.
 

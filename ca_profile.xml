@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications repository profile - read by CA from the repo
+  root alongside isputnik-video.xml. A DEPLOYMENT artifact, not source. DO NOT DELETE.
+-->
+<CommunityApplications>
+  <Profile>
+isputnik.video is the video engine for isputnik.home, the private self-hosted family media library: it scans the family's TV shows and movies, describes them from .nfo files and TMDB, and plays them in the browser and on the TV app, converting on the CPU or an Intel GPU only what a browser cannot play as it is. It is an add-on container with no pages and no sign-in of its own: install it beside the isputnik container, pair the two on isputnik.home's Settings, Apps page, and the libraries, the Video page and the player all live in isputnik.home. Report problems and ask questions on GitHub issues.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/brand/isputnik-video-icon.png</Icon>
+  <WebPage>https://github.com/isputnikdotnet/isputnik.video</WebPage>
+</CommunityApplications>

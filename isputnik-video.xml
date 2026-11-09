@@ -1,42 +1,83 @@
 <?xml version="1.0"?>
 <!--
-  Unraid Community Applications template for isputnik.video — a DEPLOYMENT
+  Unraid Community Applications template for isputnik.video - a DEPLOYMENT
   artifact (the container's install manifest), not source code. DO NOT DELETE.
-  The <Icon> below is a raw.githubusercontent URL to Assets/ on the main branch,
-  so the repo-root Assets/ folder must stay too.
+  The <Icon> below is a raw.githubusercontent URL to Assets/brand/ on the main
+  branch, so the repo-root Assets/ folder must stay too.
 
-  The video container publishes no port on purpose: only the isputnik.home
-  container talks to it, by name, over a user-defined Docker network, and the
-  home app signs people in for it and shows its libraries. See README.md.
+  Video is an add-on: it has no sign-in and no pages of its own. The isputnik
+  (isputnik.home) container reaches it and draws every screen: the libraries,
+  the Video page and the player. Without the shared secret the engine answers
+  everyone 401, so publishing its port on the LAN gives nothing away. How the
+  two find each other is set in isputnik.home, on Control panel, Settings, Apps.
+  The Date and Changes block below is written by `npm run changelog` from
+  changelog.json; edit that file, not the block.
 -->
 <Container version="2">
   <Name>isputnik-video</Name>
   <Repository>ghcr.io/isputnikdotnet/isputnik.video:latest</Repository>
   <Registry>https://ghcr.io/isputnikdotnet/isputnik.video</Registry>
-  <!-- Pick the same user-defined network as the isputnik container (create it
-       once: `docker network create isputnik`). On Docker's default bridge the
-       containers cannot reach each other by name. -->
-  <Network>isputnik</Network>
+  <!-- bridge with port 4300 published works everywhere: isputnik.home reaches
+       the engine at http://[unraid IP]:4300. On a user-defined network the two
+       containers also see each other by name (http://isputnik-video:4300), and
+       on br0 with a fixed IP at http://[that IP]:4300 - the port mapping then
+       does nothing and may be left as it is. -->
+  <Network>bridge</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <!-- The health check (GET /video/api/health) is built into the image. -->
+  <!-- Room for an orderly shutdown on update/stop. The health check
+       (GET /video/api/health) is built into the image. -->
   <ExtraParams>--stop-timeout=30</ExtraParams>
   <Support>https://github.com/isputnikdotnet/isputnik.video/issues</Support>
   <Project>https://github.com/isputnikdotnet/isputnik.video</Project>
 
   <Overview>
-The video engine for isputnik.home: TV shows and movies, scanned from your video folders, described from .nfo files and played in the browser. Alpha.
+The video engine for isputnik.home, in a container of its own: TV shows and movies scanned from your video folders, laid out the way Jellyfin and Kodi read them, described from .nfo files and TMDB (posters, backdrops, cast, sets of films, genres), and played in the browser and in the iSputnik TV app. A file a browser plays as it is goes as it is; the rest is converted while it plays, on the CPU or on an Intel CPU's graphics, with HDR tone-mapped and Blu-ray subtitles drawn in. Each person resumes where they stopped, intros and credits are skipped, viewers away from home are held under a quality cap. Everything runs on your server; nothing is sent anywhere.
 
-This container has no sign-in and no web address of its own. The isputnik.home container reaches it by name over a shared Docker network; video libraries are created, shared and watched in isputnik.home. Set up: put both containers on one user-defined Docker network (docker network create isputnik); set the isputnik container's Video URL (VIDEO_URL) to http://isputnik-video:4300 and restart it; in isputnik.home open Control panel, Apps, Setup, choose Video, press Generate secret and paste it here as Gateway Secret. Then add a library under Control panel, Library, Libraries, Add library, Video.
+This is an add-on for isputnik.home and does nothing on its own: it has no sign-in and no pages. Install it beside the isputnik container; video libraries are added, shared and watched in isputnik.home. Set it up from isputnik.home, on Control panel, Settings, Apps, Video. Before installing, press Generate secret there and copy it (it is shown once); paste it into the Gateway Secret field below, which is required. Give the container your video share as Video Folders (read-only: the engine never writes to it). Once it runs, enter its address on the same page (http://[your Unraid IP]:4300 as installed here) and press Test connection, which then says Paired. Then add a library under Control panel, Library, Libraries, Add library, Video. Needs isputnik.home 4.38 or newer.
   </Overview>
+
+  <Date>1794225600</Date>
+  <Changes>
+### 2026.11.09 — 0.31.1 On Docker Hub, and ready for Unraid Community Applications
+- **The image is on Docker Hub too, as isputnikdotnet/isputnik.video.** Every release tag publishes the same image to ghcr.io and to Docker Hub, as isputnik.home's does, and the Docker Hub page shows this README under a description that says what the container is: an add-on for isputnik.home. Every public description now says so: the GitHub repository, the image, the Unraid template and its profile.
+- **Ready for Unraid Community Applications as isputnik-video.** The template now publishes port 4300 on the ordinary bridge network, so isputnik.home reaches the engine at the server's own address with nothing to create first; a shared Docker network or br0 with a fixed IP work as before. It sends the administrator to isputnik.home's Control panel → Settings → Apps for the pairing, where the secret is generated first and pasted into Gateway Secret, and it carries this change log, regenerated by `npm run changelog` on every release.
+
+### 2026.11.09 — 0.31.0 Quality for viewers away from home
+- **Quality rungs.** The player's Quality menu in isputnik.home 4.78 asks this engine for Original, 1080p, 720p or 480p, made while the film plays; a film already smaller than the rung is sent as it is. Someone watching from outside the home network is held under the cap set in Settings → Video (up to 720p to start with), read from the gateway's network header, because a Blu-ray rip sent as it is needs more upload than a home link has.
+
+### 2026.11.09 — 0.30.0 Profiles keep their own history
+- **Viewing profiles keep their own history.** Continue watching, watched marks and My list belong to the profile isputnik.home 4.76 forwards, the same on every TV and browser, so the cartoons stay out of the grown-ups' Continue watching.
+
+### 2026.11.08 — 0.29.0 Without Stremio
+- **The Stremio add-on's routes are gone**, with the add-on itself in isputnik.home 4.74. An older home keeps working; the engine only stops answering on addresses nothing asks for any more.
+
+### 2026.11.05 — 0.28.1 Pictures for a film's parts
+- **A film in several parts shows pictures for each part**: a part matched to an episode of a TV show on TMDB gets that episode's picture, name and description.
+  </Changes>
+
+  <Requires>Needs the isputnik (isputnik.home) container, version 4.38 or newer, installed on the same server. The engine is reached only through it.</Requires>
 
   <Category>MediaServer:Video</Category>
 
-  <!-- No <WebUI>: the libraries are opened through the isputnik container. -->
+  <!-- No <WebUI>: the libraries are opened through the isputnik container.
+       The engine's own port answers 401 to a browser. -->
 
   <TemplateURL>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/isputnik-video.xml</TemplateURL>
 
-  <Icon>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/isputnikdotnet/isputnik.video/main/Assets/brand/isputnik-video-icon.png</Icon>
+
+  <!-- Port -->
+
+  <Config Name="Engine Port"
+          Target="4300"
+          Default="4300"
+          Mode="tcp"
+          Description="The port the isputnik container reaches the engine on: enter http://[your Unraid IP]:[this port] as the Video address in isputnik.home (Control panel, Settings, Apps). Not for browsers: video is watched inside isputnik.home. On br0 with a fixed IP, or on a user-defined network shared with the isputnik container, this mapping is not used and the address is the container's own IP or name with port 4300."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">4300</Config>
 
   <!-- Application Data -->
 
@@ -44,7 +85,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="/config"
           Default="/mnt/user/appdata/isputnik-video"
           Mode="rw"
-          Description="Stores the catalog: shows, seasons, episodes and movies found in the video folders (a SQLite database). Keep it apart from the isputnik container's appdata."
+          Description="Stores the catalog: shows, seasons, episodes and movies found in the video folders, posters and each person's progress (a SQLite database and a picture cache). Keep it apart from the isputnik container's appdata. isputnik.home's backups include a copy of the database."
           Type="Path"
           Display="always"
           Required="true"
@@ -74,7 +115,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="/dev/dri"
           Default=""
           Mode=""
-          Description="Optional. /dev/dri to convert video on an Intel CPU's graphics (Quick Sync) instead of the CPU: several viewers at once for little CPU. Leave empty to convert on the CPU. Settings → Video in isputnik.home shows what was found."
+          Description="Optional. /dev/dri to convert video on an Intel CPU's graphics (Quick Sync) instead of the CPU: several viewers at once for little CPU. Leave empty to convert on the CPU. Settings, Video in isputnik.home shows what was found."
           Type="Device"
           Display="always"
           Required="false"
@@ -86,7 +127,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="GATEWAY_SECRET"
           Default=""
           Mode=""
-          Description="The secret made in isputnik.home under Control panel, Apps, Setup, Video (Generate secret, then Copy), or a long random string of at least 32 characters (openssl rand -hex 32) also set on the isputnik container as VIDEO_GATEWAY_SECRET. Every request the home app forwards carries it, which is how this server knows who is signed in. Required: the server refuses to start without it, or with a short one."
+          Description="The secret isputnik.home signs its requests with, so this engine knows who is signed in. Make it first, in isputnik.home on Control panel, Settings, Apps, Video (Generate secret; it is shown once), and paste it here. Required: the engine refuses to start without one, or with one shorter than 32 characters. Everything else about video is managed inside isputnik.home."
           Type="Variable"
           Display="always"
           Required="true"
@@ -96,7 +137,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="PUID"
           Default="99"
           Mode=""
-          Description="User ID the server runs as. It runs unprivileged (not root); on first start it takes ownership of the Config &amp; Data path as this user. This user must be able to read the Video Folders. 99 (nobody) matches the default owner of an Unraid share."
+          Description="User ID the engine runs as. It runs unprivileged (not root); on first start it takes ownership of the Config &amp; Data path as this user. This user must be able to read the Video Folders. 99 (nobody) matches the default owner of an Unraid share."
           Type="Variable"
           Display="advanced"
           Required="false"
@@ -106,7 +147,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="PGID"
           Default="100"
           Mode=""
-          Description="Group ID the server runs as. 100 (users) matches the default group of an Unraid share."
+          Description="Group ID the engine runs as. 100 (users) matches the default group of an Unraid share."
           Type="Variable"
           Display="advanced"
           Required="false"
@@ -116,7 +157,7 @@ This container has no sign-in and no web address of its own. The isputnik.home c
           Target="LOG_LEVEL"
           Default="info"
           Mode=""
-          Description="trace, debug, info, warn, error, fatal or silent. The isputnik container shows this log under Control panel, Apps, Logs."
+          Description="trace, debug, info, warn, error, fatal or silent. isputnik.home shows this log and the engine's own event record under Control panel, Overview, Logs."
           Type="Variable"
           Display="advanced"
           Required="false"
