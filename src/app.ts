@@ -9,7 +9,7 @@ import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, 
 import { z } from "zod";
 import { getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries } from "./catalog.js";
 import { browserPlayability, continueWatching, fileOf, findItem, forgetHistory, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
-import { decideDelivery, type Delivery, type DeliveryMode, type DeliveryReason } from "./delivery.js";
+import { RUNGS, decideDelivery, rungOf, type Delivery, type DeliveryMode, type DeliveryReason, type Rung } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
@@ -159,13 +159,16 @@ const subtitleIdSchema = z.string().regex(/^(s\d{1,3}|x[0-9a-f]{10})$/);
  *  (only an image one changes how the film plays: it is burned in). */
 const playQuerySchema = z.object({
   audio: z.coerce.number().int().min(0).max(999).optional(),
-  subtitle: subtitleIdSchema.optional()
+  subtitle: subtitleIdSchema.optional(),
+  /** A quality rung by height, or "original" (docs/video-quality-plan.md). */
+  quality: z.enum(["original", "1080", "720", "480"]).optional()
 });
 
 /** The HLS address of one sound track: t<index>, or t- for a silent film; with
- *  b<index> after it when an image subtitle is burned in. */
+ *  b<index> after it when an image subtitle is burned in, and q<height> when
+ *  the picture is held under a quality rung. */
 const trackSegment = (delivery: Delivery) =>
-  `${delivery.audio ? `t${delivery.audio.index}` : "t-"}${delivery.burn ? `b${delivery.burn.index}` : ""}`;
+  `${delivery.audio ? `t${delivery.audio.index}` : "t-"}${delivery.burn ? `b${delivery.burn.index}` : ""}${delivery.rung ? `q${delivery.rung}` : ""}`;
 
 const artKindSchema = z.enum(["poster", "backdrop", "still"]);
 
@@ -266,11 +269,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   /** How the file reaches the browser, from what ffprobe finds inside it; null
    *  when ffmpeg is missing or can't read the file. */
-  const deliveryFor = async (item: PlayableItem, file: ProbedFile, audioIndex?: number | null, burnIndex?: number | null): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
+  const deliveryFor = async (item: PlayableItem, file: ProbedFile, audioIndex?: number | null, burnIndex?: number | null, rung: Rung | null = null): Promise<{ info: MediaInfo; delivery: Delivery } | null> => {
     if (!mediaProbe || !(await toolsReady)) return null;
     try {
       const info = await mediaProbe.info(item.id, file);
-      return { info, delivery: decideDelivery(info, path.extname(item.relative), audioIndex, burnIndex) };
+      return { info, delivery: decideDelivery(info, path.extname(item.relative), audioIndex, burnIndex, rung) };
     } catch (err) {
       app.log.warn({ err, item: item.id }, "ffprobe could not read a video file");
       return null;
@@ -617,6 +620,17 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // What home's player needs to start: the item, how it plays (with the sound
   // track asked for, ?audio=<index>), its sound tracks, where to resume, and
   // what comes next.
+  /** The picture's ceiling for this person (docs/video-quality-plan.md): what they
+   *  asked for, held under the admin's cap for anyone on the internet; with no
+   *  request, the file as it is at home and the cap away. `allowed` is what the
+   *  player may offer them. */
+  const qualityFor = (identity: Identity, asked: string | undefined): { current: Rung | null; allowed: (Rung | null)[] } => {
+    const cap = identity.network === "internet" ? readConversion(db).remoteQuality : null;
+    const allowed: (Rung | null)[] = cap === null ? [null, ...RUNGS] : RUNGS.filter((rung) => rung <= cap);
+    const wanted = asked === undefined ? cap : rungOf(asked);
+    return { current: cap !== null && (wanted === null || wanted > cap) ? cap : wanted, allowed };
+  };
+
   app.get(`${API}/play/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const identity = request.identity!;
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
@@ -625,20 +639,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const progress = progressFor(db, identity.historyId, [item.id]).get(item.id) ?? null;
     // After an episode the next one; after a film its next part, else the next of its set.
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextPart(db, item) ?? nextInSet(db, identity, item.id);
-    const { audio: audioIndex, subtitle } = playQuerySchema.parse(request.query ?? {});
+    const { audio: audioIndex, subtitle, quality: qualityAsked } = playQuerySchema.parse(request.query ?? {});
+    const quality = { ...qualityFor(identity, qualityAsked), network: identity.network };
     const stream = `${API}/stream/${item.id}`;
     let markers = readMarks(db, item);
     let probedVideoCodec: string | null = null;
     let audioTracks: (AudioStream & { selected: boolean })[] = [];
     let subtitleTracks: (SubtitleTrack & { url: string | null; burned: boolean })[] = [];
-    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null } =
-      { mode: "none", reasons: [], url: null, duration: null, busy: null };
+    let playback: { mode: DeliveryMode | "none"; reasons: DeliveryReason[]; url: string | null; duration: number | null; busy: HlsRefusal | null; quality: typeof quality } =
+      { mode: "none", reasons: [], url: null, duration: null, busy: null, quality };
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
       probedVideoCodec = probed?.video?.codec ?? null;
       markers = findMarkers(probed, file.absolute, markers, detectedMarkers(readDetected(db, item.id, file)));
       const tracks = probed ? listSubtitles(probed, file.absolute) : [];
-      const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle));
+      const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle), quality.current);
       subtitleTracks = tracks.map((track) => ({
         ...track,
         // Text goes to the browser as WebVTT; an image one is burned in when chosen.
@@ -650,14 +665,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
         // Every place to watch converted video taken: the player says so instead.
         const busy = mode !== "direct" && hls ? hls.refusal(`${identity.id}:${item.id}`) : null;
-        playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null, busy };
+        playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null, busy, quality };
         audioTracks = decided.info.audio.map((track) => ({ ...track, selected: track.index === decided.delivery.audio?.index }));
         // The playlist of a picture copied as it is needs its keyframes: start
         // reading them now, while the page opens.
         if (mode === "remux" && videoCopy) void mediaProbe!.keyframes(item.id, file).catch(() => undefined);
       } else if (browserPlayability(item.relative).direct !== "no") {
         // Nothing to look inside it with: offered as it is, and the browser decides.
-        playback = { mode: "direct", reasons: [], url: stream, duration: null, busy: null };
+        playback = { mode: "direct", reasons: [], url: stream, duration: null, busy: null, quality };
       }
     }
     return {
@@ -732,10 +747,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const file = item ? fileOf(options.mediaRoot, item) : null;
     if (!item || !file || !hls || !mediaProbe) return null;
     // No track in the address (home 4.40.0): the default sound.
-    const chosen = track === undefined ? null : /^t(\d{1,3}|-)(?:b(\d{1,3}))?$/.exec(track);
+    const chosen = track === undefined ? null : /^t(\d{1,3}|-)(?:b(\d{1,3}))?(?:q(\d{3,4}))?$/.exec(track);
     if (track !== undefined && !chosen) return null;
     const audioIndex = chosen && chosen[1] !== "-" ? Number(chosen[1]) : null;
-    const decided = await deliveryFor(item, file, audioIndex, chosen?.[2] ? Number(chosen[2]) : null);
+    // No rung in the address is the file as it is — which a viewer away from home
+    // is held under the admin's cap for, so that address isn't theirs (404 below).
+    if (chosen?.[3] && rungOf(chosen[3]) === null) return null;
+    const rung = qualityFor(identity, chosen?.[3] ?? "original").current;
+    const decided = await deliveryFor(item, file, audioIndex, chosen?.[2] ? Number(chosen[2]) : null, rung);
     if (!decided) return null;
     // An address for a track the file doesn't have is not this film.
     if (track !== undefined && trackSegment(decided.delivery) !== track) return null;
@@ -1007,7 +1026,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     hardware?.configure(settings.hardware);
     const memory = settings.memoryPerViewerMb === 0 ? "no memory" : `${settings.memoryPerViewerMb} MB of memory each, then ${settings.whenFull === "disk" ? "the disk" : "waiting"}`;
     const where = { auto: "on the GPU where it can", cpu: "on the CPU only", gpu: "on the GPU only" }[settings.hardware];
-    note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting ${where}, ${memory}` });
+    const away = settings.remoteQuality === null ? "the original" : `${settings.remoteQuality}p`;
+    note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting ${where}, ${memory}; away from home up to ${away}` });
     return conversion();
   });
 

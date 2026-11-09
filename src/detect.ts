@@ -615,7 +615,7 @@ const round = (seconds: number) => Math.round(seconds * 10) / 10;
 // ── What needs looking at ───────────────────────────────────────────────────
 
 /** Sees every library: the engine's own work, not anyone's request. */
-const ENGINE: Identity = { id: "engine", name: "engine", role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "", historyId: "engine" };
+const ENGINE: Identity = { id: "engine", name: "engine", role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "", historyId: "engine", network: "home" };
 
 export interface DetectSummary {
   seasons: number;

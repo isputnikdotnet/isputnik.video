@@ -9,7 +9,8 @@ export const conversionSchema = z.object({
   memoryPerViewerMb: z.number().int().min(0).max(16_384),
   maxViewers: z.number().int().min(1).max(50),
   whenFull: z.enum(["disk", "wait"]),
-  hardware: z.enum(["auto", "cpu", "gpu"])
+  hardware: z.enum(["auto", "cpu", "gpu"]),
+  remoteQuality: z.union([z.literal(1080), z.literal(720), z.literal(480)]).nullable()
 });
 
 const CONVERSION_KEY = "conversion";

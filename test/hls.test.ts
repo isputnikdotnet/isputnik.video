@@ -13,14 +13,18 @@ import { findTools, keyframes, probe, type MediaInfo } from "../src/ffmpeg.js";
 import { DEFAULT_CONVERSION, HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
-const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec?: string }): MediaInfo => ({
+const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec?: string; height?: number }): MediaInfo => ({
   container: over.container ?? "matroska,webm",
   start: over.start ?? 0,
   duration: over.duration ?? 60,
-  video: { index: 0, codec: over.vcodec ?? "h264", profile: "High", pixelFormat: over.pix ?? "yuv420p", width: 1920, height: 1080 },
+  bitRate: over.bitRate ?? null,
+  video: { index: 0, codec: over.vcodec ?? "h264", profile: "High", pixelFormat: over.pix ?? "yuv420p", width: Math.round(((over.height ?? 1080) * 16) / 9), height: over.height ?? 1080, colorTransfer: null, colorPrimaries: null },
   audio: over.acodec === "" ? [] : [{ index: 1, codec: over.acodec ?? "aac", channels: 6, language: "eng", title: null, default: true }],
-  subtitles: []
+  subtitles: [],
+  chapters: []
 });
+
+const MP4 = "mov,mp4,m4a,3gp,3g2,mj2";
 
 describe("how a file plays", () => {
   it("sends MP4 and WebM with browser codecs as they are", () => {
@@ -42,6 +46,24 @@ describe("how a file plays", () => {
     expect(decideDelivery(info({ vcodec: "hevc" }), ".mkv")).toMatchObject({ mode: "transcode", videoCopy: false });
     expect(decideDelivery(info({ container: "mov,mp4,m4a,3gp,3g2,mj2", pix: "yuv420p10le" }), ".mp4"))
       .toMatchObject({ mode: "transcode", reasons: ["video"] });
+  });
+
+  it("re-encodes a picture taller or heavier than the rung asked, and leaves one under it as it is", () => {
+    // A 1080p MP4 at 6 Mbit/s asked at 720p: taller than the rung.
+    expect(decideDelivery(info({ container: MP4, bitRate: 6_000_000 }), ".mp4", null, null, 720))
+      .toMatchObject({ mode: "transcode", videoCopy: false, reasons: ["size"], rung: 720 });
+    // A 720p MP4 at 2 Mbit/s asked at 720p: nothing to shrink, sent as it is.
+    expect(decideDelivery(info({ container: MP4, bitRate: 2_000_000, height: 720 }), ".mp4", null, null, 720))
+      .toMatchObject({ mode: "direct", rung: 720 });
+    // A 1080p Blu-ray remux at 28 Mbit/s asked at 1080p: heavier than the most the rung makes (10).
+    expect(decideDelivery(info({ bitRate: 28_000_000 }), ".mkv", null, null, 1080))
+      .toMatchObject({ mode: "transcode", videoCopy: false, reasons: ["container", "size"] });
+    // The same film at 9 Mbit/s: under the most, copied as today.
+    expect(decideDelivery(info({ bitRate: 9_000_000 }), ".mkv", null, null, 1080)).toMatchObject({ mode: "remux", videoCopy: true, rung: 1080 });
+    // No rung: exactly today's decision, whatever the size.
+    expect(decideDelivery(info({ bitRate: 28_000_000 }), ".mkv")).toMatchObject({ mode: "remux", rung: null });
+    // A file whose bitrate isn't known is judged by its height alone.
+    expect(decideDelivery(info({ container: MP4, height: 480 }), ".mp4", null, null, 480)).toMatchObject({ mode: "direct" });
   });
 
   it("sends a file with more than one sound track as HLS, since a page can't choose among them", () => {
@@ -100,6 +122,24 @@ describe("the cuts and the playlist", () => {
     expect(args[args.indexOf("-segment_times") + 1]).toBe("5.700,11.700");
     expect(args[args.indexOf("-segment_start_number") + 1]).toBe("2");
     expect(args).toEqual(expect.arrayContaining(["-c:v", "copy", "-c:a", "aac", "-copyts"]));
+  });
+
+  it("scales to the rung asked and spends what it allows, on the CPU and on the GPU", () => {
+    const film = info({ bitRate: 28_000_000, acodec: "ac3" });
+    const at720 = buildPlan("m1", "/media/film.mkv", film, decideDelivery(film, ".mkv", null, null, 720), null);
+    const cpu = ffmpegArgs(at720, 0, "/tmp/s");
+    expect(cpu[cpu.indexOf("-vf") + 1]).toBe("scale=-2:720");
+    expect(cpu).toEqual(expect.arrayContaining(["-c:v", "libx264", "-maxrate", "4M", "-bufsize", "8M", "-b:a", "128k"]));
+    const gpu = ffmpegArgs(at720, 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true });
+    expect(gpu[gpu.indexOf("-vf") + 1]).toBe("scale_vaapi=w=1280:h=720:format=nv12");
+    expect(gpu).toEqual(expect.arrayContaining(["-c:v", "h264_vaapi", "-b:v", "3M", "-maxrate", "4M", "-bufsize", "8M"]));
+
+    const at480 = buildPlan("m1", "/media/film.mkv", film, decideDelivery(film, ".mkv", null, null, 480), null);
+    expect(ffmpegArgs(at480, 0, "/tmp/s")).toEqual(expect.arrayContaining(["scale=-2:480", "-maxrate", "2M", "-bufsize", "4M", "-b:a", "96k"]));
+    // 1080p is what a conversion made before there were rungs.
+    const at1080 = buildPlan("m1", "/media/film.mkv", film, decideDelivery(film, ".mkv", null, null, 1080), null);
+    expect(ffmpegArgs(at1080, 0, "/tmp/s")).toEqual(expect.arrayContaining(["-maxrate", "10M", "-bufsize", "20M", "-b:a", "192k"]));
+    expect(ffmpegArgs(at1080, 0, "/tmp/s")).not.toContain("-vf");
   });
 });
 
@@ -166,6 +206,24 @@ describe("seeking", () => {
       if (far.status === "rejected") expect((far.reason as Error).message).toBe("Superseded");
       expect(near.status).toBe("fulfilled");
       expect(Date.now() - started).toBeLessThan(15_000);
+    } finally {
+      sessions.close();
+    }
+  }, 60_000);
+
+  it("starts a new run for another quality rung, re-encoding a picture the rung says is too heavy", async () => {
+    const sessions = new HlsSessions(tools, null, quiet);
+    try {
+      await sessions.segment("mum:seek", plan, 0);
+      expect(sessions.usage().viewers[0]).toMatchObject({ mode: "remux", rung: null, converter: null });
+      // The same film said to be 50 Mbit/s: above the 480p rung, so the picture is re-encoded.
+      const heavy = { ...plan.info, bitRate: 50_000_000 };
+      const smaller = buildPlan("seek", plan.file, heavy, decideDelivery(heavy, ".mkv", null, null, 480), null);
+      expect(smaller.delivery).toMatchObject({ mode: "transcode", videoCopy: false, rung: 480 });
+      const made = await sessions.segment("mum:seek", smaller, 0);
+      expect("data" in made ? made.data.length : made.size).toBeGreaterThan(0);
+      expect(sessions.usage().viewers).toHaveLength(1);
+      expect(sessions.usage().viewers[0]).toMatchObject({ mode: "transcode", rung: 480, converter: "cpu" });
     } finally {
       sessions.close();
     }
@@ -323,6 +381,41 @@ describe("real segments", () => {
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/tx/index.m3u8`, headers })).statusCode).toBe(404);
   }, 60_000);
 
+  it("holds a viewer on the internet under the admin's rung, and lets one at home have the file as it is", async () => {
+    const away = { ...headers, "x-isputnik-network": "internet" };
+    // At home, nothing asked: the original, with every rung on offer.
+    const home = (await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers })).json();
+    expect(home.playback.quality).toEqual({ current: null, allowed: [null, 1080, 720, 480], network: "home" });
+    expect(home.playback.url).toBe(`/video/api/hls/${filmId}/t1/index.m3u8`);
+    // At home, a rung asked: the address carries it. This film is 240p at a few
+    // hundred kbit/s, so there is nothing to shrink and the sound alone is converted.
+    const small = (await app.inject({ method: "GET", url: `/video/api/play/${filmId}?quality=480`, headers })).json();
+    expect(small.playback).toMatchObject({ mode: "remux", url: `/video/api/hls/${filmId}/t1q480/index.m3u8`, quality: { current: 480 } });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t1q480/index.m3u8`, headers })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t1q360/index.m3u8`, headers })).statusCode).toBe(404);
+
+    // Away: the cap (720p to start with) is the default and the most; lower is theirs to pick.
+    const capped = (await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: away })).json();
+    expect(capped.playback.quality).toEqual({ current: 720, allowed: [720, 480], network: "internet" });
+    expect(capped.playback.url).toBe(`/video/api/hls/${filmId}/t1q720/index.m3u8`);
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}?quality=original`, headers: away })).json().playback.quality.current).toBe(720);
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}?quality=480`, headers: away })).json().playback.quality.current).toBe(480);
+    // The uncapped address is not theirs.
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t1/index.m3u8`, headers: away })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t1q1080/index.m3u8`, headers: away })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/t1q720/index.m3u8`, headers: away })).statusCode).toBe(200);
+
+    // The admin lowers the cap, then lifts it.
+    const adminHeaders = { ...headers, "x-isputnik-user-id": "admin", "x-isputnik-user-role": "admin" };
+    const set = (remoteQuality: number | null) => app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers: adminHeaders, payload: { remoteQuality } });
+    expect((await set(480)).json().settings.remoteQuality).toBe(480);
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: away })).json().playback.quality).toEqual({ current: 480, allowed: [480], network: "internet" });
+    expect((await set(null)).json().settings.remoteQuality).toBeNull();
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: away })).json().playback.quality).toEqual({ current: null, allowed: [null, 1080, 720, 480], network: "internet" });
+    await set(720);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
+  }, 60_000);
+
   const adminHeaders = { ...headers, "x-isputnik-user-id": "admin", "x-isputnik-user-role": "admin" };
   const conversion = async () => (await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers: adminHeaders })).json();
   const setConversion = (payload: object) => app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers: adminHeaders, payload });
@@ -331,7 +424,7 @@ describe("real segments", () => {
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
     let state = await conversion();
-    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto" });
+    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto", remoteQuality: 720 });
     expect(state.usage.viewers).toMatchObject([{ user: "Mum", title: "Loud Film", mode: "remux" }]);
     expect(state.usage.memoryBytes).toBeGreaterThan(0);
     expect(state.usage.diskBytes).toBe(0);
@@ -389,7 +482,7 @@ describe("real segments", () => {
 
   it("keeps the admin's settings, refuses ones out of range, and lets only an admin near them", async () => {
     expect((await setConversion({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" })).json().settings)
-      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait", hardware: "auto" });
+      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait", hardware: "auto", remoteQuality: 720 });
     expect((await conversion()).settings.memoryPerViewerMb).toBe(512);
     expect((await setConversion({ memoryPerViewerMb: -1, maxViewers: 2, whenFull: "wait" })).statusCode).toBe(400);
     expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 0, whenFull: "wait" })).statusCode).toBe(400);
@@ -397,7 +490,7 @@ describe("real segments", () => {
     expect((await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers })).statusCode).toBe(403);
     expect((await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers, payload: { memoryPerViewerMb: 1, maxViewers: 1, whenFull: "disk" } })).statusCode).toBe(403);
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=conversion.changed", headers: adminHeaders })).json();
-    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting on the GPU where it can, 512 MB of memory each, then waiting");
+    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting on the GPU where it can, 512 MB of memory each, then waiting; away from home up to 720p");
     await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
   });
 

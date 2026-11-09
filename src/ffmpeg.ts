@@ -103,6 +103,10 @@ export interface MediaInfo {
   /** When the file's clock starts (an MPEG-TS recording seldom starts at 0). */
   start: number;
   duration: number;
+  /** The whole file's bits per second (ffprobe's format bit_rate, else its size
+   *  over its length); null when neither is known. What a quality rung is held
+   *  against (delivery.ts). */
+  bitRate: number | null;
   video: VideoStream | null;
   audio: AudioStream[];
   subtitles: SubtitleStream[];
@@ -129,16 +133,19 @@ interface ProbeStream {
 /** The file's streams and length; reads only its header. */
 export async function probe(tools: Tools, file: string): Promise<MediaInfo> {
   const out = await run(tools.ffprobe, ["-v", "error", "-show_format", "-show_streams", "-show_chapters", "-of", "json", file], 60_000);
-  const parsed = JSON.parse(out) as { format?: { format_name?: string; duration?: string; start_time?: string }; streams?: ProbeStream[]; chapters?: { start_time?: string; end_time?: string; tags?: Record<string, string> }[] };
+  const parsed = JSON.parse(out) as { format?: { format_name?: string; duration?: string; start_time?: string; bit_rate?: string; size?: string }; streams?: ProbeStream[]; chapters?: { start_time?: string; end_time?: string; tags?: Record<string, string> }[] };
   const streams = parsed.streams ?? [];
   // A cover picture is a "video" stream too; the film is the first real one.
   const video = streams.find((stream) => stream.codec_type === "video" && !stream.disposition?.attached_pic);
   const duration = Number(parsed.format?.duration ?? video?.duration ?? 0);
   const start = Number(parsed.format?.start_time ?? 0);
+  const declaredRate = Number(parsed.format?.bit_rate ?? 0);
+  const size = Number(parsed.format?.size ?? 0);
   return {
     container: parsed.format?.format_name ?? "",
     start: Number.isFinite(start) ? start : 0,
     duration: Number.isFinite(duration) ? duration : 0,
+    bitRate: declaredRate > 0 ? Math.round(declaredRate) : size > 0 && duration > 0 ? Math.round((size * 8) / duration) : null,
     video: video ? {
       index: video.index,
       codec: video.codec_name ?? "",

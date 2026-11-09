@@ -22,7 +22,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Delivery } from "./delivery.js";
+import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
@@ -98,8 +98,11 @@ export function playlist(plan: HlsPlan): string {
   return lines.join("\n");
 }
 
-/** The tallest picture a conversion makes; taller ones are scaled down to it. */
+/** The tallest picture a conversion makes without a rung asked; taller ones are scaled down to it. */
 const MAX_HEIGHT = 1080;
+
+/** ffmpeg's spelling of a bitrate: "8M", "1.5M", "128k". */
+const rate = (bitsPerSecond: number) => (bitsPerSecond >= 1_000_000 ? `${bitsPerSecond / 1_000_000}M` : `${bitsPerSecond / 1000}k`);
 
 /** HDR → SDR on the CPU: to linear light, into BT.709's colours, Hable's curve,
  *  back to BT.709 8-bit. What Jellyfin and most players do without a GPU. */
@@ -127,21 +130,24 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   if (from > 0) args.push("-ss", (offset + (delivery.videoCopy ? 0.05 : 0)).toFixed(3));
   args.push("-i", plan.file, "-copyts", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn");
   const burn = info.video ? delivery.burn : null;
-  const shrink = info.video !== null && info.video.height > MAX_HEIGHT;
+  // The rung asked, else the tallest a conversion makes; and what it may cost.
+  const maxHeight = delivery.rung ?? MAX_HEIGHT;
+  const limits = RUNG_LIMITS[delivery.rung ?? 1080];
+  const shrink = info.video !== null && info.video.height > maxHeight;
   // The GPU's scaler takes no "keep the shape" width: worked out here, even.
-  const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * MAX_HEIGHT) / info.video.height / 2) * 2) : 0;
+  const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * maxHeight) / info.video.height / 2) * 2) : 0;
   // A picture drawn or scaled on the CPU goes up to the GPU to be encoded.
   const upload = gpu ? ",format=nv12,hwupload" : "";
   // HDR tone-mapped on the CPU, unless the GPU decodes and tone-maps it (H2).
   const hdr = delivery.videoCopy ? null : hdrOf(info.video);
   const cpuTone = hdr && !gpu?.tonemap ? cpuTonemap(hdr) : null;
-  const gpuScale = shrink ? `scale_vaapi=w=${shrunkWidth}:h=${MAX_HEIGHT}:format=nv12` : "scale_vaapi=format=nv12";
+  const gpuScale = shrink ? `scale_vaapi=w=${shrunkWidth}:h=${maxHeight}:format=nv12` : "scale_vaapi=format=nv12";
   if (info.video && burn && gpu?.overlay) {
     // All on the GPU (H3): the picture tone-mapped and scaled there, the
     // subtitle's canvas fitted to it on the CPU (a few small images), uploaded
     // with its alpha, and laid over it.
     const outW = shrink ? shrunkWidth : info.video.width;
-    const outH = shrink ? MAX_HEIGHT : info.video.height;
+    const outH = shrink ? maxHeight : info.video.height;
     const main = `[0:${info.video.index}]${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}[m];`;
     const sub = `[0:${burn.index}]scale=${outW}:${outH},format=bgra,hwupload[sub];`;
     args.push("-filter_complex", `${main}${sub}[m][sub]overlay_vaapi=eof_action=pass[v]`, "-map", "[v]");
@@ -155,7 +161,7 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
     const picture = cpuTone ? "[pic]" : `[0:${info.video.index}]`;
     const sub = fit ? `[0:${burn.index}]scale=${width}:${height}[sub];` : "";
     const over = `${picture}${fit ? "[sub]" : `[0:${burn.index}]`}overlay=eof_action=pass`;
-    args.push("-filter_complex", `${tone}${sub}${over}${shrink ? `,scale=-2:${MAX_HEIGHT}` : ""}${upload}[v]`, "-map", "[v]");
+    args.push("-filter_complex", `${tone}${sub}${over}${shrink ? `,scale=-2:${maxHeight}` : ""}${upload}[v]`, "-map", "[v]");
   } else if (info.video) {
     args.push("-map", `0:${info.video.index}`);
   }
@@ -169,21 +175,21 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
     if (!burn) {
       args.push("-vf", gpu.decode
         ? `${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}`
-        : `${shrink ? `scale=-2:${MAX_HEIGHT},` : ""}${cpuTone ? `${cpuTone},` : ""}format=nv12,hwupload`);
+        : `${shrink ? `scale=-2:${maxHeight},` : ""}${cpuTone ? `${cpuTone},` : ""}format=nv12,hwupload`);
     }
-    args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", "8M", "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high");
+    args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", rate(limits.bitRate), "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2), "-profile:v", "high");
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   } else {
-    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", "10M", "-bufsize", "20M",
+    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2),
       "-profile:v", "high", "-pix_fmt", "yuv420p");
-    const filters = [shrink ? `scale=-2:${MAX_HEIGHT}` : null, cpuTone].filter(Boolean);
+    const filters = [shrink ? `scale=-2:${maxHeight}` : null, cpuTone].filter(Boolean);
     if (filters.length > 0 && !burn) args.push("-vf", filters.join(","));
     // A keyframe on every cut, so every segment starts on one.
     args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   }
   if (delivery.audio) {
     if (delivery.audioCopy) args.push("-c:a", "copy");
-    else args.push("-c:a", "aac", "-ac", "2", "-b:a", "192k");
+    else args.push("-c:a", "aac", "-ac", "2", "-b:a", rate(limits.audioRate));
     // Copied sound would start at the keyframe before the seek, seconds ahead of the
     // re-encoded picture. A player that sets its clock from a segment's first packet
     // (Media3, the TV app) would then show the whole film that far behind. A picture
@@ -212,9 +218,12 @@ export interface ConversionSettings {
   whenFull: "disk" | "wait";
   /** Where a picture is re-encoded (hardware.ts): the GPU where it can, the CPU only, or the GPU only. */
   hardware: HardwareMode;
+  /** The most a viewer away from home (on the internet, by the gateway's network
+   *  class) may have: a rung, or null for the file as it is. Their default too. */
+  remoteQuality: Rung | null;
 }
 
-export const DEFAULT_CONVERSION: ConversionSettings = { memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto" };
+export const DEFAULT_CONVERSION: ConversionSettings = { memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto", remoteQuality: 720 };
 
 /** A finished segment: in memory, or a file in the transcode folder. */
 export type SegmentData = { data: Buffer } | { file: string; size: number };
@@ -228,6 +237,8 @@ export interface ConversionViewer {
   converter: "gpu" | "cpu" | null;
   /** An HDR picture, tone-mapped on the way. */
   hdr: boolean;
+  /** The quality rung the picture is held under; null for the file as it is. */
+  rung: Rung | null;
   converting: boolean;
   memoryBytes: number;
   diskBytes: number;
@@ -383,9 +394,10 @@ export class HlsSessions {
     const signal = options.signal;
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
     let session = this.sessions.get(key);
-    // Another file under the same id, another sound track or other subtitles burned in: a new session.
+    // Another file under the same id, another sound track, other subtitles burned
+    // in or another quality rung: a new session (its cuts and its picture differ).
     if (session && (session.plan.file !== plan.file || session.plan.delivery.audio?.index !== plan.delivery.audio?.index ||
-      session.plan.delivery.burn?.index !== plan.delivery.burn?.index)) {
+      session.plan.delivery.burn?.index !== plan.delivery.burn?.index || session.plan.delivery.rung !== plan.delivery.rung)) {
       this.stop(key);
       session = undefined;
     }
@@ -464,6 +476,7 @@ export class HlsSessions {
       mode: session.plan.delivery.mode,
       converter: session.plan.delivery.videoCopy ? null : session.gpu ? "gpu" as const : "cpu" as const,
       hdr: !session.plan.delivery.videoCopy && hdrOf(session.plan.info.video) !== null,
+      rung: session.plan.delivery.rung,
       converting: session.proc !== null,
       memoryBytes: session.memoryBytes,
       diskBytes: [...session.onDisk.values()].reduce((sum, size) => sum + size, 0)

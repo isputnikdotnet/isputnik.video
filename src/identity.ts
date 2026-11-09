@@ -22,6 +22,11 @@ export const LIBRARIES_HEADER = "x-isputnik-libraries";
 export const PROFILE_HEADER = "x-isputnik-profile-id";
 /** The browser's address as the gateway saw it, so a log line names the person's machine. */
 export const CLIENT_IP_HEADER = "x-isputnik-client-ip";
+/** Where the gateway saw the browser: on a trusted zone, the home network (a private
+ *  address), or the internet. Decides the quality a viewer may have (delivery.ts). */
+export const NETWORK_HEADER = "x-isputnik-network";
+
+export type Network = "trusted" | "home" | "internet";
 /** The home server's id for the same request, so its log line and this one match up. */
 export const REQUEST_ID_HEADER = "x-isputnik-request-id";
 
@@ -45,6 +50,8 @@ export interface Identity {
    * uses `id`. A profile's history is the same whichever account is watching as it.
    */
   historyId: string;
+  /** Where the person is, by the gateway; "home" when an older home doesn't say. */
+  network: Network;
 }
 
 const PROFILE_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -98,6 +105,7 @@ export function identityFrom(headers: IncomingHttpHeaders, secret: string | null
   const lang = single(headers[USER_LANG_HEADER])?.trim() ?? "";
   const theme = single(headers[USER_THEME_HEADER])?.trim() ?? "";
   const appRole = single(headers[APP_ROLE_HEADER]) === "manager" || role === "admin" ? "manager" : "member";
+  const network = single(headers[NETWORK_HEADER]);
   return {
     id,
     name,
@@ -106,7 +114,8 @@ export function identityFrom(headers: IncomingHttpHeaders, secret: string | null
     libraries: librariesFrom(single(headers[LIBRARIES_HEADER])),
     lang: LANG.test(lang) ? lang : "en",
     theme: THEME.test(theme) ? theme : "minimalist",
-    historyId: historyIdFor(id, single(headers[PROFILE_HEADER]))
+    historyId: historyIdFor(id, single(headers[PROFILE_HEADER])),
+    network: network === "internet" || network === "trusted" ? network : "home"
   };
 }
 
@@ -164,7 +173,7 @@ export function checkSecret(secret: string | null, production: boolean): string 
  *  an admin who sees every library. "id:name". */
 export function devIdentity(spec: string): Identity {
   const [id = "dev", name = "Developer"] = spec.split(":");
-  return { id, name, role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "minimalist", historyId: id };
+  return { id, name, role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "minimalist", historyId: id, network: "home" };
 }
 
 /** Whether this person may see a library. */
