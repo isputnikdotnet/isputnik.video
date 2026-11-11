@@ -3,6 +3,13 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.32.0 — What you have watched
+
+- **Every card says where you are in it.** The lists isputnik.home draws its posters from now carry, for the person asking, a film's place (a film in several files counting as one) and a show's count of episodes seen, so home 4.81 can draw a bar on a film left part-way, a check on a finished one and "8 unwatched" on a show, without a request per poster.
+- **A list narrows by it.** `/titles?watch=` takes unwatched, progress and watched, any of them: home's new Watched filter. A show counts as watched only once every episode is, so a new episode brings it back.
+- **A whole show, a season or a film is marked in one call.** `PUT /video/api/watched/:kind/:id` marks every episode of a show, or of one season, or every part of a film, watched or never seen, for the person asking. Marked watched, what follows them is next: seasons 1 to 3 make season 4's first episode next up. Marked unwatched, their history goes and nothing is left to resume. Before, only one episode or film could be marked at a time.
+- Each person's marks, and each viewing profile's, stay their own, as progress always was.
+
 ## 0.31.1 — On Docker Hub, and ready for Unraid Community Applications
 
 - **The image is on Docker Hub too, as isputnikdotnet/isputnik.video.** Every release tag publishes the same image to ghcr.io and to Docker Hub, as isputnik.home's does, and the Docker Hub page shows this README under a description that says what the container is: an add-on for isputnik.home. Every public description now says so: the GitHub repository, the image, the Unraid template and its profile.
