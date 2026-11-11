@@ -7,8 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
-import { getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries } from "./catalog.js";
-import { browserPlayability, continueWatching, fileOf, findItem, forgetHistory, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { WATCH_STATES, getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries, type WatchState } from "./catalog.js";
+import { browserPlayability, continueWatching, fileOf, findItem, forgetHistory, markAllWatched, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { RUNGS, decideDelivery, rungOf, type Delivery, type DeliveryMode, type DeliveryReason, type Rung } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
@@ -134,10 +134,19 @@ const titleQuerySchema = z.object({
   kind: kindSchema.optional(),
   libraries: listParam(libraryIdSchema),
   genres: listParam(z.string().max(100)),
+  // unwatched, progress, watched — any of; a word it doesn't know is not asked.
+  watch: z.string().max(100).optional()
+    .transform((value) => (value ?? "").split(",").map((part) => part.trim()).filter((part): part is WatchState => (WATCH_STATES as readonly string[]).includes(part))),
   q: z.string().max(200).optional(),
   sort: z.enum(["title", "year", "added"]).default("title"),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(60)
+});
+
+/** PUT /watched: all of a show, one season of it, or every part of a film. */
+const watchedBodySchema = z.object({
+  watched: z.boolean(),
+  season: z.number().int().min(0).max(10_000).optional()
 });
 
 const setListQuerySchema = z.object({
@@ -927,6 +936,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!item) return reply.code(404).send({ error: "Not found" });
     const body = progressBodySchema.parse(request.body);
     return { progress: saveProgress(db, identity.historyId, item, body, await creditsAt(item, body.watched)) };
+  });
+
+  // Marked by hand, several at once (home's issue #101): a whole show, one season
+  // of it, or a film with every part — watched, or never seen. For the person
+  // asking only; the title must be one they may see.
+  app.put(`${API}/watched/:kind/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const identity = request.identity!;
+    const params = request.params as { kind: string; id: string };
+    const kind = kindSchema.safeParse(params.kind);
+    const id = itemIdSchema.parse(params.id);
+    const body = watchedBodySchema.parse(request.body);
+    const title = !kind.success ? null : kind.data === "shows" ? getShow(db, identity, id) : getMovie(db, identity, id);
+    if (!kind.success || !title) return reply.code(404).send({ error: "Not found" });
+    const target = kind.data === "shows" ? { kind: "shows" as const, id: title.id, season: body.season } : { kind: "movies" as const, id: title.id };
+    return { marked: markAllWatched(db, identity.historyId, target, body.watched) };
   });
 
   app.get(`${API}/continue`, { preHandler: requireIdentity }, async (request) => {

@@ -127,7 +127,11 @@ export function movieIdOf(db: Db, id: string): string {
  *  the one after the last they finished, else the first. Once they have finished
  *  the last part, the film is watched and starts again from the first. */
 export function placeInFilm(db: Db, userId: string, parts: MoviePart[]): { id: string; progress: Progress | null; watched: boolean } {
-  const progress = progressFor(db, userId, parts.map((part) => part.id));
+  return placeAmong(parts, progressFor(db, userId, parts.map((part) => part.id)));
+}
+
+/** placeInFilm over progress already read: for a page of films at once. */
+export function placeAmong(parts: { id: string }[], progress: Map<string, Progress>): { id: string; progress: Progress | null; watched: boolean } {
   const latest = parts
     .map((part, at) => ({ at, seen: progress.get(part.id) }))
     .filter((entry) => entry.seen)
@@ -274,6 +278,49 @@ export function saveProgress(
       updated_at = excluded.updated_at
   `).run(userId, item.id, item.type, position, duration, watched ? 1 : 0);
   return progressFor(db, userId, [item.id]).get(item.id)!;
+}
+
+// ── Marking by hand, several at once ────────────────────────────────────────
+
+/** Marks every episode of a show (or of one season), or every part of a film,
+ *  watched or not, for one person (home's issue #101). Watched: each gets its
+ *  mark at its end, the last of them newest, so what plays next is whatever
+ *  follows them. Not watched: their history goes altogether — never seen, with
+ *  nothing to resume — and what plays next is worked out from what is left.
+ *  Answers how many there were; 0 for a show or season with no episodes. */
+export function markAllWatched(
+  db: Db,
+  userId: string,
+  target: { kind: "shows"; id: string; season?: number } | { kind: "movies"; id: string },
+  watched: boolean
+): number {
+  const items: { id: string; type: ItemType; runtime: number | null }[] = target.kind === "shows"
+    ? (db.prepare(`SELECT id, runtime_minutes FROM episodes WHERE show_id = ? ${target.season === undefined ? "" : "AND season = ?"} ORDER BY season, episode, file`)
+        .all(...(target.season === undefined ? [target.id] : [target.id, target.season])) as { id: string; runtime_minutes: number | null }[])
+        .map((row) => ({ id: row.id, type: "episode" as const, runtime: row.runtime_minutes }))
+    : [{ id: target.id }, ...(db.prepare("SELECT id FROM movie_parts WHERE movie_id = ? ORDER BY part").all(target.id) as { id: string }[])]
+        .map((row) => ({ id: row.id, type: "movie" as const, runtime: null }));
+  if (items.length === 0) return 0;
+  const forget = db.prepare("DELETE FROM progress WHERE user_id = ? AND item_id = ?");
+  // The length the player measured stays; without one, the listed running time.
+  const mark = db.prepare(`
+    INSERT INTO progress (user_id, item_id, item_type, position_s, duration_s, watched, updated_at)
+    VALUES (@user, @item, @type, COALESCE(@duration, 0), @duration, 1, @at)
+    ON CONFLICT (user_id, item_id) DO UPDATE SET
+      position_s = COALESCE(progress.duration_s, excluded.duration_s, 0),
+      duration_s = COALESCE(progress.duration_s, excluded.duration_s),
+      watched = 1,
+      updated_at = excluded.updated_at
+  `);
+  const now = Date.now();
+  db.transaction(() => {
+    items.forEach((item, at) => {
+      if (!watched) forget.run(userId, item.id);
+      // A millisecond apart, in order: the last one is the one watched last.
+      else mark.run({ user: userId, item: item.id, type: item.type, duration: item.runtime ? item.runtime * 60 : null, at: new Date(now + at).toISOString() });
+    });
+  })();
+  return items.length;
 }
 
 /** Progress whose episode or movie is gone; for the daily sweep. */

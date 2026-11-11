@@ -3,7 +3,7 @@
 // home worked it out). Home's screens draw it; this answers in plain JSON.
 import type { Db } from "./db.js";
 import { canSee, type Identity } from "./identity.js";
-import { browserPlayability, movieIdOf, nextUp, partsOfMovie, placeInFilm, progressFor, resumeAt } from "./playback.js";
+import { RESUME_MIN_S, browserPlayability, movieIdOf, nextUp, partsOfMovie, placeAmong, placeInFilm, progressFor, resumeAt } from "./playback.js";
 import { BASE_PATH } from "./config.js";
 import { artUrl, metaFor, metaGenres, partKey, type MetaRow } from "./metadata.js";
 import { parseGenres, rawGenresSql, resolveGenres, widenGenres } from "./genres.js";
@@ -38,10 +38,43 @@ export interface TitleQuery {
   kind?: "shows" | "movies";
   libraries: string[];
   genres: string[];
+  /** Any of these, for the person asking; empty is every title. */
+  watch?: WatchState[];
   q?: string;
   sort: ListQuery["sort"];
   page: number;
   pageSize: number;
+}
+
+/** Where a person is with a title (home's issue #101): never started, left
+ *  part-way (a show with some episodes seen and some not), or finished. */
+export type WatchState = "unwatched" | "progress" | "watched";
+export const WATCH_STATES: readonly WatchState[] = ["unwatched", "progress", "watched"];
+
+/** Seen, or far enough in to come back to. */
+const STARTED = `(p.watched = 1 OR p.position_s >= ${RESUME_MIN_S})`;
+/** A film is watched once its last part is (its only one, for a film in one file). */
+const MOVIE_WATCHED = `EXISTS (SELECT 1 FROM progress p WHERE p.user_id = ? AND p.watched = 1
+  AND p.item_id = COALESCE((SELECT mp.id FROM movie_parts mp WHERE mp.movie_id = movies.id ORDER BY mp.part DESC LIMIT 1), movies.id))`;
+const MOVIE_STARTED = `EXISTS (SELECT 1 FROM progress p WHERE p.user_id = ? AND ${STARTED}
+  AND (p.item_id = movies.id OR p.item_id IN (SELECT mp.id FROM movie_parts mp WHERE mp.movie_id = movies.id)))`;
+/** A show is watched once every episode is; one with none never is. */
+const SHOW_WATCHED = `(EXISTS (SELECT 1 FROM episodes e WHERE e.show_id = shows.id) AND NOT EXISTS (
+  SELECT 1 FROM episodes e WHERE e.show_id = shows.id
+    AND NOT EXISTS (SELECT 1 FROM progress p WHERE p.user_id = ? AND p.item_id = e.id AND p.watched = 1)))`;
+const SHOW_STARTED = `EXISTS (SELECT 1 FROM episodes e JOIN progress p ON p.item_id = e.id WHERE e.show_id = shows.id AND p.user_id = ? AND ${STARTED})`;
+
+/** The SQL for "in any of these states", and the person it is asked for once per `?`. */
+function watchClause(table: "shows" | "movies", states: WatchState[], userId: string): { sql: string; params: string[] } | null {
+  const wanted = WATCH_STATES.filter((state) => states.includes(state));
+  if (wanted.length === 0 || wanted.length === WATCH_STATES.length) return null;
+  const watched = table === "shows" ? SHOW_WATCHED : MOVIE_WATCHED;
+  const started = table === "shows" ? SHOW_STARTED : MOVIE_STARTED;
+  const each = { unwatched: { sql: `NOT ${started}`, uses: 1 }, progress: { sql: `(NOT ${watched} AND ${started})`, uses: 2 }, watched: { sql: watched, uses: 1 } };
+  return {
+    sql: `(${wanted.map((state) => each[state].sql).join(" OR ")})`,
+    params: wanted.flatMap((state) => Array<string>(each[state].uses).fill(userId))
+  };
 }
 
 /** A title's genres as its card shows them: the scan's own, TMDB's when it had
@@ -93,7 +126,7 @@ function scope(db: Db, identity: Identity, kind: "shows" | "movies", query: List
 
 /** Which rows of a table a list takes: in these libraries, matching the search,
  *  of any of these genres. */
-function where(db: Db, table: "shows" | "movies", libraries: string[], q: string | undefined, genres: string[]) {
+function where(db: Db, table: "shows" | "movies", libraries: string[], q: string | undefined, genres: string[], watch: { states: WatchState[]; userId: string } | null = null) {
   let sql = `library_id IN (${libraries.map(() => "?").join(", ")})`;
   const params: string[] = [...libraries];
   // The scan's title or TMDB's, either in the original too: a show filed as
@@ -107,7 +140,55 @@ function where(db: Db, table: "shows" | "movies", libraries: string[], q: string
     sql += ` AND EXISTS (SELECT 1 FROM json_each(${effectiveGenres(table)}) g WHERE g.value IN (${wanted.map(() => "?").join(", ")}))`;
     params.push(...wanted);
   }
+  const watching = watch ? watchClause(table, watch.states, watch.userId) : null;
+  if (watching) {
+    sql += ` AND ${watching.sql}`;
+    params.push(...watching.params);
+  }
   return { sql, params };
+}
+
+/** Where this person is with each film of a page: their place in it (a film in
+ *  parts counting as one) and what Play starts. Read in two queries, whatever the
+ *  page's size. */
+function movieWatch(db: Db, identity: Identity, ids: string[]) {
+  const parts = new Map<string, { id: string }[]>(ids.map((id) => [id, [{ id }]]));
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const rows = db.prepare(`SELECT id, movie_id FROM movie_parts WHERE movie_id IN (${chunk.map(() => "?").join(", ")}) ORDER BY part`).all(...chunk) as { id: string; movie_id: string }[];
+    for (const row of rows) parts.get(row.movie_id)!.push({ id: row.id });
+  }
+  const progress = progressFor(db, identity.historyId, [...parts.values()].flatMap((list) => list.map((part) => part.id)));
+  return new Map(ids.map((id) => {
+    const place = placeAmong(parts.get(id)!, progress);
+    return [id, { playId: place.id, progress: place.progress && { ...place.progress, watched: place.watched } }];
+  }));
+}
+
+/** The same for shows: how many episodes are seen, whether any is left part-way,
+ *  and the episode Play starts (null once all are watched). */
+function showWatch(db: Db, identity: Identity, ids: string[]) {
+  const seen = new Map<string, { watched: number; partway: number }>();
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const rows = db.prepare(`
+      SELECT e.show_id AS id, SUM(p.watched) AS watched, SUM(CASE WHEN p.watched = 0 AND p.position_s >= ${RESUME_MIN_S} THEN 1 ELSE 0 END) AS partway
+      FROM episodes e JOIN progress p ON p.item_id = e.id
+      WHERE p.user_id = ? AND e.show_id IN (${chunk.map(() => "?").join(", ")}) GROUP BY e.show_id
+    `).all(identity.historyId, ...chunk) as { id: string; watched: number; partway: number }[];
+    for (const row of rows) seen.set(row.id, row);
+  }
+  return new Map(ids.map((id) => {
+    const row = seen.get(id);
+    return [id, { watchedEpisodes: row?.watched ?? 0, started: Boolean(row && (row.watched > 0 || row.partway > 0)), playId: nextUp(db, identity.historyId, id)?.id ?? null }];
+  }));
+}
+
+/** A page's cards with where this person is in each. */
+function withWatch<T extends { id: string }>(db: Db, identity: Identity, kind: "shows" | "movies", cards: T[]) {
+  const ids = cards.map((card) => card.id);
+  const watch: Map<string, object> = kind === "shows" ? showWatch(db, identity, ids) : movieWatch(db, identity, ids);
+  return cards.map((card) => ({ ...card, ...watch.get(card.id) }));
 }
 
 /** One page of a list, and how many there are. A person who may see nothing gets an empty page. */
@@ -151,11 +232,13 @@ const movieCard = (row: Record<string, unknown>, meta: MetaRow | undefined) => (
 });
 
 export function listShows(db: Db, identity: Identity, query: ListQuery) {
-  return page(db, "shows", SHOW_COLUMNS, scope(db, identity, "shows", query), query, showCard);
+  const found = page(db, "shows", SHOW_COLUMNS, scope(db, identity, "shows", query), query, showCard);
+  return { ...found, items: withWatch(db, identity, "shows", found.items) };
 }
 
 export function listMovies(db: Db, identity: Identity, query: ListQuery) {
-  return page(db, "movies", MOVIE_COLUMNS, scope(db, identity, "movies", query), query, movieCard);
+  const found = page(db, "movies", MOVIE_COLUMNS, scope(db, identity, "movies", query), query, movieCard);
+  return { ...found, items: withWatch(db, identity, "movies", found.items) };
 }
 
 /** Cards for some titles of one table, by id. */
@@ -175,18 +258,20 @@ export function listTitles(db: Db, identity: Identity, query: TitleQuery) {
       const libraries = visibleLibraries(db, identity, kind).map((row) => row.id)
         .filter((id) => query.libraries.length === 0 || query.libraries.includes(id));
       if (libraries.length === 0) return [];
-      const filter = where(db, kind, libraries, query.q, query.genres);
+      const filter = where(db, kind, libraries, query.q, query.genres, query.watch?.length ? { states: query.watch, userId: identity.historyId } : null);
       return [{ sql: `SELECT '${kind}' AS kind, id, sort_title, year, added_at, rowid AS rid FROM ${kind} WHERE ${filter.sql}`, params: filter.params }];
     });
-  if (parts.length === 0) return { items: [], total: 0, page: query.page, pageSize: query.pageSize };
+  // `watch`: every card says where this person is in it, and ?watch= narrows by it
+  // (engine 0.32+); home offers neither to an engine that doesn't say so.
+  if (parts.length === 0) return { items: [], total: 0, page: query.page, pageSize: query.pageSize, watch: true };
   const union = parts.map((part) => part.sql).join(" UNION ALL ");
   const params = parts.flatMap((part) => part.params);
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM (${union})`).get(...params) as { n: number }).n;
   const rows = db.prepare(`SELECT kind, id FROM (${union}) ORDER BY ${TITLE_ORDER[query.sort]} LIMIT ? OFFSET ?`)
     .all(...params, query.pageSize, (query.page - 1) * query.pageSize) as { kind: "shows" | "movies"; id: string }[];
   const idsOf = (kind: "shows" | "movies") => rows.filter((row) => row.kind === kind).map((row) => row.id);
-  const shows = cardsOf(db, "shows", SHOW_COLUMNS, idsOf("shows"), showCard);
-  const movies = cardsOf(db, "movies", MOVIE_COLUMNS, idsOf("movies"), movieCard);
+  const shows = new Map(withWatch(db, identity, "shows", [...cardsOf(db, "shows", SHOW_COLUMNS, idsOf("shows"), showCard).values()]).map((card) => [card.id, card]));
+  const movies = new Map(withWatch(db, identity, "movies", [...cardsOf(db, "movies", MOVIE_COLUMNS, idsOf("movies"), movieCard).values()]).map((card) => [card.id, card]));
   return {
     items: rows.flatMap((row) => {
       const card = row.kind === "shows" ? shows.get(row.id) : movies.get(row.id);
@@ -194,7 +279,8 @@ export function listTitles(db: Db, identity: Identity, query: TitleQuery) {
     }),
     total,
     page: query.page,
-    pageSize: query.pageSize
+    pageSize: query.pageSize,
+    watch: true
   };
 }
 
@@ -251,6 +337,8 @@ export function getShow(db: Db, identity: Identity, id: string) {
     backdrop: artUrl(API, showMeta, "backdrop"),
     ...matchOf(showMeta),
     seasons: [...seasons.values()],
+    /** A whole show or season can be marked in one call (PUT /watched, engine 0.32+). */
+    marksAll: true,
     /** The show's regulars, and who made it (credits.ts). */
     ...creditsOf(db, id),
     /** What Play on the show starts: null once every episode is watched. */
@@ -288,6 +376,7 @@ export function getMovie(db: Db, identity: Identity, askedId: string) {
     backdrop: artUrl(API, meta, "backdrop"),
     ...matchOf(meta),
     direct: browserPlayability(movie.file as string).direct,
+    marksAll: true,
     /** What Play starts: the film, or the part this person has got to. */
     playId: place.id,
     progress: place.progress && { ...place.progress, watched: place.watched },
