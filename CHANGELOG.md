@@ -3,6 +3,14 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.33.0 — Copies prepared for download
+
+- **A download optimized for a phone or tablet is now prepared here, on a queue.** isputnik.home 4.82 asks for a smaller copy of a film or episode (480p, 720p or 1080p); the engine makes it as one MP4 and the device fetches the finished file at full speed. Before, the film was converted while the phone waited on the connection, which was slow and loaded the server for as long as the download took.
+- **Kind to the server.** One copy is made at a time, on the GPU where there is one; without one, at low priority and with half the CPU's cores. A copy being made stands still while anyone is watching converted video, and carries on after.
+- **Kept for the next person.** A copy made once serves everyone who may see that title. Together they stay under a size set in home's Settings → Video → **Copies for download** (20 GB to start with); past it, the ones used longest ago go. A copy of a file that has changed since is made again.
+- **Where they are kept:** in a `copies` folder inside `/transcode` when that is mapped, otherwise beside the catalog. Map `/transcode` to a disk with room for them. The conversion folder is still emptied on start, but no longer the copies in it.
+- A 1080p copy is held to about 2.5 GB for a two-hour film, lower than a 1080p stream; 720p is about 1.4 GB and 480p about 0.7 GB.
+
 ## 0.32.0 — What you have watched
 
 - **Every card says where you are in it.** The lists isputnik.home draws its posters from now carry, for the person asking, a film's place (a film in several files counting as one) and a show's count of episodes seen, so home 4.81 can draw a bar on a film left part-way, a check on a finished one and "8 unwatched" on a show, without a request per poster.

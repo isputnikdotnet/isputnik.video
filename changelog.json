@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.33.0",
+    "label": "Copies prepared for download",
+    "changes": [
+      "**A download optimized for a phone or tablet is now prepared here, on a queue.** isputnik.home 4.82 asks for a smaller copy of a film or episode (480p, 720p or 1080p); the engine makes it as one MP4 and the device fetches the finished file at full speed. Before, the film was converted while the phone waited on the connection, which was slow and loaded the server for as long as the download took.",
+      "**Kind to the server.** One copy is made at a time, on the GPU where there is one; without one, at low priority and with half the CPU's cores. A copy being made stands still while anyone is watching converted video, and carries on after.",
+      "**Kept for the next person.** A copy made once serves everyone who may see that title. Together they stay under a size set in home's Settings → Video → **Copies for download** (20 GB to start with); past it, the ones used longest ago go. A copy of a file that has changed since is made again.",
+      "**Where they are kept:** in a `copies` folder inside `/transcode` when that is mapped, otherwise beside the catalog. Map `/transcode` to a disk with room for them. The conversion folder is still emptied on start, but no longer the copies in it.",
+      "A 1080p copy is held to about 2.5 GB for a two-hour film, lower than a 1080p stream; 720p is about 1.4 GB and 480p about 0.7 GB."
+    ]
+  },
+  {
     "version": "0.32.0",
     "label": "What you have watched",
     "changes": [
