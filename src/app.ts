@@ -18,7 +18,8 @@ import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, pu
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
-import { conversionSchema, detectionSchema, readConversion, readDetection, saveConversion, saveDetection } from "./settings.js";
+import { conversionSchema, detectionSchema, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
+import { Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
@@ -72,6 +73,9 @@ export interface AppOptions {
   /** Where TMDB's posters and backdrops are kept (ART_PATH); a fresh temporary
    *  folder when left out. */
   artDir?: string;
+  /** Where copies made for download are kept (copies.ts); a fresh temporary
+   *  folder, removed on close, when left out. */
+  copiesDir?: string;
   /** How TMDB is reached; tests hand in their own. */
   fetch?: Fetch;
   /** Tests settle files at once instead of waiting out a copy. */
@@ -268,6 +272,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   let closed = false;
   void toolsReady.then((ok) => { if (ok && !closed) hardware?.configure(readConversion(db).hardware); });
   const subtitleCache = tools ? new SubtitleCache(tools) : null;
+  // Copies made for download: a queue of its own, which waits while anyone watches.
+  const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
+  const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.active() ?? 0) > 0) : null;
+  copies?.configure(readCopies(db));
 
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
   const artDir = options.artDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
@@ -384,6 +392,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     closed = true;
     clearInterval(daily);
     hls?.close();
+    copies?.close();
+    if (options.copiesDir === undefined) fs.rmSync(copiesDir, { recursive: true, force: true });
     detectStop.abort();
     await detectChain.catch(() => undefined);
     await mediaProbe?.idle();
@@ -399,6 +409,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const purged = purgeDetached(db);
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
     purgeOrphanProgress(db);
+    copies?.purgeOrphans();
     purgeOrphanProbes(db);
     purgeOrphanMarkers(db);
     purgeOrphanDetected(db);
@@ -936,6 +947,107 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!item) return reply.code(404).send({ error: "Not found" });
     const body = progressBodySchema.parse(request.body);
     return { progress: saveProgress(db, identity.historyId, item, body, await creditsAt(item, body.watched)) };
+  });
+
+  // ── Copies to download (copies.ts) ──────────────────────────────────────
+  //
+  // A smaller MP4 of a film or episode, made once on a queue and kept: asked
+  // for with PUT, looked in on with GET, fetched from /file once ready. "none":
+  // never asked for. "unneeded": the file already fits and plays as it is —
+  // download /stream instead.
+  const copyQuerySchema = z.object({
+    quality: z.coerce.number().refine((value) => rungOf(value) !== null),
+    audio: z.coerce.number().int().min(0).max(999).optional()
+  });
+
+  /** What a copy request is about, for someone who may see the title and have this quality. */
+  const copyTarget = async (request: FastifyRequest, raw: unknown) => {
+    const identity = request.identity!;
+    const asked = copyQuerySchema.safeParse(raw ?? {});
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    const file = item ? fileOf(options.mediaRoot, item) : null;
+    if (!asked.success || !item || !file || !copies) return null;
+    const rung = rungOf(asked.data.quality)!;
+    // A viewer away from home is held under the admin's cap for copies too.
+    if (qualityFor(identity, String(rung)).current !== rung) return null;
+    const decided = await deliveryFor(item, file, asked.data.audio ?? null, null, rung);
+    if (!decided) return null;
+    const key: CopyKey = { itemId: item.id, rung, audio: decided.delivery.audio?.index ?? -1 };
+    const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
+    return { item, file, key, title, ...decided };
+  };
+
+  const copyAnswer = (target: NonNullable<Awaited<ReturnType<typeof copyTarget>>>) => {
+    const { key, file, info, delivery, item } = target;
+    if (delivery.mode === "direct") return { state: "unneeded" as const, url: `${API}/stream/${item.id}` };
+    const status = copies!.status(key, file);
+    const estimateSeconds = estimateCopySeconds(info, delivery, Boolean(hardware?.choose(info, delivery)));
+    if (!status) return { state: "none" as const, estimateSeconds };
+    return { ...status, estimateSeconds, url: status.state === "ready" ? `${API}/copies/${item.id}/file?quality=${key.rung}&audio=${key.audio}` : null };
+  };
+
+  app.get(`${API}/copies/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const target = await copyTarget(request, request.query);
+    return target ? copyAnswer(target) : reply.code(404).send({ error: "Not found" });
+  });
+
+  app.put(`${API}/copies/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const target = await copyTarget(request, request.body);
+    if (!target) return reply.code(404).send({ error: "Not found" });
+    if (target.delivery.mode !== "direct") {
+      copies!.request({ ...target.key, title: target.title, file: target.file, info: target.info, delivery: target.delivery });
+    }
+    return copyAnswer(target);
+  });
+
+  // The finished copy, with byte ranges: a download picks up where it stopped.
+  app.get(`${API}/copies/:id/file`, { preHandler: requireIdentity }, async (request, reply) => {
+    const target = await copyTarget(request, request.query);
+    const made = target ? copies!.ready(target.key, target.file) : null;
+    if (!made) return reply.code(404).send({ error: "Not found" });
+    const range = parseRange(request.headers.range, made.size);
+    if (range === "invalid") return reply.code(416).header("Content-Range", `bytes */${made.size}`).send({ error: "Range not satisfiable" });
+    const { start, end } = range ?? { start: 0, end: made.size - 1 };
+    const headers: Record<string, string | number> = {
+      "Content-Type": "video/mp4",
+      "Content-Length": made.size === 0 ? 0 : end - start + 1,
+      "Accept-Ranges": "bytes",
+      "Last-Modified": made.modified.toUTCString(),
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "X-Robots-Tag": "noindex, nofollow"
+    };
+    if (range) headers["Content-Range"] = `bytes ${start}-${end}/${made.size}`;
+    reply.hijack();
+    reply.raw.writeHead(range ? 206 : 200, headers);
+    if (request.method === "HEAD" || made.size === 0) {
+      reply.raw.end();
+      return;
+    }
+    const stream = fs.createReadStream(made.path, { start, end });
+    stream.on("error", (err) => reply.raw.destroy(err));
+    reply.raw.on("close", () => stream.destroy());
+    stream.pipe(reply.raw);
+  });
+
+  // The copies kept, what they take and how much they may: home's Settings → Video.
+  app.get(`${API}/admin/copies`, { preHandler: requireAdmin }, async (_request, reply) =>
+    (copies ? copies.list() : reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" })));
+
+  app.put(`${API}/admin/copies`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" });
+    const settings = copySettingsSchema.parse({ ...readCopies(db), ...(request.body as object) });
+    saveCopies(db, settings);
+    copies.configure(settings);
+    note(request, "info", "copies.changed", { detail: `Copies to download may take ${settings.limitGb} GB` });
+    return copies.list();
+  });
+
+  app.delete(`${API}/admin/copies`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" });
+    const removed = copies.clear();
+    note(request, "info", "copies.cleared", { detail: `${removed} copies to download removed` });
+    return copies.list();
   });
 
   // Marked by hand, several at once (home's issue #101): a whole show, one season

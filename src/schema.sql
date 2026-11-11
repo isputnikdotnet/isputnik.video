@@ -383,3 +383,23 @@ CREATE TABLE IF NOT EXISTS credits (
   PRIMARY KEY (item_id, person_id, kind, role)
 );
 CREATE INDEX IF NOT EXISTS credits_person ON credits (person_id);
+
+-- Copies made for download (copies.ts): a film or episode as a smaller MP4, kept
+-- for whoever asks next. One per title, quality and sound track; the file is in
+-- the copies folder under the same name. Only finished ones outlive a restart.
+CREATE TABLE IF NOT EXISTS copies (
+  item_id          TEXT NOT NULL,
+  rung             INTEGER NOT NULL,
+  audio            INTEGER NOT NULL,
+  state            TEXT NOT NULL CHECK (state IN ('queued', 'running', 'ready', 'failed')),
+  title            TEXT NOT NULL DEFAULT '',
+  size_bytes       INTEGER NOT NULL DEFAULT 0,
+  -- The file it was made from: a different size or date is a different film.
+  source_size      INTEGER NOT NULL,
+  source_modified  TEXT NOT NULL,
+  error            TEXT,
+  requested_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  ready_at         TEXT,
+  used_at          TEXT,
+  PRIMARY KEY (item_id, rung, audio)
+);

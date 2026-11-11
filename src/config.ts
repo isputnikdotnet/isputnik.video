@@ -34,6 +34,12 @@ export const config = {
   /** Where segments are made while someone watches; emptied on start. Fast
    *  local disk or RAM is best (the image: /transcode). */
   transcodeDir: process.env.TRANSCODE_PATH?.trim() || path.join(os.tmpdir(), "isputnik-video-hls"),
+  /** Copies made for download, kept between restarts: inside the conversion
+   *  folder when one is mounted (usually the server's fast disk), else beside
+   *  the catalog. */
+  copiesDir: process.env.TRANSCODE_PATH?.trim()
+    ? path.join(process.env.TRANSCODE_PATH.trim(), "copies")
+    : path.join(path.dirname(process.env.DB_PATH ?? path.join(rootDir, "data", "video.sqlite")), "copies"),
   /** Posters and backdrops fetched from TMDB; beside the catalog unless ART_PATH
    *  says otherwise (the image: /config/art). Not backed up: fetched again. */
   artDir: process.env.ART_PATH?.trim() || path.join(path.dirname(process.env.DB_PATH ?? path.join(rootDir, "data", "video.sqlite")), "art"),

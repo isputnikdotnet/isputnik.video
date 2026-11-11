@@ -26,6 +26,9 @@ import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
+/** Inside the conversion folder: the copies kept for download, never swept. */
+export const COPIES_FOLDER = "copies";
+
 /** How long a segment is meant to be. */
 export const SEGMENT_TARGET_S = 6;
 /** The shortest last segment. */
@@ -112,12 +115,22 @@ export function cpuTonemap(hdr: "pq" | "hlg"): string {
     "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
 }
 
+/** The film as one MP4 instead of segments (copies.ts): where it goes, what it
+ *  may cost, and how many threads a CPU encode may take. */
+export interface WholeFile {
+  path: string;
+  limits: { bitRate: number; maxRate: number; audioRate: number };
+  threads?: number;
+}
+
 /** ffmpeg's arguments for a run that starts at segment `from`. `gpu`: the
  *  picture is encoded on the GPU (hardware.ts), and decoded there too when
  *  it says so; null keeps it all on the CPU. */
-export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null): string[] {
+export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null): string[] {
   const { info, delivery } = plan;
   const args = ["-hide_banner", "-nostdin", "-v", "error", "-y"];
+  // A whole file says how far it is on its standard output, for whoever waits.
+  if (whole) args.push("-nostats", "-progress", "pipe:1");
   const gpu = delivery.videoCopy || !info.video ? null : gpuRun;
   if (gpu) {
     args.push(...deviceArgs(gpu.device));
@@ -128,11 +141,12 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   // asked: just past the cut, so never the one before it.
   const offset = plan.starts[from] - info.start;
   if (from > 0) args.push("-ss", (offset + (delivery.videoCopy ? 0.05 : 0)).toFixed(3));
-  args.push("-i", plan.file, "-copyts", "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn");
+  // Segments keep the file's own clock, so runs line up; a whole file starts at zero.
+  args.push("-i", plan.file, ...(whole ? [] : ["-copyts"]), "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn");
   const burn = info.video ? delivery.burn : null;
   // The rung asked, else the tallest a conversion makes; and what it may cost.
   const maxHeight = delivery.rung ?? MAX_HEIGHT;
-  const limits = RUNG_LIMITS[delivery.rung ?? 1080];
+  const limits = whole?.limits ?? RUNG_LIMITS[delivery.rung ?? 1080];
   const shrink = info.video !== null && info.video.height > maxHeight;
   // The GPU's scaler takes no "keep the shape" width: worked out here, even.
   const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * maxHeight) / info.video.height / 2) * 2) : 0;
@@ -178,14 +192,15 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
         : `${shrink ? `scale=-2:${maxHeight},` : ""}${cpuTone ? `${cpuTone},` : ""}format=nv12,hwupload`);
     }
     args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", rate(limits.bitRate), "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2), "-profile:v", "high");
-    args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
+    if (!whole) args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   } else {
     args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2),
       "-profile:v", "high", "-pix_fmt", "yuv420p");
     const filters = [shrink ? `scale=-2:${maxHeight}` : null, cpuTone].filter(Boolean);
     if (filters.length > 0 && !burn) args.push("-vf", filters.join(","));
     // A keyframe on every cut, so every segment starts on one.
-    args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
+    if (!whole) args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
+    if (whole?.threads) args.push("-threads", String(whole.threads));
   }
   if (delivery.audio) {
     if (delivery.audioCopy) args.push("-c:a", "copy");
@@ -195,6 +210,12 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
     // (Media3, the TV app) would then show the whole film that far behind. A picture
     // that is copied too has to keep its keyframe, and starts on the cut anyway.
     if (delivery.audioCopy && !delivery.videoCopy) args.push("-copypriorss", "0");
+  }
+
+  // One file, its index at the front so a player can start before it has it all.
+  if (whole) {
+    args.push("-max_muxing_queue_size", "2048", "-movflags", "+faststart", "-f", "mp4", whole.path);
+    return args;
   }
 
   // The segment muxer's split points count from the run's first timestamp; a
@@ -316,7 +337,10 @@ const personOf = (key: string) => key.slice(0, key.lastIndexOf(":"));
 export function prepareRoot(root: string, log: Pick<HlsLog, "warn">): string | null {
   try {
     fs.mkdirSync(root, { recursive: true });
-    for (const entry of fs.readdirSync(root)) fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+    // Not the copies kept for download (copies.ts), which outlive a restart.
+    for (const entry of fs.readdirSync(root)) {
+      if (entry !== COPIES_FOLDER) fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+    }
     fs.rmdirSync(fs.mkdtempSync(path.join(root, "check-")));
     return root;
   } catch (err) {

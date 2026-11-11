@@ -4,6 +4,7 @@
 import { z } from "zod";
 import type { Db } from "./db.js";
 import { DEFAULT_CONVERSION, type ConversionSettings } from "./hls.js";
+import { DEFAULT_COPIES, copySettingsSchema, type CopySettings } from "./copies.js";
 
 export const conversionSchema = z.object({
   memoryPerViewerMb: z.number().int().min(0).max(16_384),
@@ -33,6 +34,22 @@ function save(db: Db, key: string, value: unknown): void {
   db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`)
     .run(key, JSON.stringify(value));
+}
+
+// Copies kept for download (copies.ts): how much room they may take together.
+const COPIES_KEY = "copies";
+
+export function readCopies(db: Db): CopySettings {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(COPIES_KEY) as { value: string } | undefined;
+  try {
+    return row ? copySettingsSchema.parse({ ...DEFAULT_COPIES, ...(JSON.parse(row.value) as object) }) : { ...DEFAULT_COPIES };
+  } catch {
+    return { ...DEFAULT_COPIES };
+  }
+}
+
+export function saveCopies(db: Db, settings: CopySettings): void {
+  save(db, COPIES_KEY, settings);
 }
 
 // Finding intros, recaps and credits by itself (detect.ts): on unless the admin

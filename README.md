@@ -46,6 +46,8 @@ together are grouped into sets, from the .nfo files or TMDB's collections.
 | `GET /video/api/hls/:id/t<track>/index.m3u8`, `/:n.ts` | signed | the film as HLS with that sound track, its segments cut as they are asked for |
 | `DELETE /video/api/hls/:id` | signed | the player has gone: stop converting |
 | `PUT /video/api/progress/:id` | signed | `{ position, duration, watched? }` — this person's place in it |
+| `GET`, `PUT /video/api/copies/:id` | signed | `quality` (and `audio`): a smaller MP4 of a film or episode for download — how it stands, or ask for it to be made; `GET …/file` is the finished copy, with byte ranges |
+| `GET`, `PUT`, `DELETE /video/api/admin/copies` | admin | the copies kept, the room they may take (`limitGb`), and clearing them |
 | `PUT /video/api/watched/:kind/:id` | signed | `{ watched, season? }` — a whole show (`shows`), one season of it, or a film with every part (`movies`), marked watched or never seen for this person; answers `{ marked }` |
 | `GET /video/api/continue` | signed | left halfway, and the next episode of a show, newest first |
 | `GET /video/api/admin/libraries` | admin | every library with counts and scan state |
