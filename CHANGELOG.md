@@ -3,6 +3,12 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.34.0 — Off the row, and new again
+
+- **Take something off Continue watching.** `DELETE /video/api/continue/:id` takes a show (asked by any of its episodes) or a film (every part of it) off the row for the person asking, so isputnik.home 4.86 can offer **Remove from Continue watching** on each card. Nothing is forgotten: the place in it stays, and playing it again, or marking it watched or unwatched, brings it back. Before, a film abandoned halfway or a show nobody meant to go on with stayed on the row for good.
+- **Every film and show card says when it came** (`addedAt`), so home can keep **Recently added** to the last weeks instead of calling a years-old title new just because nothing came after it.
+- **A new season makes a show new again.** A show is now dated by the later of when it was first found and when the scan last found an episode it didn't have, so it moves back to the top of Recently added. A file renamed or moved to another folder, with the same season and episode number, doesn't count. Episodes found before this version don't count either: only those the scan finds from now on.
+
 ## 0.33.0 — Copies prepared for download
 
 - **A download optimized for a phone or tablet is now prepared here, on a queue.** isputnik.home 4.82 asks for a smaller copy of a film or episode (480p, 720p or 1080p); the engine makes it as one MP4 and the device fetches the finished file at full speed. Before, the film was converted while the phone waited on the connection, which was slow and loaded the server for as long as the download took.
