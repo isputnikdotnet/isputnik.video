@@ -8,7 +8,7 @@ import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { WATCH_STATES, getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries, type WatchState } from "./catalog.js";
-import { browserPlayability, continueWatching, fileOf, findItem, forgetHistory, markAllWatched, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { browserPlayability, continueWatching, dismissContinue, fileOf, findItem, forgetHistory, markAllWatched, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { RUNGS, decideDelivery, rungOf, type Delivery, type DeliveryMode, type DeliveryReason, type Rung } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
@@ -1068,6 +1068,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.get(`${API}/continue`, { preHandler: requireIdentity }, async (request) => {
     const { limit } = continueQuerySchema.parse(request.query ?? {});
     return { items: continueWatching(db, request.identity!, limit) };
+  });
+
+  // "Remove from Continue watching": the show or film this item belongs to leaves
+  // the row for the person asking, with their place in it kept.
+  app.delete(`${API}/continue/:id`, { preHandler: requireIdentity }, async (request, reply) => {
+    const identity = request.identity!;
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    if (!item) return reply.code(404).send({ error: "Not found" });
+    return { removed: dismissContinue(db, identity.historyId, item) };
   });
 
   // ── Libraries, as home manages them (home's server calls these) ─────────

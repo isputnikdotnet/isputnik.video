@@ -93,7 +93,9 @@ const ADDED_COLUMNS: [table: string, column: string, definition: string][] = [
   ["title_edits", "no_set", "INTEGER NOT NULL DEFAULT 0"],
   ["title_edits", "auto_set_name", "TEXT"],
   ["title_edits", "auto_set_tmdb_id", "TEXT"],
-  ["title_edits", "auto_set_order", "INTEGER"]
+  ["title_edits", "auto_set_order", "INTEGER"],
+  ["progress", "dismissed", "INTEGER NOT NULL DEFAULT 0"],
+  ["shows", "new_episode_at", "TEXT"]
 ];
 
 const hasTable = (db: Database.Database, table: string) =>

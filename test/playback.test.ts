@@ -193,6 +193,30 @@ describe("continue watching", () => {
     expect((await app.inject({ method: "DELETE", url: "/video/api/admin/history/profiles/kidsProfile", headers: as("mum") })).statusCode).toBe(403);
   });
 
+  it("takes a show or a film off by hand, keeping the place, until it is played again", async () => {
+    const some = films.find((film) => film.title === "Some Film")!;
+    const ids = async (who = "mum") => (await get("/video/api/continue", as(who))).json().items.map((item: { id: string }) => item.id);
+    await saveProgress(episode(1).id, { position: 2400, duration: 2400 });
+    await saveProgress(some.id, { position: 1200, duration: 6700 });
+    await saveProgress(some.id, { position: 1200, duration: 6700 }, "dad");
+    expect(await ids()).toEqual([some.id, episode(2).id]);
+
+    // The show's next episode has no history of its own: the show goes all the same.
+    const removed = await app.inject({ method: "DELETE", url: `/video/api/continue/${episode(2).id}`, headers: as("mum") });
+    expect(removed.statusCode).toBe(200);
+    expect(await ids()).toEqual([some.id]);
+    await app.inject({ method: "DELETE", url: `/video/api/continue/${some.id}`, headers: as("mum") });
+    expect(await ids()).toEqual([]);
+    // Only for the person asking, and the place stays.
+    expect(await ids("dad")).toEqual([some.id]);
+    expect((await get(`/video/api/movies/${some.id}`, as("mum"))).json().progress).toMatchObject({ position: 1200 });
+
+    // Playing it again brings it back.
+    await saveProgress(episode(2).id, { position: 300, duration: 2400 });
+    expect(await ids()).toEqual([episode(2).id]);
+    expect((await app.inject({ method: "DELETE", url: "/video/api/continue/nope", headers: as("mum") })).statusCode).toBe(404);
+  });
+
   it("drops a show once its last episode is watched", async () => {
     for (const n of [1, 2, 3]) await saveProgress(episode(n).id, { position: 2400, duration: 2400 });
     expect((await get("/video/api/continue", as("mum"))).json().items).toEqual([]);

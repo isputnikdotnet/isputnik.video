@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS shows (
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   -- When the scan first found it: what "Recently added" sorts by, shows and films alike.
   added_at      TEXT,
+  -- When the scan last found an episode the show didn't have (a number new to it,
+  -- not a file renamed): a new season makes the show recently added again.
+  new_episode_at TEXT,
   UNIQUE (library_id, folder)
 );
 CREATE INDEX IF NOT EXISTS shows_added ON shows (added_at DESC);
@@ -129,6 +132,8 @@ CREATE TABLE IF NOT EXISTS progress (
   duration_s  REAL,
   watched     INTEGER NOT NULL DEFAULT 0,
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  -- Taken off Continue watching by hand; playing or marking it again brings it back.
+  dismissed   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user_id, item_id)
 );
 CREATE INDEX IF NOT EXISTS progress_recent ON progress (user_id, updated_at DESC);

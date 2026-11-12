@@ -50,6 +50,7 @@ interface ProgressRow {
   duration_s: number | null;
   watched: number;
   updated_at: string;
+  dismissed: number;
 }
 
 const toProgress = (row: ProgressRow): Progress => ({
@@ -275,7 +276,8 @@ export function saveProgress(
       position_s = excluded.position_s,
       duration_s = COALESCE(excluded.duration_s, progress.duration_s),
       watched = excluded.watched,
-      updated_at = excluded.updated_at
+      updated_at = excluded.updated_at,
+      dismissed = 0
   `).run(userId, item.id, item.type, position, duration, watched ? 1 : 0);
   return progressFor(db, userId, [item.id]).get(item.id)!;
 }
@@ -310,7 +312,8 @@ export function markAllWatched(
       position_s = COALESCE(progress.duration_s, excluded.duration_s, 0),
       duration_s = COALESCE(progress.duration_s, excluded.duration_s),
       watched = 1,
-      updated_at = excluded.updated_at
+      updated_at = excluded.updated_at,
+      dismissed = 0
   `);
   const now = Date.now();
   db.transaction(() => {
@@ -372,6 +375,7 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
       if (item.movieId) {
         if (films.has(item.movieId)) continue;
         films.add(item.movieId);
+        if (row.dismissed) continue;
         const next = progress.watched ? nextPart(db, item) : null;
         const nextItem = next ? findItem(db, identity, next.id) : null;
         if (nextItem) {
@@ -381,13 +385,15 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
           continue;
         }
       }
-      if (progress.watched || progress.position < RESUME_MIN_S) continue;
+      if (row.dismissed || progress.watched || progress.position < RESUME_MIN_S) continue;
       out.push({ ...entryOf(item), position: progress.position, duration: progress.duration, resume: true, updatedAt: progress.updatedAt });
       continue;
     }
     // A show counts once, by the episode watched most recently.
     if (shows.has(item.show!.id)) continue;
     shows.add(item.show!.id);
+    // Taken off by hand: the show stays off until something of it is played again.
+    if (row.dismissed) continue;
     if (!progress.watched) {
       if (progress.position < RESUME_MIN_S) continue;
       out.push({ ...entryOf(item), position: progress.position, duration: progress.duration, resume: true, updatedAt: progress.updatedAt });
@@ -401,6 +407,20 @@ export function continueWatching(db: Db, identity: Identity, limit: number): Con
     out.push({ ...entryOf(nextItem), position, duration: nextProgress?.duration ?? null, resume: position > 0, updatedAt: progress.updatedAt });
   }
   return out;
+}
+
+/** Takes what Continue watching shows for this item off it, for one person: the
+ *  whole show for an episode, every part for a film. Nothing is forgotten — the
+ *  place in it stays, and playing or marking any of it again brings it back.
+ *  Answers how many rows of history it touched. */
+export function dismissContinue(db: Db, userId: string, item: PlayableItem): number {
+  if (item.show) {
+    return db.prepare("UPDATE progress SET dismissed = 1 WHERE user_id = ? AND item_id IN (SELECT id FROM episodes WHERE show_id = ?)")
+      .run(userId, item.show.id).changes;
+  }
+  const movieId = movieIdOf(db, item.id);
+  return db.prepare("UPDATE progress SET dismissed = 1 WHERE user_id = ? AND (item_id = ? OR item_id IN (SELECT id FROM movie_parts WHERE movie_id = ?))")
+    .run(userId, movieId, movieId).changes;
 }
 
 function entryOf(item: PlayableItem) {

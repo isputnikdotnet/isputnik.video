@@ -107,11 +107,17 @@ export function visibleLibraries(db: Db, identity: Identity, kind?: "shows" | "m
   return rows.filter((row) => canSee(identity, row.id));
 }
 
-const ORDER: Record<ListQuery["sort"], string> = {
+/** When a title came: a film when it was found, a show when it was found or when
+ *  its newest episode was, whichever is later. */
+const ADDED: Record<"shows" | "movies", string> = {
+  shows: "MAX(added_at, COALESCE(new_episode_at, added_at))",
+  movies: "added_at"
+};
+const order = (table: "shows" | "movies"): Record<ListQuery["sort"], string> => ({
   title: "sort_title COLLATE NOCASE, year",
   year: "year DESC, sort_title COLLATE NOCASE",
-  added: "added_at DESC, rowid DESC"
-};
+  added: `${ADDED[table]} DESC, rowid DESC`
+});
 /** The same over films and shows together, where rowid means nothing across tables. */
 const TITLE_ORDER: Record<ListQuery["sort"], string> = {
   title: "sort_title COLLATE NOCASE, year, kind",
@@ -196,14 +202,14 @@ function page<T>(db: Db, table: "shows" | "movies", columns: string, libraries: 
   if (libraries.length === 0) return { items: [] as T[], total: 0, page: 1, pageSize: query.pageSize };
   const filter = where(db, table, libraries, query.q, query.genre ? [query.genre] : []);
   const total = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${filter.sql}`).get(...filter.params) as { n: number }).n;
-  const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE ${filter.sql} ORDER BY ${ORDER[query.sort]} LIMIT ? OFFSET ?`)
+  const rows = db.prepare(`SELECT ${columns} FROM ${table} WHERE ${filter.sql} ORDER BY ${order(table)[query.sort]} LIMIT ? OFFSET ?`)
     .all(...filter.params, query.pageSize, (query.page - 1) * query.pageSize) as Record<string, unknown>[];
   const meta = metaFor(db, rows.map((row) => row.id as string));
   return { items: rows.map((row) => map(row, meta.get(row.id as string))), total, page: query.page, pageSize: query.pageSize };
 }
 
 const SHOW_COLUMNS = `
-  id, library_id, title, year, imdb_id, ${effectiveGenres("shows")} AS genres,
+  id, library_id, title, year, imdb_id, ${ADDED.shows} AS added_at, ${effectiveGenres("shows")} AS genres,
   (SELECT COUNT(DISTINCT season) FROM episodes WHERE show_id = shows.id) AS seasons,
   (SELECT COUNT(*) FROM episodes WHERE show_id = shows.id) AS episodes
 `;
@@ -213,19 +219,23 @@ const showCard = (row: Record<string, unknown>, meta: MetaRow | undefined) => ({
   title: row.title as string,
   year: filled(row.year as number | null, meta?.year),
   imdbId: (row.imdb_id as string | null) ?? null,
+  /** When it came, or its newest episode did: home keeps "Recently added" to the last weeks. */
+  addedAt: (row.added_at as string | null) ?? null,
   genres: parseGenres(row.genres),
   seasons: row.seasons as number,
   episodes: row.episodes as number,
   ...art(meta)
 });
 
-const MOVIE_COLUMNS = `id, library_id, title, year, imdb_id, ${effectiveGenres("movies")} AS genres, runtime_minutes`;
+const MOVIE_COLUMNS = `id, library_id, title, year, imdb_id, added_at, ${effectiveGenres("movies")} AS genres, runtime_minutes`;
 const movieCard = (row: Record<string, unknown>, meta: MetaRow | undefined) => ({
   id: row.id as string,
   libraryId: row.library_id as string,
   title: row.title as string,
   year: filled(row.year as number | null, meta?.year),
   imdbId: (row.imdb_id as string | null) ?? null,
+  /** When the scan first found it: home keeps "Recently added" to the last weeks. */
+  addedAt: (row.added_at as string | null) ?? null,
   genres: parseGenres(row.genres),
   runtimeMinutes: (row.runtime_minutes as number | null) ?? null,
   ...art(meta)
@@ -259,7 +269,7 @@ export function listTitles(db: Db, identity: Identity, query: TitleQuery) {
         .filter((id) => query.libraries.length === 0 || query.libraries.includes(id));
       if (libraries.length === 0) return [];
       const filter = where(db, kind, libraries, query.q, query.genres, query.watch?.length ? { states: query.watch, userId: identity.historyId } : null);
-      return [{ sql: `SELECT '${kind}' AS kind, id, sort_title, year, added_at, rowid AS rid FROM ${kind} WHERE ${filter.sql}`, params: filter.params }];
+      return [{ sql: `SELECT '${kind}' AS kind, id, sort_title, year, ${ADDED[kind]} AS added_at, rowid AS rid FROM ${kind} WHERE ${filter.sql}`, params: filter.params }];
     });
   // `watch`: every card says where this person is in it, and ?watch= narrows by it
   // (engine 0.32+); home offers neither to an engine that doesn't say so.

@@ -82,6 +82,38 @@ describe("films and shows in one list", () => {
     const page = await titles("?sort=added");
     expect(names(page)[0]).toBe("shows:Paper Rockets");
     expect(page.total).toBe(5);
+    // Each card says when it came, newest first: home keeps "Recently added" to recent weeks.
+    const dates = (page.items as { addedAt: string | null }[]).map((item) => item.addedAt);
+    expect(dates.every((date) => typeof date === "string" && !Number.isNaN(Date.parse(date)))).toBe(true);
+    expect([...dates].sort().reverse()).toEqual(dates);
+  });
+
+  it("brings a show back to the top when an episode it didn't have arrives, not when a file is renamed", async () => {
+    const radar = "Shows/Radar (2026) [imdbid-tt33022834]/Season 01";
+    const rescan = async () => {
+      await app.inject({ method: "POST", url: "/video/api/admin/libraries/lib_tv/scan", headers: home });
+      await app.scansSettled();
+    };
+    const first = async () => (await titles("?sort=added")).items[0] as Title & { addedAt: string };
+    // The films' library was scanned after the shows'.
+    expect((await first()).kind).toBe("movies");
+
+    // The same episode under another name: nothing new to watch.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    fixture.remove(`${radar}/Radar (2026) S01E01 - Серия 1.mkv`);
+    fixture.remove(`${radar}/Radar (2026) S01E01 - Серия 1.nfo`);
+    fixture.write(`${radar}/Radar.2026.S01E01.mkv`);
+    await rescan();
+    expect((await first()).kind).toBe("movies");
+
+    // A new episode: the show is recently added again, and its card says when.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    fixture.write(`${radar}/Radar (2026) S01E04 - Серия 4.mkv`);
+    await rescan();
+    const top = await first();
+    expect(top).toMatchObject({ kind: "shows", title: "Радар" });
+    expect(Date.now() - Date.parse(top.addedAt)).toBeLessThan(60_000);
+    expect(names(await titles("?kind=shows&sort=added"))[0]).toBe("shows:Радар");
   });
 
   it("narrows to any of some libraries, and any of some genres", async () => {

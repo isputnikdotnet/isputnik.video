@@ -220,6 +220,8 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
     WHERE id = @id
   `);
   const findEpisode = db.prepare("SELECT id FROM episodes WHERE show_id = ? AND file = ?");
+  const hasNumber = db.prepare("SELECT 1 FROM episodes WHERE show_id = ? AND season = ? AND episode = ?");
+  const newEpisode = db.prepare("UPDATE shows SET new_episode_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?");
   const upsertEpisode = db.prepare(`
     INSERT INTO episodes (id, show_id, season, episode, file, title, plot, aired, runtime_minutes, size_bytes, modified_at)
     VALUES (@id, @show, @season, @episode, @file, @title, @plot, @aired, @runtime, @size, @modifiedAt)
@@ -282,6 +284,8 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
           continue;
         }
         const known = findEpisode.get(row.id, relative) as { id: string } | undefined;
+        // An episode this show didn't have, in a show already here: it is new again.
+        if (existing && !known && !hasNumber.get(row.id, season, episode)) newEpisode.run(row.id);
         upsertEpisode.run({
           id: known?.id ?? newId(),
           show: row.id,
