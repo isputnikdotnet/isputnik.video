@@ -3,6 +3,11 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.36.0 — Big films start sooner
+
+- **The first play of a big MKV no longer waits for the whole file to be read.** A film whose picture is sent as it is can only be cut where its keyframes are, and the engine used to find them by reading every byte of the file. On a 30 GB Blu-ray rip on an array disk that took several minutes (longer than the player waited), so the film sat on "Getting it ready…" or failed to start the first time. The keyframes now come from the file's own index, checking each one the way ffmpeg does, since MakeMKV and mkvmerge mark more frames than ffmpeg can cut on: seconds instead of minutes. A file whose index won't do is read as before.
+- **Keyframes are read ahead.** After each scan and when the engine starts, it reads the keyframes of the titles that will need them, one file at a time and never starting a new one while someone is watching, so even a file that has to be read whole is ready before anyone presses Play.
+
 ## 0.35.0 — Memory first, one cache, kept ready
 
 - **Converted video stays out of the container.** The engine now checks whether `/transcode` is a disk mapped into the container. If it isn't (the Unraid template's Transcode path left empty), video is converted in memory only and no copies for download are prepared there, so nothing fills `docker.img`. With a disk, the admin picks memory only, memory then the disk (the default), or the disk only, and one memory limit is shared by everyone watching (a tenth of the server's memory, at most 1 GB, to start with). isputnik.home 4.88 shows the disk and its free space on Settings › Video › Converting video. Older homes keep working with their memory-per-viewer setting.
