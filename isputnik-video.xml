@@ -39,7 +39,11 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 
   <Date>1794571200</Date>
   <Changes>
-### 2026.11.13 — 0.36.0 Big films start sooner
+### 2026.11.13 — 0.36.1 Released for real
+- **0.35.0 and 0.36.0 reach the image at last.** Neither was published: the tests that run before the image is built failed, because the ffmpeg they used (a separate build, not the one the image ships) crashed whenever it put an MPEG-TS video into an MP4, which is how a copy for download is finished. The tests now use the same kind of ffmpeg as the image. This release carries everything in 0.35.0 (converting in memory unless /transcode is a disk, one shared conversion, films kept once converted, Keep ready) and 0.36.0 (big films start sooner).
+- **A copy for download is put together from one stream.** Its kept pieces are now handed to ffmpeg one after another rather than through a list file: simpler, and nothing left behind if it stops.
+
+### 2026.11.12 — 0.36.0 Big films start sooner
 - **The first play of a big MKV no longer waits for the whole file to be read.** A film whose picture is sent as it is can only be cut where its keyframes are, and the engine used to find them by reading every byte of the file. On a 30 GB Blu-ray rip on an array disk that took several minutes (longer than the player waited), so the film sat on "Getting it ready…" or failed to start the first time. The keyframes now come from the file's own index, checking each one the way ffmpeg does, since MakeMKV and mkvmerge mark more frames than ffmpeg can cut on: seconds instead of minutes. A file whose index won't do is read as before.
 - **Keyframes are read ahead.** After each scan and when the engine starts, it reads the keyframes of the titles that will need them, one file at a time and never starting a new one while someone is watching, so even a file that has to be read whole is ready before anyone presses Play.
 
@@ -62,12 +66,6 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 - **Kept for the next person.** A copy made once serves everyone who may see that title. Together they stay under a size set in home's Settings → Video → **Copies for download** (20 GB to start with); past it, the ones used longest ago go. A copy of a file that has changed since is made again.
 - **Where they are kept:** in a `copies` folder inside `/transcode` when that is mapped, otherwise beside the catalog. Map `/transcode` to a disk with room for them. The conversion folder is still emptied on start, but no longer the copies in it.
 - A 1080p copy is held to about 2.5 GB for a two-hour film, lower than a 1080p stream; 720p is about 1.4 GB and 480p about 0.7 GB.
-
-### 2026.11.10 — 0.32.0 What you have watched
-- **Every card says where you are in it.** The lists isputnik.home draws its posters from now carry, for the person asking, a film's place (a film in several files counting as one) and a show's count of episodes seen, so home 4.81 can draw a bar on a film left part-way, a check on a finished one and "8 unwatched" on a show, without a request per poster.
-- **A list narrows by it.** `/titles?watch=` takes unwatched, progress and watched, any of them: home's new Watched filter. A show counts as watched only once every episode is, so a new episode brings it back.
-- **A whole show, a season or a film is marked in one call.** `PUT /video/api/watched/:kind/:id` marks every episode of a show, or of one season, or every part of a film, watched or never seen, for the person asking. Marked watched, what follows them is next: seasons 1 to 3 make season 4's first episode next up. Marked unwatched, their history goes and nothing is left to resume. Before, only one episode or film could be marked at a time.
-- Each person's marks, and each viewing profile's, stay their own, as progress always was.
   </Changes>
 
   <Requires>Needs the isputnik (isputnik.home) container, version 4.38 or newer, installed on the same server. The engine is reached only through it.</Requires>

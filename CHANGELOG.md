@@ -3,6 +3,11 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.36.1 — Released for real
+
+- **0.35.0 and 0.36.0 reach the image at last.** Neither was published: the tests that run before the image is built failed, because the ffmpeg they used (a separate build, not the one the image ships) crashed whenever it put an MPEG-TS video into an MP4, which is how a copy for download is finished. The tests now use the same kind of ffmpeg as the image. This release carries everything in 0.35.0 (converting in memory unless /transcode is a disk, one shared conversion, films kept once converted, Keep ready) and 0.36.0 (big films start sooner).
+- **A copy for download is put together from one stream.** Its kept pieces are now handed to ffmpeg one after another rather than through a list file: simpler, and nothing left behind if it stops.
+
 ## 0.36.0 — Big films start sooner
 
 - **The first play of a big MKV no longer waits for the whole file to be read.** A film whose picture is sent as it is can only be cut where its keyframes are, and the engine used to find them by reading every byte of the file. On a 30 GB Blu-ray rip on an array disk that took several minutes (longer than the player waited), so the film sat on "Getting it ready…" or failed to start the first time. The keyframes now come from the file's own index, checking each one the way ffmpeg does, since MakeMKV and mkvmerge mark more frames than ffmpeg can cut on: seconds instead of minutes. A file whose index won't do is read as before.

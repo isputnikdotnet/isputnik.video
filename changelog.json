@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.36.1",
+    "label": "Released for real",
+    "changes": [
+      "**0.35.0 and 0.36.0 reach the image at last.** Neither was published: the tests that run before the image is built failed, because the ffmpeg they used (a separate build, not the one the image ships) crashed whenever it put an MPEG-TS video into an MP4, which is how a copy for download is finished. The tests now use the same kind of ffmpeg as the image. This release carries everything in 0.35.0 (converting in memory unless /transcode is a disk, one shared conversion, films kept once converted, Keep ready) and 0.36.0 (big films start sooner).",
+      "**A copy for download is put together from one stream.** Its kept pieces are now handed to ffmpeg one after another rather than through a list file: simpler, and nothing left behind if it stops."
+    ]
+  },
+  {
     "version": "0.36.0",
     "label": "Big films start sooner",
     "changes": [
