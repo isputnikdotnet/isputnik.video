@@ -3,6 +3,11 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.37.1 — Posters past a sleeping disk
+
+- **Scrolling past posters no longer waits on a sleeping disk.** A poster or backdrop kept beside a film was looked up in a way that held the whole engine, so a page of posters from a disk that had spun down stopped everyone, people watching something else included, until it was up again. It is now looked up without holding anything, as the films themselves have been since 0.37.0.
+- **A poster taken away from beside its film is simply not there.** One removed after the engine had found it answered with an error; it now answers that there is no such picture.
+
 ## 0.37.0 — Answers through every scan
 
 - **The engine keeps answering while it scans.** A scan read the whole library in one go and nothing else got a turn until it finished: on a big library on a NAS share that was minutes with no health check, no page and no video, and the container showed as unhealthy. The disk is now read a little at a time between other work, and the catalog written from it in one short step. A library a stop left marked as queued or scanning is set back on start.

@@ -39,7 +39,11 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 
   <Date>1794571200</Date>
   <Changes>
-### 2026.11.13 — 0.37.0 Answers through every scan
+### 2026.11.13 — 0.37.1 Posters past a sleeping disk
+- **Scrolling past posters no longer waits on a sleeping disk.** A poster or backdrop kept beside a film was looked up in a way that held the whole engine, so a page of posters from a disk that had spun down stopped everyone, people watching something else included, until it was up again. It is now looked up without holding anything, as the films themselves have been since 0.37.0.
+- **A poster taken away from beside its film is simply not there.** One removed after the engine had found it answered with an error; it now answers that there is no such picture.
+
+### 2026.11.12 — 0.37.0 Answers through every scan
 - **The engine keeps answering while it scans.** A scan read the whole library in one go and nothing else got a turn until it finished: on a big library on a NAS share that was minutes with no health check, no page and no video, and the container showed as unhealthy. The disk is now read a little at a time between other work, and the catalog written from it in one short step. A library a stop left marked as queued or scanning is set back on start.
 - **No more minutes of silence after a scan.** The pass that looks for posters and TMDB details went over every title after every scan, rewrote each one even when nothing had changed, and worked its cast and crew out again from scratch. It now writes only what changed, works out the cast only of titles that got new people, lists each folder once, and lets other work in between titles. Scanning the cast of the whole catalog, which the scan did too, is now done only for titles added, removed or with another cast in their .nfo. On a test library of 2000 films the engine stopped answering for about 10 seconds per scan; now for well under one.
 - **A sleeping disk no longer stops everyone.** Finding a film's file, the subtitles beside it and its .edl waited on the disk in a way that held the whole engine: when the disk holding one film had spun down, people watching something else waited for it too. Those lookups now wait on their own. The folder picker in Add library, and finding intros and credits after a scan, do the same.
@@ -64,11 +68,6 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 - **Copies for download are made through the same cache.** A copy whose picture is re-encoded is made as the version a viewer would get, a stretch at a time and resumable, then put together into the MP4 in seconds. Copies asked for are carried on after a restart.
 - **Keep ready.** An admin can keep a film, a show or one season ready at 1080p, 720p or 480p (`/admin/keep-ready`): converted ahead of time in the background and never removed to make room. A show's new episodes follow unless asked not to.
 - **When downloads are prepared.** The queue runs right away, only when the server is idle, or only between two times at night, with a number of jobs at once and a limit on how many downloads one member may have waiting (`/admin/jobs`). Copies going to someone away from home can be held to a download speed so streaming keeps its share of the upload link.
-
-### 2026.11.11 — 0.34.0 Off the row, and new again
-- **Take something off Continue watching.** `DELETE /video/api/continue/:id` takes a show (asked by any of its episodes) or a film (every part of it) off the row for the person asking, so isputnik.home 4.86 can offer **Remove from Continue watching** on each card. Nothing is forgotten: the place in it stays, and playing it again, or marking it watched or unwatched, brings it back. Before, a film abandoned halfway or a show nobody meant to go on with stayed on the row for good.
-- **Every film and show card says when it came** (`addedAt`), so home can keep **Recently added** to the last weeks instead of calling a years-old title new just because nothing came after it.
-- **A new season makes a show new again.** A show is now dated by the later of when it was first found and when the scan last found an episode it didn't have, so it moves back to the top of Recently added. A file renamed or moved to another folder, with the same season and episode number, doesn't count. Episodes found before this version don't count either: only those the scan finds from now on.
   </Changes>
 
   <Requires>Needs the isputnik (isputnik.home) container, version 4.38 or newer, installed on the same server. The engine is reached only through it.</Requires>
