@@ -39,7 +39,11 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 
   <Date>1794571200</Date>
   <Changes>
-### 2026.11.13 — 0.37.1 Posters past a sleeping disk
+### 2026.11.13 — 0.38.0 Diagnostics for bug reports
+- **The engine reports on itself for a bug report.** Home's new Control panel › Infrastructure › Diagnostics page asks it for its version and machine, the ffmpeg it runs, what the GPU check found, its conversion settings, its libraries' counts and states, and the warnings and errors in its log. Home hides names, folders and addresses unless the admin asks to include them, and nothing leaves home unless the admin copies the report out. Needs isputnik.home 4.89.0 to be seen.
+- **The GPU's recent failures are kept with ffmpeg's own words.** The last ten, each with when it happened and whether it counted towards setting the GPU aside (a film without HDR mastering data doesn't). Before, only the count was kept, so a report of "the GPU isn't used" came with nothing to go on.
+
+### 2026.11.12 — 0.37.1 Posters past a sleeping disk
 - **Scrolling past posters no longer waits on a sleeping disk.** A poster or backdrop kept beside a film was looked up in a way that held the whole engine, so a page of posters from a disk that had spun down stopped everyone, people watching something else included, until it was up again. It is now looked up without holding anything, as the films themselves have been since 0.37.0.
 - **A poster taken away from beside its film is simply not there.** One removed after the engine had found it answered with an error; it now answers that there is no such picture.
 
@@ -60,14 +64,6 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 ### 2026.11.12 — 0.36.0 Big films start sooner
 - **The first play of a big MKV no longer waits for the whole file to be read.** A film whose picture is sent as it is can only be cut where its keyframes are, and the engine used to find them by reading every byte of the file. On a 30 GB Blu-ray rip on an array disk that took several minutes (longer than the player waited), so the film sat on "Getting it ready…" or failed to start the first time. The keyframes now come from the file's own index, checking each one the way ffmpeg does, since MakeMKV and mkvmerge mark more frames than ffmpeg can cut on: seconds instead of minutes. A file whose index won't do is read as before.
 - **Keyframes are read ahead.** After each scan and when the engine starts, it reads the keyframes of the titles that will need them, one file at a time and never starting a new one while someone is watching, so even a file that has to be read whole is ready before anyone presses Play.
-
-### 2026.11.12 — 0.35.0 Memory first, one cache, kept ready
-- **Converted video stays out of the container.** The engine now checks whether `/transcode` is a disk mapped into the container. If it isn't (the Unraid template's Transcode path left empty), video is converted in memory only and no copies for download are prepared there, so nothing fills `docker.img`. With a disk, the admin picks memory only, memory then the disk (the default), or the disk only, and one memory limit is shared by everyone watching (a tenth of the server's memory, at most 1 GB, to start with). isputnik.home 4.88 shows the disk and its free space on Settings › Video › Converting video. Older homes keep working with their memory-per-viewer setting.
-- **One conversion per version, shared.** Two people watching the same film at the same quality and sound track now share one conversion instead of making it twice, and joining a film someone is already watching takes no place from the household's limit.
-- **Films kept once converted all the way through.** With a disk, a film whose picture had to be re-encoded is kept once someone has watched it to the end, so it plays next time with nothing converted, also after a restart. A film left at 70% or more is finished off in the background so it is kept too. Kept films and copies for download share one limit (Room for kept video, 50 GB to start with); the ones used longest ago go first.
-- **Copies for download are made through the same cache.** A copy whose picture is re-encoded is made as the version a viewer would get, a stretch at a time and resumable, then put together into the MP4 in seconds. Copies asked for are carried on after a restart.
-- **Keep ready.** An admin can keep a film, a show or one season ready at 1080p, 720p or 480p (`/admin/keep-ready`): converted ahead of time in the background and never removed to make room. A show's new episodes follow unless asked not to.
-- **When downloads are prepared.** The queue runs right away, only when the server is idle, or only between two times at night, with a number of jobs at once and a limit on how many downloads one member may have waiting (`/admin/jobs`). Copies going to someone away from home can be held to a download speed so streaming keeps its share of the upload link.
   </Changes>
 
   <Requires>Needs the isputnik (isputnik.home) container, version 4.38 or newer, installed on the same server. The engine is reached only through it.</Requires>

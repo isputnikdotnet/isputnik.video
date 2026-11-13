@@ -3,6 +3,11 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.38.0 — Diagnostics for bug reports
+
+- **The engine reports on itself for a bug report.** Home's new Control panel › Infrastructure › Diagnostics page asks it for its version and machine, the ffmpeg it runs, what the GPU check found, its conversion settings, its libraries' counts and states, and the warnings and errors in its log. Home hides names, folders and addresses unless the admin asks to include them, and nothing leaves home unless the admin copies the report out. Needs isputnik.home 4.89.0 to be seen.
+- **The GPU's recent failures are kept with ffmpeg's own words.** The last ten, each with when it happened and whether it counted towards setting the GPU aside (a film without HDR mastering data doesn't). Before, only the count was kept, so a report of "the GPU isn't used" came with nothing to go on.
+
 ## 0.37.1 — Posters past a sleeping disk
 
 - **Scrolling past posters no longer waits on a sleeping disk.** A poster or backdrop kept beside a film was looked up in a way that held the whole engine, so a page of posters from a disk that had spun down stopped everyone, people watching something else included, until it was up again. It is now looked up without holding anything, as the films themselves have been since 0.37.0.
