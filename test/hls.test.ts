@@ -446,12 +446,24 @@ describe("real segments", () => {
 
   const adminHeaders = { ...headers, "x-isputnik-user-id": "admin", "x-isputnik-user-role": "admin" };
   const conversion = async () => (await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers: adminHeaders })).json();
+  /** The conversion's state once `ready` holds: the run carries on past the segment
+   *  asked for, and each new one sits on the disk until it is read into memory, so a
+   *  single look can land in between (it failed the v0.38.0 image build that way). */
+  const conversionOnce = async (ready: (state: Awaited<ReturnType<typeof conversion>>) => boolean) => {
+    const until = Date.now() + 10_000;
+    let state = await conversion();
+    while (!ready(state) && Date.now() < until) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      state = await conversion();
+    }
+    return state;
+  };
   const setConversion = (payload: object) => app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers: adminHeaders, payload });
 
   it("keeps finished segments in memory, and on the disk when the admin gives none", async () => {
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
-    let state = await conversion();
+    let state = await conversionOnce((now) => now.usage.diskBytes === 0);
     expect(state.settings).toMatchObject({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3, hardware: "auto", remoteQuality: 720 });
     expect(state.disk).toMatchObject({ mapped: true });
     expect(state.storage).toBe("memory-disk");
@@ -464,7 +476,7 @@ describe("real segments", () => {
     const segment = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers });
     expect(segment.statusCode).toBe(200);
     expect(Number(segment.headers["content-length"])).toBe(segment.rawPayload.length);
-    state = await conversion();
+    state = await conversionOnce((now) => now.usage.memoryBytes === 0);
     expect(state.usage.memoryBytes).toBe(0);
     expect(state.usage.diskBytes).toBeGreaterThan(0);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
