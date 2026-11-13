@@ -133,13 +133,15 @@ describe("one limit for everything kept", () => {
 
 const put = (url: string, body: unknown, who = "mum") => app.inject({ method: "PUT", url, headers: as(who), payload: body as Record<string, unknown> });
 
-/** Asks until `check` holds, or gives up. */
+/** Asks until `check` holds, or gives up — saying where things stood. */
 async function until(what: string, check: () => Promise<boolean>, tries = 600): Promise<void> {
   for (let n = 0; n < tries; n++) {
     if (await check()) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`Never ${what}`);
+  const jobs = (await get("/video/api/admin/jobs", "admin")).json();
+  const copies = (await get("/video/api/admin/copies", "admin")).json();
+  throw new Error(`Never ${what}: jobs ${JSON.stringify(jobs)}; copies ${JSON.stringify(copies)}; conversion ${JSON.stringify((await conversion()).usage)}`);
 }
 
 describe("jobs on the shared cache", () => {
