@@ -32,6 +32,13 @@ jobs:
       - name: Install
         run: npm ci
 
+      # The distribution's ffmpeg, as the image ships (Dockerfile: Debian's), not
+      # the ffmpeg-static npm build: its Linux binary (johnvansickle 7.0.2-static)
+      # crashes with SIGSEGV on every MPEG-TS → MP4 remux, which failed the
+      # download-copy tests and kept 0.35.0 and 0.36.0 from publishing.
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -39,4 +46,7 @@ jobs:
         run: npm run lint
 
       - name: Test
+        env:
+          FFMPEG_PATH: /usr/bin/ffmpeg
+          FFPROBE_PATH: /usr/bin/ffprobe
         run: npm test
