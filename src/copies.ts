@@ -27,6 +27,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import type { Db } from "./db.js";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
@@ -615,7 +616,10 @@ export class Copies {
   }
 
   /** The kept version's segments, one after another, into an MP4: copied, not
-   *  encoded, so it takes seconds. */
+   *  encoded, so it takes seconds. They go to ffmpeg as one MPEG-TS stream — they
+   *  carry the film's own clock (-copyts), so they join byte for byte — not
+   *  through the concat demuxer and a list file, which crashed (SIGSEGV) on the
+   *  Linux ffmpeg build CI uses. */
   private putTogether(running: Running, plan: HlsPlan): void {
     const job = running.job;
     const files = this.filler?.keptSegments(plan) ?? null;
@@ -624,20 +628,26 @@ export class Copies {
       return;
     }
     const out = path.join(this.dir, fileName(job));
-    const list = `${out}.list`;
-    fs.writeFileSync(list, files.map((file) => `file '${file.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"));
     // ADTS AAC (a converted sound, or AAC copied) needs its headers made MP4's.
     const aac = Boolean(job.delivery.audio) && (!job.delivery.audioCopy || job.delivery.audio?.codec === "aac");
-    const args = ["-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", list, "-map", "0", "-c", "copy",
+    const args = ["-hide_banner", "-v", "error", "-y", "-f", "mpegts", "-i", "pipe:0", "-map", "0", "-c", "copy",
       ...(aac ? ["-bsf:a", "aac_adtstoasc"] : []), "-movflags", "+faststart", "-f", "mp4", `${out}.part`];
-    const proc = spawn(this.tools.ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const proc = spawn(this.tools.ffmpeg, args, { stdio: ["pipe", "ignore", "pipe"], windowsHide: true });
     running.proc = proc;
     running.abort = undefined;
+    // ffmpeg gone early (an error, or stopped) breaks the pipe: its exit says why.
+    proc.stdin?.on("error", () => undefined);
+    void (async () => {
+      for (const file of files) {
+        if (!proc.stdin || proc.stdin.destroyed) return;
+        await pipeline(fs.createReadStream(file), proc.stdin, { end: false }).catch(() => undefined);
+      }
+      proc.stdin?.end();
+    })();
     let stderr = "";
     proc.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
     proc.on("error", (err) => this.finish(running, `ffmpeg could not start: ${err.message}`, stderr));
     proc.on("exit", (code, signal) => {
-      fs.rm(list, { force: true }, () => undefined);
       if (code === 0) this.finish(running, null, stderr);
       else this.finish(running, `The copy could not be put together: ${stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`}`, stderr);
     });
