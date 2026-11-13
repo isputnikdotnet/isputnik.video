@@ -29,9 +29,9 @@ export function findTools(env: NodeJS.ProcessEnv = process.env): Tools {
   };
 }
 
-function run(binary: string, args: string[], timeoutMs: number, input?: Buffer): Promise<string> {
+function run(binary: string, args: string[], timeoutMs: number, input?: Buffer, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = execFile(binary, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+    const child = execFile(binary, args, { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true, signal }, (err, stdout, stderr) => {
       if (err) reject(new Error(`${String(stderr).trim().split("\n").pop() || err.message}`));
       else resolve(stdout);
     });
@@ -194,10 +194,10 @@ export function toWebVtt(tools: Tools, source: { file: string; index: number } |
 
 /** Where the video's keyframes are, in seconds. Reads the whole file (packets
  *  only, nothing decoded): seconds for an episode, longer for a film on a slow disk. */
-export async function keyframes(tools: Tools, file: string): Promise<number[]> {
+export async function keyframes(tools: Tools, file: string, signal?: AbortSignal): Promise<number[]> {
   const out = await run(tools.ffprobe, [
     "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", file
-  ], 10 * 60_000);
+  ], 10 * 60_000, undefined, signal);
   const times: number[] = [];
   for (const line of out.split(/\r?\n/)) {
     const [time, flags] = line.split(",");

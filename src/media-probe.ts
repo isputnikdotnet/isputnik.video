@@ -2,9 +2,11 @@
 // on the first play, the keyframes on the first play that needs them. A file
 // replaced on disk (new size or date) is probed again. Two requests for the same
 // file while one probe runs share it. An MP4 gives up its keyframes from its
-// header (mp4-index.ts); every other file is walked by ffprobe.
+// header (mp4-index.ts), a Matroska file from its Cues (mkv-index.ts); every
+// other file, and one whose index won't do, is walked by ffprobe.
 import type { Db } from "./db.js";
 import { keyframes, probe, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { mkvKeyframes } from "./mkv-index.js";
 import { mp4Keyframes } from "./mp4-index.js";
 
 interface ProbeRow {
@@ -21,9 +23,12 @@ export interface ProbedFile {
 }
 
 const isMp4 = (container: string) => /(^|,)(mov|mp4)(,|$)/.test(container);
+const isMatroska = (container: string) => /(^|,)(matroska|webm)(,|$)/.test(container);
 
 export class MediaProbe {
   private running = new Map<string, Promise<unknown>>();
+  /** Stops a walk of a whole file when the engine closes: a 30 GB film takes minutes. */
+  private stop = new AbortController();
 
   constructor(private db: Db, private tools: Tools) {}
 
@@ -36,6 +41,17 @@ export class MediaProbe {
    *  left holding a file (which Windows then can't delete). */
   async idle(): Promise<void> {
     await Promise.allSettled([...this.running.values()]);
+  }
+
+  /** Stops what is walking a whole file, then waits for the rest. */
+  async close(): Promise<void> {
+    this.stop.abort();
+    await this.idle();
+  }
+
+  /** Whether the keyframes of this file are kept already (no probe is run). */
+  hasKeyframes(itemId: string, file: ProbedFile): boolean {
+    return Boolean(this.row(itemId, file)?.keyframes);
   }
 
   private once<T>(key: string, work: () => Promise<T>): Promise<T> {
@@ -71,8 +87,11 @@ export class MediaProbe {
     const cached = this.row(itemId, file);
     if (cached?.keyframes) return JSON.parse(cached.keyframes) as number[];
     return this.once(`keyframes:${itemId}`, async () => {
-      const fromHeader = info.video && isMp4(info.container) ? await mp4Keyframes(file.absolute, info.video).catch(() => null) : null;
-      const times = fromHeader ?? await keyframes(this.tools, file.absolute);
+      const fromHeader = !info.video ? null
+        : isMp4(info.container) ? await mp4Keyframes(file.absolute, info.video).catch(() => null)
+        : isMatroska(info.container) ? await mkvKeyframes(file.absolute, { start: info.start, duration: info.duration, video: info.video }).catch(() => null)
+        : null;
+      const times = fromHeader ?? await keyframes(this.tools, file.absolute, this.stop.signal);
       this.db.prepare("UPDATE media_probe SET keyframes = ? WHERE item_id = ?").run(JSON.stringify(times), itemId);
       return times;
     });

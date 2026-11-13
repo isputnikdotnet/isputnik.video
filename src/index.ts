@@ -19,6 +19,9 @@ const app = await buildApp({
   // Intros, recaps and credits found by sound and picture after each scan
   // (detect.ts); the admin turns it off on home's Settings → Video.
   detect: true,
+  // Keyframes read ahead of the first play (keyframe-warmer.ts), so a film that
+  // has to be walked whole doesn't keep its viewer waiting.
+  warmKeyframes: true,
   logBuffer,
   fastify: {
     logger: { level: process.env.LOG_LEVEL?.trim() || "info", stream: logBuffer }

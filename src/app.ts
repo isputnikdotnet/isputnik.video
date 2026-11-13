@@ -25,6 +25,7 @@ import { Bucket, throttled } from "./throttle.js";
 import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
 import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
+import { KeyframeWarmer } from "./keyframe-warmer.js";
 import { BASE_PATH } from "./config.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase, upgradeDatabase } from "./db.js";
@@ -52,6 +53,8 @@ declare module "fastify" {
     scansSettled(): Promise<void>;
     /** …and the intros and credits looked for after them (detect.ts). */
     detectionSettled(): Promise<void>;
+    /** …and the keyframes read ahead of the first play after them (keyframe-warmer.ts). */
+    keyframesSettled(): Promise<void>;
   }
 }
 
@@ -91,6 +94,10 @@ export interface AppOptions {
   /** Find intros, recaps and credits by itself (detect.ts) after each scan and on
    *  start, while the admin's setting allows. The server turns it on; tests ask for it. */
   detect?: boolean;
+  /** Read the keyframes of titles whose picture is copied as it is ahead of
+   *  their first play (keyframe-warmer.ts), after each scan and on start. The
+   *  server turns it on; tests ask for it. */
+  warmKeyframes?: boolean;
   fastify?: FastifyServerOptions;
 }
 
@@ -437,6 +444,30 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     void resumeCopies().then(() => queueKeepReady());
   });
 
+  // Keyframes read ahead of the first play (keyframe-warmer.ts): the films a
+  // browser gets with their picture copied as it is, as planFor() cuts them.
+  const warmStop = new AbortController();
+  const warmer = mediaProbe && options.warmKeyframes ? new KeyframeWarmer({
+    db,
+    mediaRoot: options.mediaRoot,
+    probe: mediaProbe,
+    copiesPicture: (item, info) => {
+      const delivery = decideDelivery(info, path.extname(item.relative));
+      return delivery.mode !== "direct" && delivery.videoCopy;
+    },
+    busy: () => (hls?.active() ?? 0) > 0,
+    log: engineLog
+  }) : null;
+  const warmKeyframes = () => {
+    if (warmer && !warmStop.signal.aborted) void toolsReady.then((ok) => { if (ok) void warmer.queue(warmStop.signal); });
+  };
+  app.decorate("keyframesSettled", async () => {
+    await scanChain;
+    await toolsReady;
+    await warmer?.settled();
+  });
+  warmKeyframes();
+
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
   const queued = new Set<string>();
@@ -535,8 +566,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     copies?.close();
     if (options.copiesDir === undefined) fs.rmSync(copiesDir, { recursive: true, force: true });
     detectStop.abort();
+    warmStop.abort();
     await detectChain.catch(() => undefined);
-    await mediaProbe?.idle();
+    await warmer?.settled();
+    await mediaProbe?.close();
     await scanChain.catch(() => undefined);
     await metadataChain.catch(() => undefined);
     db.close();
@@ -660,6 +693,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         queueMetadata(libraryId, null, false);
         queueDetect({ library: libraryId }, false, null);
         void queueKeepReady();
+        warmKeyframes();
       } catch (err) {
         const message = err instanceof ScanError ? err.message : `The scan failed: ${(err as Error).message}`;
         setScanState(db, libraryId, "error", message);
