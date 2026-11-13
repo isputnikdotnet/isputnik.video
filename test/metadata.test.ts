@@ -134,6 +134,12 @@ describe("without a TMDB key", () => {
     expect((await app.inject({ method: "GET", url: "/video/api/admin/metadata", headers: admin })).json()).toEqual({ hasKey: false, keyHint: null });
   });
 
+  it("answers Not found, not an error, for a poster taken away from beside the film since it was found", async () => {
+    const url = byTitle(await movies(), "Some Film").poster as string;
+    fixture.remove("Movies/Some Film (2010)/poster.jpg");
+    expect((await app.inject({ method: "GET", url, headers: mum })).statusCode).toBe(404);
+  });
+
   it("keeps a picture from anyone who can't see the title", async () => {
     const url = byTitle(await movies(), "Some Film").poster as string;
     expect((await app.inject({ method: "GET", url, headers: as("kid", "member", ["lib_shows"]) })).statusCode).toBe(404);

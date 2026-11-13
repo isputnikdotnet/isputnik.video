@@ -176,6 +176,15 @@ export function artFile(row: Partial<Record<ArtKind, string | null>> | undefined
   return null;
 }
 
+/** artFile for a request: a picture beside the video is looked up without
+ *  holding the engine, since its disk may have spun down, and scrolling a page
+ *  of posters would otherwise make everyone wait for it (issue 6). */
+export async function artFileAsync(row: Partial<Record<ArtKind, string | null>> | undefined | null, kind: ArtKind, mediaRoot: string, artDir: string): Promise<string | null> {
+  const source = row?.[kind];
+  if (source?.startsWith("local:")) return resolveInsideAsync(mediaRoot, source.slice(6));
+  return artFile(row, kind, mediaRoot, artDir);
+}
+
 // ── The pass ───────────────────────────────────────────────────────────────
 
 export interface MetadataContext {

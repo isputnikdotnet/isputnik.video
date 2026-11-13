@@ -14,7 +14,7 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
-import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
+import { MetadataRunner, artFileAsync, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
@@ -1058,12 +1058,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // Not a title: a set's own picture, for someone who sees one of its films.
     const set = owner ? null : setArtRow(db, request.identity!, itemId);
     if (!artKind.success || (!set && (!library || library.state !== "active" || !canSee(request.identity!, library.id)))) return reply.code(404).send({ error: "Not found" });
-    const file = artFile(set ?? metaFor(db, [partOf ? askedId : itemId]).get(partOf ? askedId : itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
+    const file = await artFileAsync(set ?? metaFor(db, [partOf ? askedId : itemId]).get(partOf ? askedId : itemId), artKind.data as ArtKind, options.mediaRoot, artDir);
     if (!file) return reply.code(404).send({ error: "Not found" });
     const type = ART_TYPES[path.extname(file).toLowerCase()];
     if (!type) return reply.code(404).send({ error: "Not found" });
+    // Gone from beside the film since it was found: as if it had never been there.
+    const bytes = await fs.promises.readFile(file).catch(() => null);
+    if (!bytes) return reply.code(404).send({ error: "Not found" });
     // The address carries a version, so it can be kept a while.
-    return reply.header("Content-Type", type).header("Cache-Control", "private, max-age=86400").send(await fs.promises.readFile(file));
+    return reply.header("Content-Type", type).header("Cache-Control", "private, max-age=86400").send(bytes);
   };
   app.get(`${API}/art/:id/:kind`, { preHandler: requireIdentity }, serveArt);
 
