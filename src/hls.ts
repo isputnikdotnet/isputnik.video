@@ -8,18 +8,26 @@
 // forced onto it when it is re-encoded. Timestamps stay the file's own
 // (-copyts), so a run started after a seek lines up with the segments before it.
 //
-// One run per person and film. It runs ahead of the player, stops once it is
-// far enough ahead, and starts again where the player gets to; a seek past what
-// it has made starts it there. A session nobody asks anything of for a minute
-// is stopped and its segments deleted.
+// A version of a film (variantOf: the file, its sound track, burned subtitles,
+// quality) is one entry, shared by everyone watching it. Each viewer's requests
+// may start a run of ffmpeg, into a folder of its own; it runs ahead of its
+// player, stops once far enough ahead, at a segment that is already there, or
+// where a run ahead of it began, and starts again where the player gets to. A
+// viewer nobody hears from for a minute is stopped; a version nobody watches
+// goes, or, when its picture is re-encoded and there is a disk, waits ten
+// minutes for someone to come back — and once every segment of it has been
+// made it is kept (its folder under cache/ gets an entry.json) until the
+// cleanup removes it (cache.ts: one limit with the copies for download).
 //
 // ffmpeg writes each segment to the transcode folder; once it is finished it is
 // read into memory and the file goes, up to the memory the admin gives every
 // viewer together (ConversionSettings). Past that a segment stays on the disk,
 // or with memory only the run waits for the player to catch up — which is all
-// there is when the folder is not a disk mapped into the container (mounts.ts). Only so many people convert at
-// once; the next one is told so (HlsBusyError) rather than everyone slowing.
+// there is when the folder is not a disk mapped into the container (mounts.ts).
+// Only so many versions are converted at once; the next one is told so
+// (HlsBusyError) rather than everyone slowing.
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +37,12 @@ import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMod
 
 /** Inside the conversion folder: the copies kept for download, never swept. */
 export const COPIES_FOLDER = "copies";
+/** …and every version being converted, one folder each, the ones converted all
+ *  the way through kept (with an entry.json) between restarts. */
+export const CACHE_FOLDER = "cache";
+const ENTRY_FILE = "entry.json";
+/** A half-made version kept on the disk is dropped this long after its last viewer. */
+const ENTRY_GRACE_MS = 10 * 60_000;
 
 /** How long a segment is meant to be. */
 export const SEGMENT_TARGET_S = 6;
@@ -60,6 +74,9 @@ export interface HlsPlan {
   starts: number[];
   /** Where the last one ends. */
   end: number;
+  /** The file's size and time (`<size>:<mtime ms>`): a changed file is another
+   *  version, so a kept one is never served for it. */
+  stamp?: string;
 }
 
 /** The segment boundaries: keyframes at least a target apart, or a fixed grid. */
@@ -80,9 +97,9 @@ export function segmentStarts(info: MediaInfo, videoCopy: boolean, keyframes: nu
 
 const round = (value: number) => Math.round(value * 1000) / 1000;
 
-export function buildPlan(itemId: string, file: string, info: MediaInfo, delivery: Delivery, keyframes: number[] | null): HlsPlan {
+export function buildPlan(itemId: string, file: string, info: MediaInfo, delivery: Delivery, keyframes: number[] | null, stamp?: string): HlsPlan {
   const starts = segmentStarts(info, delivery.videoCopy, keyframes);
-  return { itemId, file, info, delivery, starts, end: Math.max(info.start + info.duration, starts[starts.length - 1] + 0.1) };
+  return { itemId, file, info, delivery, starts, end: Math.max(info.start + info.duration, starts[starts.length - 1] + 0.1), ...(stamp ? { stamp } : {}) };
 }
 
 const durationOf = (plan: HlsPlan, n: number) => (n + 1 < plan.starts.length ? plan.starts[n + 1] : plan.end) - plan.starts[n];
@@ -301,22 +318,33 @@ export interface ConversionViewer {
   /** The quality rung the picture is held under; null for the file as it is. */
   rung: Rung | null;
   converting: boolean;
+  /** What their version holds (shared with whoever watches it too). */
   memoryBytes: number;
   diskBytes: number;
+  /** Someone else watches the same version: made once for both. */
+  shared: boolean;
+  /** A film kept whole: nothing is made. */
+  kept: boolean;
 }
 
 export interface ConversionUsage {
   viewers: ConversionViewer[];
   memoryBytes: number;
+  /** Being made now (kept films not counted). */
   diskBytes: number;
+  /** Films converted all through and kept on the disk. */
+  kept: { count: number; bytes: number };
 }
 
-interface Session {
-  key: string;
+/** One version of one film being watched (home's docs/video-cache-plan.md, C2):
+ *  its segments, wherever they are, shared by everyone watching that version. */
+interface Entry {
+  variant: string;
   plan: HlsPlan;
-  /** Whose and what, for the admin's list. */
-  user: string;
   title: string;
+  /** <root>/cache/<variant>-<random>: the finished segments, each run's own folder
+   *  inside. Never reused: on Windows a folder just removed can't be made again
+   *  at once, and a killed ffmpeg may still hold files in the last one. */
   dir: string;
   /** Segments finished, wherever they are. */
   done: Set<number>;
@@ -324,19 +352,43 @@ interface Session {
   memory: Map<number, Buffer>;
   /** Bytes in memory, counting segments being read in. */
   memoryBytes: number;
-  /** Finished segments left on the disk, by size. */
+  /** Finished segments that are files in `dir`, by size. */
   onDisk: Map<number, number>;
   /** Segments being read into memory just now. */
   settling: Map<number, Promise<void>>;
-  proc: ChildProcess | null;
-  /** The current run's GPU, or null on the CPU. */
-  gpu: GpuRun | null;
-  /** A GPU run failed: the rest of this viewing is on the CPU. */
+  runs: Set<Run>;
+  /** A GPU run failed: the rest of this version is made on the CPU. */
   cpuOnly: boolean;
-  /** The segment the current run started at. */
-  runFrom: number;
-  /** The last segment the current run has started writing. */
+  viewers: Set<Viewer>;
+  /** Kept on the disk, every segment there: nothing is made. */
+  complete: boolean;
+  /** When its last viewer went; 0 while someone watches. */
+  idleSince: number;
+}
+
+/** One ffmpeg run, writing into a folder of its own and handing each finished
+ *  segment to its entry. It belongs to the viewer whose request started it. */
+interface Run {
+  entry: Entry;
+  owner: Viewer;
+  proc: ChildProcess;
+  dir: string;
+  /** The run's GPU, or null on the CPU. */
+  gpu: GpuRun | null;
+  /** The segment it started at. */
+  from: number;
+  /** The last segment it has started writing. */
   writing: number;
+}
+
+/** Someone watching: a person and a film ("<person>:<item>"), at a place in an entry. */
+interface Viewer {
+  key: string;
+  entry: Entry;
+  /** Whose and what, for the admin's list. */
+  user: string;
+  title: string;
+  run: Run | null;
   failure: string | null;
   lastWanted: number;
   /** Counts requests: only the newest may move the run (a seek), so one
@@ -345,9 +397,24 @@ interface Session {
   touched: number;
 }
 
+/** A film converted all the way through and kept, for the admin and the cleanup. */
+export interface KeptFilm {
+  variant: string;
+  /** Its folder under cache/. */
+  folder: string;
+  itemId: string;
+  title: string;
+  rung: Rung | null;
+  segments: number;
+  sizeBytes: number;
+  completedAt: string;
+  usedAt: string;
+  /** Someone is watching it now: it can't be removed. */
+  inUse?: boolean;
+}
+
 export class HlsError extends Error {}
 
-/** Everyone the admin allows is already watching something converted. */
 /** Why someone may not start converting a film now: every place the admin
  *  allows is taken ("household"), or they are watching another film converted
  *  ("person" — on another screen, or a tab left playing; it lets go once it
@@ -367,19 +434,35 @@ export class HlsBusyError extends HlsError {
   }
 }
 
-/** Whose a session is: the person in "<person>:<item>". */
+/** Whose a viewer is: the person in "<person>:<item>". */
 const personOf = (key: string) => key.slice(0, key.lastIndexOf(":"));
+
+/** Which version of a film a set of segments is. The same plan cuts the same
+ *  segments, whoever asks; a changed file (its stamp) is another version. */
+export function variantOf(plan: HlsPlan): string {
+  const { delivery } = plan;
+  return createHash("sha1").update([
+    plan.itemId, plan.file, plan.stamp ?? "", delivery.mode, delivery.videoCopy ? "copy" : "encode", delivery.audioCopy ? "copy" : "encode",
+    delivery.audio?.index ?? "-", delivery.burn?.index ?? "-", delivery.rung ?? "original", plan.starts.length, plan.end
+  ].join("|")).digest("hex").slice(0, 24);
+}
 
 /** Empties the folder and checks it can be written to; null when it can't. Only
  *  what is inside goes: the folder itself is often a mount point (/transcode in
  *  the image), which this user could never remove. What a previous process
- *  left behind is nobody's. */
+ *  left behind is nobody's — but the copies kept for download (copies.ts) and
+ *  the films kept once converted all through (cache/, those with their
+ *  entry.json) outlive a restart. */
 export function prepareRoot(root: string, log: Pick<HlsLog, "warn">): string | null {
   try {
     fs.mkdirSync(root, { recursive: true });
-    // Not the copies kept for download (copies.ts), which outlive a restart.
     for (const entry of fs.readdirSync(root)) {
-      if (entry !== COPIES_FOLDER) fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+      if (entry === COPIES_FOLDER) continue;
+      if (entry === CACHE_FOLDER && fs.statSync(path.join(root, entry)).isDirectory()) {
+        sweepCache(path.join(root, entry));
+        continue;
+      }
+      fs.rmSync(path.join(root, entry), { recursive: true, force: true });
     }
     fs.rmdirSync(fs.mkdtempSync(path.join(root, "check-")));
     return root;
@@ -389,18 +472,39 @@ export function prepareRoot(root: string, log: Pick<HlsLog, "warn">): string | n
   }
 }
 
+/** Only complete entries stay, without any run's leftovers. */
+function sweepCache(cache: string): void {
+  for (const name of fs.readdirSync(cache)) {
+    const dir = path.join(cache, name);
+    if (!fs.existsSync(path.join(dir, ENTRY_FILE))) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      continue;
+    }
+    for (const inner of fs.readdirSync(dir)) {
+      if (inner.startsWith("run-")) fs.rmSync(path.join(dir, inner), { recursive: true, force: true });
+    }
+  }
+}
+
 export interface HlsLog {
   info(obj: object, msg: string): void;
   warn(obj: object, msg: string): void;
 }
 
 export class HlsSessions {
-  private sessions = new Map<string, Session>();
+  private viewers = new Map<string, Viewer>();
+  /** Entries someone watches, or watched a moment ago, by variant. */
+  private entries = new Map<string, Entry>();
+  /** Films kept whole on the disk, by variant (cache/<variant>/entry.json). */
+  private kept = new Map<string, KeptFilm>();
   /** When each player said it had gone, so a request of its still on the way
    *  can't start the film again behind it. */
   private left = new Map<string, number>();
   private sweeper: NodeJS.Timeout;
   private root: string;
+  private runCount = 0;
+  /** A film was just kept whole: the app keeps everything kept under its limit. */
+  onKept: (() => void) | null = null;
 
   /** Where segments are made: for the Disks answer home's Dashboard reads. */
   get folder(): string {
@@ -412,9 +516,12 @@ export class HlsSessions {
   private diskMapped = false;
 
   /** Whether the conversion folder is a disk mapped into the container
-   *  (mounts.ts), told by the app; a folder made here never is. */
+   *  (mounts.ts), told by the app; a folder made here never is. The films kept
+   *  there are read in then. */
   setMapped(mapped: boolean): void {
     this.diskMapped = mapped;
+    this.kept.clear();
+    if (this.mapped) this.readKept();
   }
 
   get mapped(): boolean {
@@ -446,19 +553,33 @@ export class HlsSessions {
     return this.settings.maxViewers;
   }
 
-  /** Why `key` may not watch now; null when it may: already converting this
-   *  film, or a place is free and this person is watching nothing else. One film
-   *  at a time per person, refused rather than taken over, so two screens on
-   *  one account don't stop each other's conversion turn about. A film of theirs
-   *  gone quiet gives way, and its place counts as free (open stops it). */
-  refusal(key: string): HlsRefusal | null {
-    if (this.sessions.has(key)) return null;
+  /** Why `key` may not watch now; null when it may: already watching this film,
+   *  or a place is free and this person is watching nothing else. One film at a
+   *  time per person, refused rather than taken over, so two screens on one
+   *  account don't stop each other's conversion turn about. A film of theirs
+   *  gone quiet gives way, and its place counts as free (attach stops it).
+   *  Places are counted by versions being converted: someone joining a version
+   *  already being watched, or one kept whole, takes none (`plan`, when known;
+   *  an item id alone, for a picture copied whose cuts need its keyframes, counts
+   *  any version of that film someone else is watching). */
+  refusal(key: string, plan?: HlsPlan | string): HlsRefusal | null {
+    if (this.viewers.has(key)) return null;
     const person = personOf(key);
-    const mine = [...this.sessions.values()].filter((session) => personOf(session.key) === person);
     const now = Date.now();
-    const other = mine.find((session) => now - session.touched <= PERSON_HOLD_MS);
+    const other = [...this.viewers.values()].find((viewer) => personOf(viewer.key) === person && now - viewer.touched <= PERSON_HOLD_MS);
     if (other) return { reason: "person", limit: this.settings.maxViewers, title: other.title };
-    if (this.sessions.size - mine.length >= this.settings.maxViewers) return { reason: "household", limit: this.settings.maxViewers };
+    if (typeof plan === "string") {
+      const watched = [...this.entries.values()].some((entry) => entry.plan.itemId === plan && [...entry.viewers].some((viewer) => personOf(viewer.key) !== person));
+      if (watched) return null;
+    } else if (plan) {
+      const variant = variantOf(plan);
+      if (this.kept.has(variant)) return null;
+      const live = this.entries.get(variant);
+      if (live && [...live.viewers].some((viewer) => personOf(viewer.key) !== person)) return null;
+    }
+    const taken = [...this.entries.values()].filter((entry) =>
+      !entry.complete && [...entry.viewers].some((viewer) => personOf(viewer.key) !== person)).length;
+    if (taken >= this.settings.maxViewers) return { reason: "household", limit: this.settings.maxViewers };
     return null;
   }
 
@@ -466,64 +587,66 @@ export class HlsSessions {
     return this.refusal(key) === null;
   }
 
-  /** Segment `n`, made if it isn't there yet. `who` names the session for the
+  /** Segment `n`, made if it isn't there yet. `who` names the viewer for the
    *  admin; `signal` is the player hanging up (a seek cancels the segment it
    *  was loading), which ends the wait; `asked` is when the request came in. */
   async segment(key: string, plan: HlsPlan, n: number, options: { who?: { user: string; title: string }; signal?: AbortSignal; asked?: number } = {}): Promise<SegmentData> {
     const who = options.who ?? { user: "", title: "" };
     const signal = options.signal;
     if (!Number.isInteger(n) || n < 0 || n >= plan.starts.length) throw new HlsError("No such segment");
-    let session = this.sessions.get(key);
+    let viewer = this.viewers.get(key);
     // Another file under the same id, another sound track, other subtitles burned
-    // in or another quality rung: a new session (its cuts and its picture differ).
-    if (session && (session.plan.file !== plan.file || session.plan.delivery.audio?.index !== plan.delivery.audio?.index ||
-      session.plan.delivery.burn?.index !== plan.delivery.burn?.index || session.plan.delivery.rung !== plan.delivery.rung)) {
+    // in or another quality rung: another version (its cuts and its picture differ).
+    const variant = variantOf(plan);
+    if (viewer && viewer.entry.variant !== variant) {
       this.stop(key);
-      session = undefined;
+      viewer = undefined;
     }
-    if (!session) {
+    if (!viewer) {
       if (signal?.aborted) throw new HlsError("Cancelled");
       const left = this.left.get(key);
       if (left !== undefined && options.asked !== undefined && options.asked < left) throw new HlsError("Stopped");
-      const refused = this.refusal(key);
+      const refused = this.refusal(key, plan);
       if (refused) throw new HlsBusyError(refused);
-      session = this.open(key, plan, who);
+      viewer = this.attach(key, plan, variant, who);
     }
-    session.touched = Date.now();
-    session.lastWanted = n;
-    const ask = ++session.asked;
-    this.forgetBehind(session, n);
+    const entry = viewer.entry;
+    viewer.touched = Date.now();
+    viewer.lastWanted = n;
+    const ask = ++viewer.asked;
+    this.forgetBehind(entry);
 
     const deadline = Date.now() + WAIT_MS;
     let started = false;
     for (;;) {
-      this.refresh(session);
-      if (session.done.has(n)) {
-        this.keepAhead(session, n);
-        await session.settling.get(n);
-        if (this.sessions.get(key) !== session) throw new HlsError("Stopped");
-        const data = session.memory.get(n);
+      for (const run of [...entry.runs]) this.refresh(run);
+      if (entry.done.has(n)) {
+        this.keepAhead(viewer, n);
+        await entry.settling.get(n);
+        if (this.viewers.get(key) !== viewer) throw new HlsError("Stopped");
+        const data = entry.memory.get(n);
         if (data) return { data };
         // Not forgotten while it was read in: it stayed on the disk.
-        if (session.done.has(n)) return { file: path.join(session.dir, `${n}.ts`), size: session.onDisk.get(n) ?? 0 };
+        if (entry.onDisk.has(n)) return { file: path.join(entry.dir, `${n}.ts`), size: entry.onDisk.get(n) ?? 0 };
       }
       if (signal?.aborted) throw new HlsError("Cancelled");
       // Still wanted: a slow first segment is someone watching, not silence.
-      session.touched = Date.now();
-      if (session.failure && started) throw new HlsError(session.failure);
-      const running = session.proc !== null;
-      if (!running || n < session.runFrom || n > session.writing + JUMP_AHEAD) {
-        if (started && !running) throw new HlsError(session.failure ?? "The conversion stopped");
+      viewer.touched = Date.now();
+      if (viewer.failure && started) throw new HlsError(viewer.failure);
+      // Someone's run is on its way to it (this viewer's, or another's).
+      const coming = [...entry.runs].some((run) => n >= run.from && n <= run.writing + JUMP_AHEAD);
+      if (!coming) {
+        if (started && !viewer.run) throw new HlsError(viewer.failure ?? "The conversion stopped");
         // A newer request moved the run elsewhere: this one is not what the
         // player wants any more, and restarting for it would undo the seek.
-        if (ask !== session.asked) throw new HlsError("Superseded");
-        this.start(session, n);
+        if (ask !== viewer.asked) throw new HlsError("Superseded");
+        this.start(viewer, n);
         started = true;
       }
       if (Date.now() > deadline) throw new HlsError("The segment took too long to make");
       await new Promise((resolve) => setTimeout(resolve, 120));
-      // The session was stopped while this request waited (the player left).
-      if (this.sessions.get(key) !== session) throw new HlsError("Stopped");
+      // The viewer was stopped while this request waited (the player left).
+      if (this.viewers.get(key) !== viewer) throw new HlsError("Stopped");
     }
   }
 
@@ -533,44 +656,83 @@ export class HlsSessions {
     this.stop(key);
   }
 
+  /** The viewer goes; their run stops, and the entry follows once nobody is left. */
   stop(key: string): void {
-    const session = this.sessions.get(key);
-    if (!session) return;
-    this.sessions.delete(key);
-    this.kill(session);
-    session.memory.clear();
-    session.memoryBytes = 0;
-    fs.rm(session.dir, { recursive: true, force: true }, () => undefined);
+    const viewer = this.viewers.get(key);
+    if (!viewer) return;
+    this.viewers.delete(key);
+    if (viewer.run) this.kill(viewer.run);
+    const entry = viewer.entry;
+    entry.viewers.delete(viewer);
+    if (entry.viewers.size > 0) return;
+    entry.idleSince = Date.now();
+    if (entry.complete) {
+      this.drop(entry, false);
+    } else if (this.keeps(entry)) {
+      // Kept a while on the disk for whoever comes next; memory goes now.
+      for (const n of [...entry.memory.keys()]) this.dropMemory(entry, n);
+    } else {
+      this.drop(entry, true);
+    }
   }
 
-  /** People converting right now, for the admin and the log. */
+  /** Runs converting right now, for the admin and the log. */
   active(): number {
-    return [...this.sessions.values()].filter((session) => session.proc).length;
+    let runs = 0;
+    for (const entry of this.entries.values()) runs += entry.runs.size;
+    return runs;
   }
 
   /** Who is watching converted video, and what it holds in memory and on the disk. */
   usage(): ConversionUsage {
-    const viewers = [...this.sessions.values()].map((session) => ({
-      user: session.user,
-      title: session.title,
-      mode: session.plan.delivery.mode,
-      converter: session.plan.delivery.videoCopy ? null : session.gpu ? "gpu" as const : "cpu" as const,
-      hdr: !session.plan.delivery.videoCopy && hdrOf(session.plan.info.video) !== null,
-      rung: session.plan.delivery.rung,
-      converting: session.proc !== null,
-      memoryBytes: session.memoryBytes,
-      diskBytes: [...session.onDisk.values()].reduce((sum, size) => sum + size, 0)
-    }));
+    const viewers = [...this.viewers.values()].map((viewer) => {
+      const entry = viewer.entry;
+      return {
+        user: viewer.user,
+        title: viewer.title,
+        mode: entry.plan.delivery.mode,
+        converter: entry.plan.delivery.videoCopy || entry.complete ? null : viewer.run?.gpu ? "gpu" as const : "cpu" as const,
+        hdr: !entry.plan.delivery.videoCopy && hdrOf(entry.plan.info.video) !== null,
+        rung: entry.plan.delivery.rung,
+        converting: viewer.run !== null,
+        memoryBytes: entry.memoryBytes,
+        diskBytes: sumOf(entry.onDisk),
+        shared: entry.viewers.size > 1,
+        kept: entry.complete
+      };
+    });
+    const live = [...this.entries.values()];
+    const kept = [...this.kept.values()];
     return {
       viewers,
-      memoryBytes: viewers.reduce((sum, viewer) => sum + viewer.memoryBytes, 0),
-      diskBytes: viewers.reduce((sum, viewer) => sum + viewer.diskBytes, 0)
+      memoryBytes: live.reduce((sum, entry) => sum + entry.memoryBytes, 0),
+      diskBytes: live.filter((entry) => !entry.complete).reduce((sum, entry) => sum + sumOf(entry.onDisk), 0),
+      kept: { count: kept.length, bytes: kept.reduce((sum, film) => sum + film.sizeBytes, 0) }
     };
+  }
+
+  /** The films kept whole, used longest ago first. */
+  keptFilms(): KeptFilm[] {
+    return [...this.kept.values()]
+      .map((film) => ({ ...film, inUse: (this.entries.get(film.variant)?.viewers.size ?? 0) > 0 }))
+      .sort((a, b) => a.usedAt.localeCompare(b.usedAt));
+  }
+
+  /** Removes a kept film; false while someone watches it. */
+  removeKept(variant: string): boolean {
+    const live = this.entries.get(variant);
+    if (live && live.viewers.size > 0) return false;
+    if (live) this.drop(live, true);
+    const film = this.kept.get(variant);
+    this.kept.delete(variant);
+    if (film) fs.rm(path.join(this.root, CACHE_FOLDER, film.folder), { recursive: true, force: true }, () => undefined);
+    return true;
   }
 
   close(): void {
     clearInterval(this.sweeper);
-    for (const key of [...this.sessions.keys()]) this.stop(key);
+    for (const key of [...this.viewers.keys()]) this.stop(key);
+    for (const entry of [...this.entries.values()]) this.drop(entry, !entry.complete);
     if (this.ownsRoot) fs.rm(this.root, { recursive: true, force: true }, () => undefined);
   }
 
@@ -579,10 +741,10 @@ export class HlsSessions {
     return this.storage === "disk" ? 0 : this.settings.memoryMb * 1024 * 1024;
   }
 
-  /** Bytes of segments in memory, every viewer together. */
+  /** Bytes of segments in memory, every entry together. */
   private get pooled(): number {
     let sum = 0;
-    for (const session of this.sessions.values()) sum += session.memoryBytes;
+    for (const entry of this.entries.values()) sum += entry.memoryBytes;
     return sum;
   }
 
@@ -593,170 +755,334 @@ export class HlsSessions {
     return this.storage === "memory" && this.pooled >= this.budget;
   }
 
-  private open(key: string, plan: HlsPlan, who: { user: string; title: string }): Session {
-    // refusal let this through, so any other film of theirs has gone quiet.
-    const person = personOf(key);
-    for (const other of [...this.sessions.keys()]) {
-      if (personOf(other) === person) this.stop(other);
-    }
-    const dir = fs.mkdtempSync(path.join(this.root, "s-"));
-    const session: Session = {
-      key, plan, user: who.user, title: who.title, dir,
-      done: new Set(), memory: new Map(), memoryBytes: 0, onDisk: new Map(), settling: new Map(),
-      proc: null, gpu: null, cpuOnly: false, runFrom: 0, writing: -1, failure: null, lastWanted: 0, asked: 0, touched: Date.now()
-    };
-    this.sessions.set(key, session);
-    return session;
+  /** Whether an entry's segments stay on the disk, to be kept once all are
+   *  there: a picture re-encoded (dear to make again), with a disk to keep it on. */
+  private keeps(entry: Entry): boolean {
+    return this.storage !== "memory" && !entry.plan.delivery.videoCopy;
   }
 
-  private start(session: Session, from: number): void {
-    this.kill(session);
-    session.failure = null;
-    session.runFrom = from;
-    session.writing = from - 1;
-    const gpu = session.cpuOnly ? null : this.hardware?.choose(session.plan.info, session.plan.delivery) ?? null;
-    session.gpu = gpu;
-    const args = ffmpegArgs(session.plan, from, session.dir, gpu);
+  private attach(key: string, plan: HlsPlan, variant: string, who: { user: string; title: string }): Viewer {
+    // refusal let this through, so any other film of theirs has gone quiet.
+    const person = personOf(key);
+    for (const other of [...this.viewers.keys()]) {
+      if (personOf(other) === person) this.stop(other);
+    }
+    const entry = this.entries.get(variant) ?? this.fromKept(variant, plan, who.title) ?? this.open(variant, plan, who.title);
+    entry.idleSince = 0;
+    const viewer: Viewer = { key, entry, user: who.user, title: who.title, run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    entry.viewers.add(viewer);
+    this.viewers.set(key, viewer);
+    const film = this.kept.get(variant);
+    if (film) {
+      film.usedAt = new Date().toISOString();
+      this.writeKept(film);
+    }
+    return viewer;
+  }
+
+  private open(variant: string, plan: HlsPlan, title: string): Entry {
+    fs.mkdirSync(path.join(this.root, CACHE_FOLDER), { recursive: true });
+    const dir = fs.mkdtempSync(path.join(this.root, CACHE_FOLDER, `${variant}-`));
+    const entry: Entry = {
+      variant, plan, title, dir, done: new Set(), memory: new Map(), memoryBytes: 0, onDisk: new Map(), settling: new Map(),
+      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: false, idleSince: 0
+    };
+    this.entries.set(variant, entry);
+    return entry;
+  }
+
+  /** A kept film, back as an entry whose every segment is on the disk; null
+   *  (and the film forgotten) when it isn't all there any more. */
+  private fromKept(variant: string, plan: HlsPlan, title: string): Entry | null {
+    const film = this.kept.get(variant);
+    if (!film) return null;
+    const dir = path.join(this.root, CACHE_FOLDER, film.folder);
+    const onDisk = new Map<number, number>();
+    for (let n = 0; n < plan.starts.length; n++) {
+      try {
+        onDisk.set(n, fs.statSync(path.join(dir, `${n}.ts`)).size);
+      } catch {
+        break;
+      }
+    }
+    if (film.segments !== plan.starts.length || onDisk.size !== plan.starts.length) {
+      this.log.warn({ item: film.itemId, variant }, "A kept film is no longer whole; making it again");
+      this.kept.delete(variant);
+      return null;
+    }
+    const entry: Entry = {
+      variant, plan, title, dir, done: new Set(onDisk.keys()), memory: new Map(), memoryBytes: 0, onDisk, settling: new Map(),
+      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: true, idleSince: 0
+    };
+    this.entries.set(variant, entry);
+    return entry;
+  }
+
+  /** Forgets a live entry; `files`: its folder goes too (not a kept film's). */
+  private drop(entry: Entry, files: boolean): void {
+    for (const run of [...entry.runs]) this.kill(run);
+    entry.memory.clear();
+    entry.memoryBytes = 0;
+    if (this.entries.get(entry.variant) === entry) this.entries.delete(entry.variant);
+    if (files && !entry.complete) fs.rm(entry.dir, { recursive: true, force: true }, () => undefined);
+  }
+
+  private start(viewer: Viewer, from: number): void {
+    const entry = viewer.entry;
+    if (viewer.run) this.kill(viewer.run);
+    viewer.failure = null;
+    const gpu = entry.cpuOnly ? null : this.hardware?.choose(entry.plan.info, entry.plan.delivery) ?? null;
+    const dir = path.join(entry.dir, `run-${++this.runCount}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const args = ffmpegArgs(entry.plan, from, dir, gpu);
     const proc = spawn(this.tools.ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
-    session.proc = proc;
+    const run: Run = { entry, owner: viewer, proc, dir, gpu, from, writing: from - 1 };
+    entry.runs.add(run);
+    viewer.run = run;
     let stderr = "";
     proc.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
     proc.on("error", (err) => {
-      if (session.proc !== proc) return;
-      session.proc = null;
-      session.failure = `ffmpeg could not start: ${err.message}`;
-      this.log.warn({ item: session.plan.itemId, err }, "ffmpeg could not start");
+      if (!entry.runs.has(run)) return;
+      this.end(run);
+      viewer.failure = `ffmpeg could not start: ${err.message}`;
+      this.log.warn({ item: entry.plan.itemId, err }, "ffmpeg could not start");
     });
     proc.on("exit", (code, signal) => {
-      if (session.proc !== proc) return;
-      session.proc = null;
+      if (!entry.runs.has(run)) return;
       if (code === 0) {
         // The last segment of the run is finished too.
-        for (let n = session.runFrom; n < session.plan.starts.length; n++) {
-          if (!session.done.has(n) && fs.existsSync(path.join(session.dir, `${n}.ts`))) this.settle(session, n);
+        for (let n = run.from; n < entry.plan.starts.length; n++) {
+          if (fs.existsSync(path.join(dir, `${n}.ts`))) this.settle(entry, n, path.join(dir, `${n}.ts`));
         }
+        this.end(run);
         return;
       }
+      this.end(run);
       const reason = stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`;
-      // The GPU failed: the same segments again on the CPU, for the rest of the
-      // viewing, unless the admin asked for the GPU only.
+      // The GPU failed: the same segments again on the CPU, for the rest of this
+      // version, unless the admin asked for the GPU only.
       if (gpu && this.hardware?.failed(reason)) {
-        this.log.warn({ item: session.plan.itemId, reason, stderr: stderr.trim() }, "The GPU could not convert this; converting it on the CPU");
-        session.cpuOnly = true;
-        let next = session.runFrom;
-        while (session.done.has(next)) next += 1;
-        if (next < session.plan.starts.length) this.start(session, next);
+        this.log.warn({ item: entry.plan.itemId, reason, stderr: stderr.trim() }, "The GPU could not convert this; converting it on the CPU");
+        entry.cpuOnly = true;
+        let next = run.from;
+        while (entry.done.has(next)) next += 1;
+        if (next < entry.plan.starts.length && this.viewers.get(viewer.key) === viewer) this.start(viewer, next);
         return;
       }
-      session.failure = `The conversion failed: ${reason}`;
-      this.log.warn({ item: session.plan.itemId, code, signal, stderr: stderr.trim() }, "ffmpeg failed");
+      viewer.failure = `The conversion failed: ${reason}`;
+      this.log.warn({ item: entry.plan.itemId, code, signal, stderr: stderr.trim() }, "ffmpeg failed");
     });
-    this.log.info({ item: session.plan.itemId, from, mode: session.plan.delivery.mode, gpu: gpu ? (gpu.decode ? "decode+encode" : "encode") : null }, "Converting");
+    this.log.info({ item: entry.plan.itemId, from, mode: entry.plan.delivery.mode, gpu: gpu ? (gpu.decode ? "decode+encode" : "encode") : null, shared: entry.viewers.size > 1 }, "Converting");
   }
 
-  /** Stops the run and deletes the segment it was in the middle of. */
-  private kill(session: Session): void {
-    const proc = session.proc;
-    if (!proc) return;
-    session.proc = null;
-    proc.kill("SIGKILL");
-    for (let n = session.runFrom; n <= session.writing + 1; n++) {
-      if (!session.done.has(n)) fs.rm(path.join(session.dir, `${n}.ts`), { force: true }, () => undefined);
-    }
+  /** A run is over: out of its entry and its viewer, its folder gone. */
+  private end(run: Run): void {
+    run.entry.runs.delete(run);
+    if (run.owner.run === run) run.owner.run = null;
+    fs.rm(run.dir, { recursive: true, force: true }, () => undefined);
   }
 
-  /** A finished segment: into memory while the pool allows (its bytes counted
-   *  at once, so two read in together can't both squeeze in), else left on the
-   *  disk. With memory only everything goes into memory, and refresh stops the
-   *  run once the pool is used. */
-  private settle(session: Session, n: number): void {
-    session.done.add(n);
-    const file = path.join(session.dir, `${n}.ts`);
-    let size: number;
-    try {
-      size = fs.statSync(file).size;
-    } catch {
-      session.done.delete(n);
+  /** Stops a run; the segment it was in the middle of goes with its folder. */
+  private kill(run: Run): void {
+    if (!run.entry.runs.has(run)) return;
+    run.proc.kill("SIGKILL");
+    this.end(run);
+  }
+
+  /** A finished segment from a run's folder: into the entry's (once — another
+   *  run may have made it first), then into memory while the pool allows (its
+   *  bytes counted at once, so two read in together can't both squeeze in).
+   *  An entry being kept keeps the file as well; otherwise it goes once read in.
+   *  With memory only everything goes into memory, and refresh stops the run
+   *  once the pool is used. */
+  private settle(entry: Entry, n: number, from: string): void {
+    if (entry.done.has(n)) {
+      fs.rm(from, { force: true }, () => undefined);
       return;
     }
+    const file = path.join(entry.dir, `${n}.ts`);
+    let size: number;
+    try {
+      fs.renameSync(from, file);
+      size = fs.statSync(file).size;
+    } catch {
+      return;
+    }
+    entry.done.add(n);
+    entry.onDisk.set(n, size);
     const budget = this.budget;
     const toMemory = budget > 0 && (this.storage === "memory" || this.pooled + size <= budget);
     if (!toMemory) {
-      session.onDisk.set(n, size);
+      this.complete(entry);
       return;
     }
-    session.memoryBytes += size;
+    entry.memoryBytes += size;
     const reading = fs.promises.readFile(file).then(
       (data) => {
-        // Forgotten or stopped meanwhile: its place is given back.
-        if (this.sessions.get(session.key) !== session || !session.done.has(n)) {
-          session.memoryBytes -= size;
+        // Forgotten or dropped meanwhile: its place is given back.
+        if (this.entries.get(entry.variant) !== entry || !entry.done.has(n)) {
+          entry.memoryBytes -= size;
           return;
         }
-        session.memoryBytes += data.length - size;
-        session.memory.set(n, data);
-        fs.rm(file, { force: true }, () => undefined);
+        entry.memoryBytes += data.length - size;
+        entry.memory.set(n, data);
+        if (!this.keeps(entry)) {
+          entry.onDisk.delete(n);
+          fs.rm(file, { force: true }, () => undefined);
+        }
+        this.complete(entry);
       },
       () => {
-        session.memoryBytes -= size;
-        session.done.delete(n);
+        entry.memoryBytes -= size;
+        entry.done.delete(n);
+        entry.onDisk.delete(n);
       }
-    ).finally(() => session.settling.delete(n));
-    session.settling.set(n, reading);
+    ).finally(() => entry.settling.delete(n));
+    entry.settling.set(n, reading);
   }
 
-  /** A segment is finished once the run has started the next one. */
-  private refresh(session: Session): void {
-    if (!session.proc) return;
-    while (fs.existsSync(path.join(session.dir, `${session.writing + 1}.ts`))) session.writing += 1;
-    for (let n = session.runFrom; n < session.writing; n++) {
-      if (!session.done.has(n)) this.settle(session, n);
+  /** Every segment a file on the disk: the film is kept whole. */
+  private complete(entry: Entry): void {
+    if (entry.complete || !this.keeps(entry) || entry.onDisk.size < entry.plan.starts.length) return;
+    entry.complete = true;
+    for (const run of [...entry.runs]) this.kill(run);
+    const now = new Date().toISOString();
+    const film: KeptFilm = {
+      variant: entry.variant, folder: path.basename(entry.dir), itemId: entry.plan.itemId, title: entry.title, rung: entry.plan.delivery.rung,
+      segments: entry.plan.starts.length, sizeBytes: sumOf(entry.onDisk), completedAt: now, usedAt: now
+    };
+    this.kept.set(entry.variant, film);
+    this.writeKept(film);
+    this.log.info({ item: film.itemId, variant: film.variant, bytes: film.sizeBytes }, "Converted all through: kept");
+    this.onKept?.();
+  }
+
+  /** The note that keeps a film, written whole and swapped in: two notes at
+   *  once, or a restart halfway, must never leave an empty one. */
+  private writeKept(film: KeptFilm): void {
+    const { inUse: _inUse, ...stored } = film;
+    const file = path.join(this.root, CACHE_FOLDER, film.folder, ENTRY_FILE);
+    try {
+      fs.writeFileSync(`${file}.part`, JSON.stringify(stored));
+      fs.renameSync(`${file}.part`, file);
+    } catch (err) {
+      this.log.warn({ err, variant: film.variant }, "Could not note a kept film");
     }
-    const ahead = session.writing - session.lastWanted;
-    if (ahead > MAX_AHEAD || (this.full() && ahead >= MIN_AHEAD)) this.kill(session);
   }
 
-  /** Near the end of what was made and nothing running: carry on from there. */
-  private keepAhead(session: Session, n: number): void {
-    if (session.proc) return;
+  /** The kept films' notes, read on start. */
+  private readKept(): void {
+    const cache = path.join(this.root, CACHE_FOLDER);
+    let names: string[];
+    try {
+      names = fs.readdirSync(cache);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      try {
+        const film = JSON.parse(fs.readFileSync(path.join(cache, name, ENTRY_FILE), "utf8")) as KeptFilm;
+        if (typeof film.variant === "string") this.kept.set(film.variant, { ...film, folder: name });
+      } catch {
+        /* not kept: prepareRoot removed it, or it is someone's leftover */
+      }
+    }
+  }
+
+  /** A run's finished segments go to its entry: a segment counts as finished
+   *  once the run has started the next one. A run stops when it is far enough
+   *  ahead of its viewer, when memory is full, or when it reaches a segment
+   *  another run made or is making. */
+  private refresh(run: Run): void {
+    const entry = run.entry;
+    if (!entry.runs.has(run)) return;
+    while (fs.existsSync(path.join(run.dir, `${run.writing + 1}.ts`))) run.writing += 1;
+    for (let n = run.from; n < run.writing; n++) {
+      const file = path.join(run.dir, `${n}.ts`);
+      if (fs.existsSync(file)) this.settle(entry, n, file);
+    }
+    if (!entry.runs.has(run)) return;
+    const ahead = run.writing - run.owner.lastWanted;
+    // The segment it is writing now was made already, or a run started ahead of
+    // it is making it: from here on it would only repeat what is there.
+    const repeating = run.writing >= run.from && (entry.done.has(run.writing) ||
+      [...entry.runs].some((other) => other !== run && other.from > run.from && other.from <= run.writing && run.writing <= other.writing + 1));
+    if (ahead > MAX_AHEAD || (this.full() && ahead >= MIN_AHEAD) || repeating) this.kill(run);
+  }
+
+  /** Near the end of what was made and nothing coming: carry on from there. */
+  private keepAhead(viewer: Viewer, n: number): void {
+    const entry = viewer.entry;
+    if (viewer.run || entry.complete) return;
     let next = n + 1;
-    while (session.done.has(next)) next += 1;
-    if (next >= session.plan.starts.length || next - n > RESTART_WITHIN) return;
+    while (entry.done.has(next)) next += 1;
+    if (next >= entry.plan.starts.length || next - n > RESTART_WITHIN) return;
+    if ([...entry.runs].some((run) => next >= run.from && next <= run.writing + JUMP_AHEAD)) return;
     // Memory full: only once the player is nearly out of what was made.
     if (this.full() && next - n >= MIN_AHEAD) return;
-    this.start(session, next);
+    this.start(viewer, next);
   }
 
-  private forget(session: Session, n: number): void {
-    session.done.delete(n);
-    const data = session.memory.get(n);
+  /** Out of memory; still a file if it is one. */
+  private dropMemory(entry: Entry, n: number): void {
+    const data = entry.memory.get(n);
+    if (!data) return;
+    entry.memory.delete(n);
+    entry.memoryBytes -= data.length;
+    if (!entry.onDisk.has(n)) entry.done.delete(n);
+  }
+
+  private forget(entry: Entry, n: number): void {
+    entry.done.delete(n);
+    const data = entry.memory.get(n);
     if (data) {
-      session.memory.delete(n);
-      session.memoryBytes -= data.length;
+      entry.memory.delete(n);
+      entry.memoryBytes -= data.length;
     }
-    session.onDisk.delete(n);
-    fs.rm(path.join(session.dir, `${n}.ts`), { force: true }, () => undefined);
+    if (entry.onDisk.delete(n)) fs.rm(path.join(entry.dir, `${n}.ts`), { force: true }, () => undefined);
   }
 
-  private forgetBehind(session: Session, n: number): void {
-    for (const done of [...session.done]) {
-      if (done < n - KEEP_BEHIND) this.forget(session, done);
+  /** What is behind every viewer of the entry: kept on the disk when the entry
+   *  is being kept, else forgotten — and out of memory first when it is full. */
+  private forgetBehind(entry: Entry): void {
+    if (entry.complete || entry.viewers.size === 0) return;
+    const low = Math.min(...[...entry.viewers].map((viewer) => viewer.lastWanted));
+    const keeping = this.keeps(entry);
+    for (const done of [...entry.done]) {
+      if (done < low - KEEP_BEHIND) {
+        if (keeping) this.dropMemory(entry, done);
+        else this.forget(entry, done);
+      }
     }
     // Memory full: what is behind the player goes first, to make room ahead.
-    for (const done of [...session.done].filter((at) => at < n).sort((a, b) => a - b)) {
+    for (const done of [...entry.done].filter((at) => at < low).sort((a, b) => a - b)) {
       if (!this.full()) break;
-      if (session.memory.has(done)) this.forget(session, done);
+      if (!entry.memory.has(done)) continue;
+      if (keeping) this.dropMemory(entry, done);
+      else this.forget(entry, done);
     }
   }
 
   private sweep(): void {
     const now = Date.now();
-    for (const session of [...this.sessions.values()]) {
-      if (session.proc) this.refresh(session);
-      if (now - session.touched > IDLE_MS) this.stop(session.key);
+    for (const entry of [...this.entries.values()]) {
+      for (const run of [...entry.runs]) this.refresh(run);
+    }
+    for (const viewer of [...this.viewers.values()]) {
+      if (now - viewer.touched > IDLE_MS) this.stop(viewer.key);
+    }
+    // Half-made versions nobody has come back to.
+    for (const entry of [...this.entries.values()]) {
+      if (entry.viewers.size === 0 && entry.idleSince > 0 && now - entry.idleSince > ENTRY_GRACE_MS) this.drop(entry, true);
     }
     for (const [key, at] of this.left) {
       if (now - at > IDLE_MS) this.left.delete(key);
     }
   }
 }
+
+const sumOf = (sizes: Map<number, number>) => {
+  let sum = 0;
+  for (const size of sizes.values()) sum += size;
+  return sum;
+};

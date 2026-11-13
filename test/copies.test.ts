@@ -144,7 +144,7 @@ describe("a copy to download", () => {
     expect(list.copies).toHaveLength(1);
     expect(list.copies[0]).toMatchObject({ title: "Tall Film", state: "ready", quality: 480 });
     expect(list.usedBytes).toBeGreaterThan(0);
-    expect(list.settings.limitGb).toBe(20);
+    expect(list.settings.limitGb).toBe(50);
   }, 60_000);
 
   it("copies the picture as it is when it already fits, and says a plain file needs none", async () => {

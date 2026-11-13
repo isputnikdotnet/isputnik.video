@@ -41,7 +41,7 @@ export const copySettingsSchema = z.object({
   limitGb: z.number().int().min(1).max(10_000)
 });
 export type CopySettings = z.infer<typeof copySettingsSchema>;
-export const DEFAULT_COPIES: CopySettings = { limitGb: 20 };
+export const DEFAULT_COPIES: CopySettings = { limitGb: 50 };
 
 export type CopyState = "queued" | "running" | "ready" | "failed";
 
@@ -193,6 +193,20 @@ export class Copies {
     return { path: file, size: stat.size, modified: stat.mtime };
   }
 
+  /** A copy was just made: the app keeps everything kept under one limit (cache.ts). */
+  onReady: ((key: CopyKey) => void) | null = null;
+
+  /** The finished copies, for the shared limit: what each takes and when it was last wanted. */
+  readyItems(): { key: CopyKey; sizeBytes: number; usedAt: string }[] {
+    const rows = this.db.prepare("SELECT * FROM copies WHERE state = 'ready'").all() as CopyRow[];
+    return rows.map((row) => ({ key: { itemId: row.item_id, rung: row.rung as Rung, audio: row.audio }, sizeBytes: row.size_bytes, usedAt: row.used_at ?? row.ready_at ?? row.requested_at }));
+  }
+
+  /** Removes one copy (the shared limit's choice). */
+  remove(key: CopyKey): void {
+    this.drop(key);
+  }
+
   /** Every copy, newest first, and what the finished ones take: for the admin. */
   list() {
     const rows = this.db.prepare("SELECT * FROM copies ORDER BY requested_at DESC").all() as CopyRow[];
@@ -317,6 +331,7 @@ export class Copies {
             .run(size, now(), now(), job.itemId, job.rung, job.audio);
           this.log.info({ item: job.itemId, quality: job.rung, size, seconds: Math.round((Date.now() - running.startedAt) / 1000), gpu: Boolean(gpu) }, "A copy is ready to download");
           this.trim(job);
+          this.onReady?.(job);
         } catch (err) {
           failure = `The copy could not be kept: ${(err as Error).message}`;
         }

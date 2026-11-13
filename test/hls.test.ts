@@ -443,23 +443,29 @@ describe("real segments", () => {
     await setConversion({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3 });
   }, 60_000);
 
-  it("turns away a viewer past the admin's limit, and lets them in once a place is free", async () => {
+  it("turns away a viewer past the admin's limit, lets them share what is being watched, and in once a place is free", async () => {
     await setConversion({ storage: "memory", maxViewers: 1 });
     const dad = { ...headers, "x-isputnik-user-id": "dad", "x-isputnik-user-name": "Dad" };
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
 
-    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: dad })).json().playback.busy).toEqual({ reason: "household", limit: 1 });
-    const refused = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/index.m3u8`, headers: dad });
+    // Another film needs a place of its own: there is none.
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${secondId}`, headers: dad })).json().playback.busy).toEqual({ reason: "household", limit: 1 });
+    const refused = await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/index.m3u8`, headers: dad });
     expect(refused.statusCode).toBe(503);
     expect(refused.json()).toMatchObject({ code: "busy", reason: "household", limit: 1 });
-    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).json().code).toBe("busy");
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/0.ts`, headers: dad })).json().code).toBe("busy");
+    // The film Mum is watching is made once for both: Dad joins it.
+    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers: dad })).json().playback.busy).toBeNull();
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).statusCode).toBe(200);
+    const viewers = (await conversion()).usage.viewers as { user: string; shared: boolean }[];
+    expect(viewers.map((viewer) => [viewer.user, viewer.shared])).toEqual([["Mum", true], ["Dad", true]]);
     // Mum, already watching, carries on.
-    expect((await app.inject({ method: "GET", url: `/video/api/play/${filmId}`, headers })).json().playback.busy).toBeNull();
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers })).statusCode).toBe(200);
 
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
-    expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).statusCode).toBe(200);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers: dad });
+    expect((await app.inject({ method: "GET", url: `/video/api/hls/${secondId}/0.ts`, headers: dad })).statusCode).toBe(200);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${secondId}`, headers: dad });
     await setConversion({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3 });
   }, 60_000);
 

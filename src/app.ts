@@ -21,6 +21,7 @@ import { HlsBusyError, HlsError, HlsSessions, buildPlan, legacyOf, playlist, typ
 import { isInside, isMapped } from "./mounts.js";
 import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
 import { Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
+import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
@@ -296,6 +297,24 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // the container (on Unraid, docker.img): none are made there. Ones made before
   // are still handed out until the admin deletes them.
   const copiesInsideContainer = Boolean(hls && isInside(copiesDir, hls.folder) && !hls.mapped);
+  // One limit (Room for kept video) for the copies and the films kept whole once
+  // converted all through (cache.ts): past it, what was used longest ago goes.
+  const copyId = (key: CopyKey) => `${key.itemId}:${key.rung}:${key.audio}`;
+  const trimCache = (justMade: string | null = null) => {
+    if (!copies) return;
+    const things: KeptThing[] = [
+      ...copies.readyItems().map((copy) => ({ kind: "copy" as const, id: copyId(copy.key), sizeBytes: copy.sizeBytes, usedAt: copy.usedAt, held: copyId(copy.key) === justMade })),
+      ...(hls?.keptFilms() ?? []).map((film) => ({ kind: "film" as const, id: film.variant, sizeBytes: film.sizeBytes, usedAt: film.usedAt, held: Boolean(film.inUse) || film.variant === justMade }))
+    ];
+    const ready = new Map(copies.readyItems().map((copy) => [copyId(copy.key), copy.key]));
+    for (const thing of overLimit(things, readCopies(db).limitGb * 1024 ** 3)) {
+      if (thing.kind === "film") hls?.removeKept(thing.id);
+      else if (ready.has(thing.id)) copies.remove(ready.get(thing.id)!);
+    }
+  };
+  if (hls) hls.onKept = () => trimCache();
+  if (copies) copies.onReady = (key) => trimCache(copyId(key));
+  trimCache();
 
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
   const artDir = options.artDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
@@ -704,7 +723,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         const { mode, reasons, videoCopy } = decided.delivery;
         const hlsUrl = `${API}/hls/${item.id}/${trackSegment(decided.delivery)}/index.m3u8`;
         // Every place to watch converted video taken: the player says so instead.
-        const busy = mode !== "direct" && hls ? hls.refusal(`${identity.id}:${item.id}`) : null;
+        // A version already being watched, or kept whole, takes no place; its plan
+        // is cheap to know unless its picture is copied (that needs the keyframes).
+        const shareable = videoCopy ? item.id : buildPlan(item.id, file.absolute, decided.info, decided.delivery, null, `${file.size}:${file.modified.getTime()}`);
+        const busy = mode !== "direct" && hls ? hls.refusal(`${identity.id}:${item.id}`, shareable) : null;
         playback = { mode, reasons, url: mode === "direct" ? stream : hlsUrl, duration: decided.info.duration || null, busy, quality };
         audioTracks = decided.info.audio.map((track) => ({ ...track, selected: track.index === decided.delivery.audio?.index }));
         // The playlist of a picture copied as it is needs its keyframes: start
@@ -802,7 +824,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
     return {
       key: `${identity.id}:${item.id}`,
-      plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes),
+      plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes, `${file.size}:${file.modified.getTime()}`),
       who: { user: identity.name || identity.id, title }
     };
   };
@@ -820,7 +842,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const found = await planFor(request);
     if (!found) return reply.code(404).send({ error: "Not found" });
     // Every place taken: refused before the player waits on a segment.
-    const refused = hls!.refusal(found.key);
+    const refused = hls!.refusal(found.key, found.plan);
     if (refused) return busyReply(reply, refused);
     if (!segment) {
       return reply.header("Content-Type", "application/vnd.apple.mpegurl").header("Cache-Control", "private, no-store").send(playlist(found.plan));
@@ -1057,7 +1079,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // The copies kept, what they take and how much they may: home's Settings → Video.
   // Engine 0.35+: insideContainer — the copies' folder is no disk of its own, so
   // no new ones are made; those there are handed out until deleted.
-  const copiesList = (made: Copies) => ({ ...made.list(), insideContainer: copiesInsideContainer });
+  // Engine 0.35+: the films kept whole once converted all through, under the same limit.
+  const copiesList = (made: Copies) => {
+    const kept = hls?.keptFilms() ?? [];
+    return { ...made.list(), insideContainer: copiesInsideContainer, kept, keptBytes: kept.reduce((sum, film) => sum + film.sizeBytes, 0) };
+  };
   app.get(`${API}/admin/copies`, { preHandler: requireAdmin }, async (_request, reply) =>
     (copies ? copiesList(copies) : reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" })));
 
@@ -1066,13 +1092,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const settings = copySettingsSchema.parse({ ...readCopies(db), ...(request.body as object) });
     saveCopies(db, settings);
     copies.configure(settings);
+    trimCache();
     note(request, "info", "copies.changed", { detail: `Copies to download may take ${settings.limitGb} GB` });
     return copiesList(copies);
   });
 
   app.delete(`${API}/admin/copies`, { preHandler: requireAdmin }, async (request, reply) => {
     if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" });
-    const removed = copies.clear();
+    let removed = copies.clear();
+    for (const film of hls?.keptFilms() ?? []) if (!film.inUse && hls?.removeKept(film.variant)) removed += 1;
     note(request, "info", "copies.cleared", { detail: `${removed} copies to download removed` });
     return copiesList(copies);
   });
