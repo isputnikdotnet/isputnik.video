@@ -17,7 +17,8 @@
     "lint": "eslint .",
     "changelog": "node scripts/changelog-md.mjs",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:scan": "tsx scripts/bench-scan.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
