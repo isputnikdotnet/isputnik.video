@@ -87,6 +87,11 @@ describe("where a film is converted", () => {
     expect((await hardwareWith(found({ tonemap: false }))).choose(info, delivery)).toEqual({ device: "/dev/dri/renderD128", decode: false, tonemap: false, overlay: false });
   });
 
+  it("tone-maps HLG on the CPU even where the GPU tone-maps PQ: it carries no mastering display data (issue 2)", async () => {
+    const info = film("hevc", "yuv420p10le", 2160, 3840, "arib-std-b67");
+    expect((await hardwareWith(found({ tonemap: true }))).choose(info, decideDelivery(info, ".mkv"))).toEqual({ device: "/dev/dri/renderD128", decode: false, tonemap: false, overlay: false });
+  });
+
   it("needs neither for a picture that goes through as it is", async () => {
     const hardware = await hardwareWith(found());
     const info = film("h264", "yuv420p");
@@ -111,6 +116,15 @@ describe("where a film is converted", () => {
     expect(hardware.state().setAside).toBe(true);
     await hardware.check();
     expect(hardware.choose(info, delivery)).not.toBeNull();
+  });
+
+  it("sends a film the GPU can't tone-map for want of mastering data to the CPU, without holding it against the GPU", async () => {
+    const hardware = await hardwareWith(found(), "gpu");
+    const info = film("hevc", "yuv420p");
+    const stderr = "[Parsed_tonemap_vaapi_0] No mastering display data from input\nError while filtering: Invalid argument";
+    for (let i = 0; i < 3; i++) expect(hardware.failed("Error while filtering: Invalid argument", stderr)).toBe(true);
+    expect(hardware.state().setAside).toBe(false);
+    expect(hardware.choose(info, decideDelivery(info, ".mkv"))).not.toBeNull();
   });
 
   it("never falls back in GPU only, so the failure shows", async () => {

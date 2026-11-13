@@ -46,13 +46,14 @@ interface Sidecar {
 const FORCED = new Set(["forced", "foreign"]);
 const SDH = new Set(["sdh", "cc", "hi"]);
 
-/** The subtitle files beside a video file. */
-function sidecars(videoFile: string): Sidecar[] {
+/** The subtitle files beside a video file. The folder is listed without
+ *  holding the engine: it may sit on a disk that has spun down. */
+async function sidecars(videoFile: string): Promise<Sidecar[]> {
   const dir = path.dirname(videoFile);
   const base = path.basename(videoFile, path.extname(videoFile)).toLowerCase();
   let names: string[];
   try {
-    names = fs.readdirSync(dir);
+    names = await fs.promises.readdir(dir);
   } catch {
     return [];
   }
@@ -107,11 +108,11 @@ const embeddedTrack = (stream: SubtitleStream): SubtitleTrack | null => {
 };
 
 /** Every subtitle the player can offer for a file: inside it first, then beside it. */
-export function listSubtitles(info: MediaInfo | null, videoFile: string): SubtitleTrack[] {
+export async function listSubtitles(info: MediaInfo | null, videoFile: string): Promise<SubtitleTrack[]> {
   const inside = (info?.subtitles ?? []).map(embeddedTrack).filter((track): track is SubtitleTrack => track !== null);
   // An image subtitle is drawn onto the picture: a file without one has nothing to draw on.
   const drawable = inside.filter((track) => track.kind === "text" || info?.video);
-  return [...drawable, ...sidecars(videoFile).map((sidecar) => sidecar.track)];
+  return [...drawable, ...(await sidecars(videoFile)).map((sidecar) => sidecar.track)];
 }
 
 /** The stream index of an image track id ("s4" → 4); null for anything else. */
@@ -145,12 +146,12 @@ export class SubtitleCache {
 
   /** The WebVTT for `trackId`; null when the file has no such text track. */
   async webVtt(info: MediaInfo | null, file: { absolute: string; size: number; modified: Date }, trackId: string): Promise<string | null> {
-    const track = listSubtitles(info, file.absolute).find((candidate) => candidate.id === trackId);
+    const track = (await listSubtitles(info, file.absolute)).find((candidate) => candidate.id === trackId);
     if (!track || track.kind !== "text") return null;
-    const sidecar = track.external ? sidecars(file.absolute).find((candidate) => candidate.track.id === trackId) : undefined;
+    const sidecar = track.external ? (await sidecars(file.absolute)).find((candidate) => candidate.track.id === trackId) : undefined;
     let stamp = `${file.size}:${file.modified.getTime()}`;
     if (sidecar) {
-      const stat = fs.statSync(sidecar.file);
+      const stat = await fs.promises.stat(sidecar.file);
       stamp = `${stat.size}:${stat.mtimeMs}`;
     }
     const key = `${file.absolute}\n${trackId}\n${stamp}`;
@@ -164,7 +165,7 @@ export class SubtitleCache {
     const running = this.running.get(key);
     if (running) return running;
     const work = (sidecar
-      ? toWebVtt(this.tools, { text: decodeSubtitleText(fs.readFileSync(sidecar.file)), format: sidecar.format })
+      ? fs.promises.readFile(sidecar.file).then((bytes) => toWebVtt(this.tools, { text: decodeSubtitleText(bytes), format: sidecar.format }))
       : toWebVtt(this.tools, { file: file.absolute, index: Number(trackId.slice(1)) })
     ).then((vtt) => {
       this.done.set(key, vtt);

@@ -716,7 +716,7 @@ export class Copies {
       if (code === 0) return finish(null);
       const reason = stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`;
       // The GPU failed: the same copy again on the CPU, unless the admin asked for the GPU only.
-      if (gpu && this.hardware?.failed(reason)) {
+      if (gpu && this.hardware?.failed(reason, stderr)) {
         this.log.warn({ item: job.itemId, reason }, "The GPU could not make this copy; making it on the CPU");
         this.runnings = this.runnings.filter((candidate) => candidate !== running);
         fs.rm(part, { force: true }, () => undefined);

@@ -49,9 +49,45 @@ const parse = (raw: unknown): RawPerson[] => {
 
 const nameId = (key: string) => `n${crypto.createHash("sha1").update(key).digest("base64url").slice(0, 15)}`;
 
-/** Work out every title's cast and crew again (or some titles'), and let go of
- *  people no title has any more, with their kept pictures. */
+/** How many titles one slice of a whole rebuild works out before giving way. */
+const SLICE = 100;
+
+/** Work out every title's cast and crew again, a slice at a time so the engine
+ *  keeps answering (a big library is tens of thousands of credits), then let go
+ *  of what no title has any more. */
+export async function rebuildAllCredits(db: Db, artDir: string, signal?: AbortSignal): Promise<void> {
+  const ids = (db.prepare("SELECT id FROM shows UNION ALL SELECT id FROM movies").all() as { id: string }[]).map((row) => row.id);
+  for (let at = 0; at < ids.length; at += SLICE) {
+    if (signal?.aborted || !db.open) return;
+    rebuildCredits(db, artDir, ids.slice(at, at + SLICE));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  if (signal?.aborted || !db.open) return;
+  rebuildCredits(db, artDir);
+}
+
+/** The titles that credit someone by name only, whose name TMDB has since given
+ *  a person of (another title's cast): worked out again, so it is that person.
+ *  For after a metadata pass, which works out only the titles TMDB told it new
+ *  people of. */
+export function relinkNamedPeople(db: Db, artDir: string): void {
+  const ids = (db.prepare(`
+    SELECT DISTINCT c.item_id FROM credits c JOIN people p ON p.id = c.person_id
+    WHERE p.tmdb_id IS NULL AND EXISTS (SELECT 1 FROM people q WHERE q.name_key = p.name_key AND q.tmdb_id IS NOT NULL)
+  `).all() as { item_id: string }[]).map((row) => row.item_id);
+  rebuildCredits(db, artDir, ids);
+}
+
+/** Work out some titles' cast and crew again — or, with no ids, every title's
+ *  — and let go of people none has any more, with their kept pictures. An id
+ *  whose title is gone loses its credits. */
 export function rebuildCredits(db: Db, artDir: string, itemIds: string[] | null = null): void {
+  if (itemIds && itemIds.length === 0) return;
+  // SQLite takes a few hundred parameters at once; a long list goes in slices.
+  if (itemIds && itemIds.length > SLICE * 4) {
+    for (let at = 0; at < itemIds.length; at += SLICE * 4) rebuildCredits(db, artDir, itemIds.slice(at, at + SLICE * 4));
+    return;
+  }
   const titles = (["shows", "movies"] as const).flatMap((table) => {
     const filter = itemIds ? `WHERE t.id IN (${itemIds.map(() => "?").join(", ")})` : "";
     return db.prepare(`
@@ -59,17 +95,34 @@ export function rebuildCredits(db: Db, artDir: string, itemIds: string[] | null 
       LEFT JOIN metadata m ON m.item_id = t.id ${filter}
     `).all(...(itemIds ?? [])) as { id: string; nfo_people: string; tmdb_people: string }[];
   });
-  if (itemIds && itemIds.length === 0) return;
 
   const write = db.transaction(() => {
+    // Who the titles being worked out credited before: those left with no title
+    // after are let go. (A rebuild of every title looks at everyone.)
+    const marks = itemIds ? itemIds.map(() => "?").join(", ") : "";
+    const before = itemIds
+      ? (db.prepare(`SELECT DISTINCT person_id FROM credits WHERE item_id IN (${marks})`).all(...itemIds) as { person_id: string }[]).map((row) => row.person_id)
+      : null;
+    const parsed = new Map(titles.map((title) => [title.id, { nfo: parse(title.nfo_people), tmdb: parse(title.tmdb_people) }]));
+
     // Names that belong to exactly one TMDB person in the library: an .nfo name
-    // without an id is that person.
+    // without an id is that person. Only the names these titles use are looked up.
     const byName = new Map<string, string | null>();
     const known = (key: string, tmdbId: string) => byName.set(key, byName.has(key) && byName.get(key) !== tmdbId ? null : tmdbId);
-    for (const row of db.prepare("SELECT tmdb_id, name_key FROM people WHERE tmdb_id IS NOT NULL").all() as { tmdb_id: string; name_key: string }[]) known(row.name_key, row.tmdb_id);
+    if (itemIds) {
+      const keys = [...new Set([...parsed.values()].flatMap(({ nfo, tmdb }) => [...nfo, ...tmdb].map((entry) => personKey(entry.name)).filter(Boolean)))];
+      const lookup = db.prepare(`SELECT tmdb_id, name_key FROM people WHERE tmdb_id IS NOT NULL AND name_key IN (${Array.from({ length: SLICE }, () => "?").join(", ")})`);
+      for (let at = 0; at < keys.length; at += SLICE) {
+        const chunk = keys.slice(at, at + SLICE);
+        while (chunk.length < SLICE) chunk.push("");
+        for (const row of lookup.all(...chunk) as { tmdb_id: string; name_key: string }[]) known(row.name_key, row.tmdb_id);
+      }
+    } else {
+      for (const row of db.prepare("SELECT tmdb_id, name_key FROM people WHERE tmdb_id IS NOT NULL").all() as { tmdb_id: string; name_key: string }[]) known(row.name_key, row.tmdb_id);
+    }
     // …and those the titles being worked out name, so the first rebuild links them too.
-    for (const title of titles) {
-      for (const entry of [...parse(title.nfo_people), ...parse(title.tmdb_people)]) if (entry.tmdbId) known(personKey(entry.name), entry.tmdbId);
+    for (const { nfo, tmdb } of parsed.values()) {
+      for (const entry of [...nfo, ...tmdb]) if (entry.tmdbId) known(personKey(entry.name), entry.tmdbId);
     }
     const upsert = db.prepare(`
       INSERT INTO people (id, tmdb_id, name, name_key, profile_path) VALUES (@id, @tmdbId, @name, @key, @profilePath)
@@ -79,10 +132,11 @@ export function rebuildCredits(db: Db, artDir: string, itemIds: string[] | null 
     const insert = db.prepare("INSERT OR IGNORE INTO credits (item_id, person_id, kind, role, position, source) VALUES (?, ?, ?, ?, ?, ?)");
     const clear = db.prepare("DELETE FROM credits WHERE item_id = ?");
 
+    // Titles asked about that are gone: their credits go with them.
+    if (itemIds) for (const id of itemIds) if (!parsed.has(id)) clear.run(id);
     for (const title of titles) {
       clear.run(title.id);
-      const nfo = parse(title.nfo_people);
-      const tmdb = parse(title.tmdb_people);
+      const { nfo, tmdb } = parsed.get(title.id)!;
       const tmdbByName = new Map(tmdb.filter((entry) => entry.tmdbId).map((entry) => [personKey(entry.name), entry]));
       for (const kind of ["cast", "crew"] as const) {
         const own = nfo.filter((entry) => entry.kind === kind);
@@ -104,7 +158,9 @@ export function rebuildCredits(db: Db, artDir: string, itemIds: string[] | null 
     if (!itemIds) {
       db.prepare("DELETE FROM credits WHERE item_id NOT IN (SELECT id FROM shows) AND item_id NOT IN (SELECT id FROM movies)").run();
     }
-    const gone = db.prepare("SELECT id, photo FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM credits)").all() as { id: string; photo: string | null }[];
+    const gone = before
+      ? before.flatMap((id) => (db.prepare("SELECT p.id, p.photo FROM people p WHERE p.id = ? AND NOT EXISTS (SELECT 1 FROM credits c WHERE c.person_id = p.id)").all(id) as { id: string; photo: string | null }[]))
+      : db.prepare("SELECT id, photo FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM credits)").all() as { id: string; photo: string | null }[];
     for (const person of gone) {
       if (person.photo?.startsWith("cache:")) fs.rmSync(path.join(artDir, path.basename(person.photo.slice(6))), { force: true });
       db.prepare("DELETE FROM people WHERE id = ?").run(person.id);

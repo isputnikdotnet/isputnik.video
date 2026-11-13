@@ -21,7 +21,7 @@ import type { Db } from "./db.js";
 import type { Tools } from "./ffmpeg.js";
 import type { Identity } from "./identity.js";
 import type { MediaProbe } from "./media-probe.js";
-import { fileOf, findItem } from "./playback.js";
+import { fileOfAsync, findItem } from "./playback.js";
 
 const RATE = 8000;
 const FRAME = 2048;
@@ -632,7 +632,9 @@ export class DetectRunner {
 
   private async target(itemId: string): Promise<DetectTarget | null> {
     const item = findItem(this.options.db, ENGINE, itemId);
-    const file = item ? fileOf(this.options.mediaRoot, item) : null;
+    // Looked up without holding the engine; it also gives everyone else a turn
+    // per item when the whole pass has nothing new to look at.
+    const file = item ? await fileOfAsync(this.options.mediaRoot, item) : null;
     if (!file) return null;
     const info = await this.options.probe.info(itemId, file).catch(() => null);
     if (!info || !(info.duration > 0)) return null;

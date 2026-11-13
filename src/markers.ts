@@ -124,11 +124,12 @@ export function markersFromEdl(stretches: { start: number; end: number }[], dura
   return found;
 }
 
-function readEdl(videoFile: string): { start: number; end: number }[] {
+/** The .edl beside a video file, read without holding the engine. */
+async function readEdl(videoFile: string): Promise<{ start: number; end: number }[]> {
   const file = path.join(path.dirname(videoFile), `${path.basename(videoFile, path.extname(videoFile))}.edl`);
   try {
-    if (fs.statSync(file).size > MAX_EDL_BYTES) return [];
-    return parseEdl(fs.readFileSync(file, "utf8"));
+    if ((await fs.promises.stat(file)).size > MAX_EDL_BYTES) return [];
+    return parseEdl(await fs.promises.readFile(file, "utf8"));
   } catch {
     return [];
   }
@@ -138,9 +139,9 @@ function readEdl(videoFile: string): { start: number; end: number }[] {
  *  chapters', else what the engine found by itself (detect.ts), each kind on its
  *  own. Without the probe only the marks and what was found: an .edl means
  *  nothing without the file's length. */
-export function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS, detected: Markers = NO_MARKERS): Markers {
+export async function findMarkers(info: MediaInfo | null, videoFile: string, marks: Markers = NO_MARKERS, detected: Markers = NO_MARKERS): Promise<Markers> {
   if (!info) return { recap: marks.recap ?? detected.recap, intro: marks.intro ?? detected.intro, credits: marks.credits ?? detected.credits };
-  const edl = markersFromEdl(readEdl(videoFile), info.duration);
+  const edl = markersFromEdl(await readEdl(videoFile), info.duration);
   const chapters = markersFromChapters(info.chapters, info.start, info.duration);
   return {
     recap: marks.recap ?? chapters.recap ?? detected.recap,

@@ -73,10 +73,15 @@ export class MediaProbe {
     if (known && fresh) return Promise.resolve(known);
     return this.once(`info:${itemId}`, async () => {
       const info = await probe(this.tools, file.absolute);
+      // The keyframes stay when only the probe is old and the file is as it was:
+      // 0.31.0's re-probe dropped them, and every film played before paid for a
+      // whole-file read again (issue 8).
       this.db.prepare(`
         INSERT INTO media_probe (item_id, size, modified_ms, info, keyframes) VALUES (?, ?, ?, ?, NULL)
-        ON CONFLICT (item_id) DO UPDATE SET size = excluded.size, modified_ms = excluded.modified_ms,
-          info = excluded.info, keyframes = NULL, probed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        ON CONFLICT (item_id) DO UPDATE SET
+          keyframes = CASE WHEN media_probe.size = excluded.size AND media_probe.modified_ms = excluded.modified_ms THEN media_probe.keyframes END,
+          size = excluded.size, modified_ms = excluded.modified_ms,
+          info = excluded.info, probed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       `).run(itemId, file.size, file.modified.getTime(), JSON.stringify(info));
       return info;
     });

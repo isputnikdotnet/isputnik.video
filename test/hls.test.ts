@@ -10,7 +10,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
 import { findTools, keyframes, probe, type MediaInfo } from "../src/ffmpeg.js";
-import { DEFAULT_CONVERSION, HlsSessions, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
+import { DEFAULT_CONVERSION, HlsSessions, HlsSupersededError, buildPlan, ffmpegArgs, playlist, prepareRoot, segmentStarts } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 const info = (over: Partial<MediaInfo> & { vcodec?: string; pix?: string; acodec?: string; height?: number }): MediaInfo => ({
@@ -224,6 +224,34 @@ describe("seeking", () => {
       expect("data" in made ? made.data.length : made.size).toBeGreaterThan(0);
       expect(sessions.usage().viewers).toHaveLength(1);
       expect(sessions.usage().viewers[0]).toMatchObject({ mode: "transcode", rung: 480, converter: "cpu" });
+    } finally {
+      sessions.close();
+    }
+  }, 60_000);
+
+  it("lets the playlist asked for last decide the version: a request left over from before a switch is turned away, not given the run", async () => {
+    let converting = 0;
+    const counting = { info: (_obj: object, msg: string) => { if (msg === "Converting") converting += 1; }, warn: () => undefined };
+    const sessions = new HlsSessions(tools, null, counting);
+    try {
+      const heavy = { ...plan.info, bitRate: 50_000_000 };
+      const smaller = buildPlan("seek", plan.file, heavy, decideDelivery(heavy, ".mkv", null, null, 480), null);
+      sessions.choose("mum:seek", plan);
+      // Stopped by the switch: what it waited for is not wanted any more.
+      const old = sessions.segment("mum:seek", plan, 3).catch(() => undefined);
+      // Another quality chosen while segment 3 is on its way: its playlist first, then its segment.
+      sessions.choose("mum:seek", smaller);
+      const fresh = sessions.segment("mum:seek", smaller, 0);
+      // The old one asked again (a player or a proxy retrying) stands aside at once.
+      await expect(sessions.segment("mum:seek", plan, 3)).rejects.toBeInstanceOf(HlsSupersededError);
+      await fresh;
+      await old;
+      // Before, the two kept stopping each other's ffmpeg: 21 runs in 1.6 s (issue 3).
+      expect(converting).toBe(2);
+      // Switching back asks for the first playlist again, and is that version once more.
+      sessions.choose("mum:seek", plan);
+      await sessions.segment("mum:seek", plan, 3);
+      expect(converting).toBe(3);
     } finally {
       sessions.close();
     }

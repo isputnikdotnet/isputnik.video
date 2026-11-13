@@ -68,6 +68,11 @@ const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
 ];
 
 const TEST_TIMEOUT_MS = 20_000;
+/** A typical HDR10 grade's mastering display (P3 primaries, D65, 1000 to 0.0001
+ *  nits), in x265's notation, for the tone-mapping test's sample. */
+const HDR10_MASTER_DISPLAY = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)";
+/** What tonemap_vaapi says of a frame with no mastering display data. */
+const NO_MASTERING = /No mastering display data/i;
 
 type Runner = (binary: string, args: string[], timeoutMs: number) => Promise<{ ok: boolean; out: string }>;
 
@@ -168,6 +173,9 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
 
   // Tone mapping: a 10-bit HDR10 sample, decoded and tone-mapped on the GPU and
   // encoded there. Only where 10-bit HEVC decodes on it at all (Kaby Lake: maybe).
+  // With its mastering display and light levels, as an HDR10 film has them:
+  // tonemap_vaapi refuses a frame without ("No mastering display data from
+  // input"), so a bare PQ sample failed on every GPU (issue 2).
   let tonemap = false;
   // Drawing a subtitle: a picture with alpha laid over the film on the GPU.
   let overlay = false;
@@ -178,7 +186,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
       const made = await run(tools.ffmpeg, [
         "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "0.5",
         "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
-        "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc", file
+        "-x265-params", `log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=${HDR10_MASTER_DISPLAY}:max-cll=1000,400`, file
       ], TEST_TIMEOUT_MS);
       if (made.ok) {
         tonemap = (await run(tools.ffmpeg, [
@@ -270,10 +278,12 @@ export class Hardware {
     const caps = this.caps;
     if (!caps?.encode || !caps.device || this.setAside) return null;
     const key = decodeKeyOf(info);
-    const hdr = hdrOf(info.video) !== null;
+    const kind = hdrOf(info.video);
+    const hdr = kind !== null;
     // An HDR picture is decoded on the GPU only where it is tone-mapped there
-    // too; else the CPU decodes and tone-maps it, and the GPU encodes.
-    const canDecode = key !== null && caps.decode.includes(key) && (!hdr || caps.tonemap === true);
+    // too; else the CPU decodes and tone-maps it, and the GPU encodes. Only PQ
+    // (HDR10): tonemap_vaapi needs mastering display data, which HLG doesn't carry.
+    const canDecode = key !== null && caps.decode.includes(key) && (!hdr || (kind === "pq" && caps.tonemap === true));
     // A subtitle is drawn on the GPU where it can be; else the CPU draws it on a
     // picture it decoded, and only the encode goes to the GPU.
     const overlay = delivery.burn !== null && canDecode && caps.overlay === true;
@@ -281,8 +291,15 @@ export class Hardware {
     return { device: caps.device, decode, tonemap: decode && hdr, overlay };
   }
 
-  /** A GPU run failed: whether to run it again on the CPU (not in GPU only). */
-  failed(reason: string): boolean {
+  /** A GPU run failed: whether to run it again on the CPU (not in GPU only).
+   *  `stderr`, ffmpeg's: a film the GPU can't tone-map since it carries no
+   *  mastering display data is the film's doing, not the GPU's — it goes to the
+   *  CPU, and doesn't count towards setting the GPU aside for everything. */
+  failed(reason: string, stderr = ""): boolean {
+    if (NO_MASTERING.test(stderr) || NO_MASTERING.test(reason)) {
+      this.log.info({ reason }, "This film has no mastering display data for the GPU to tone-map it by; converting it on the CPU");
+      return true;
+    }
     this.failures.push(Date.now());
     if (this.setAside) this.log.warn({ reason }, `The GPU failed ${FAILURES_ALLOWED} times within an hour: converting on the CPU until the admin checks again`);
     return this.mode !== "gpu";

@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Db } from "./db.js";
 import { canSee, type Identity } from "./identity.js";
-import { resolveInside } from "./media.js";
+import { resolveInside, resolveInsideAsync } from "./media.js";
 
 export type ItemType = "episode" | "movie";
 
@@ -215,6 +215,19 @@ export function fileOf(mediaRoot: string, item: PlayableItem): { absolute: strin
   if (!absolute) return null;
   try {
     const stat = fs.statSync(absolute);
+    return stat.isFile() ? { absolute, size: stat.size, modified: stat.mtime } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** fileOf without holding the engine: a disk that has spun down answers only
+ *  once it is up again, and the request path must not make everyone wait for it. */
+export async function fileOfAsync(mediaRoot: string, item: PlayableItem): Promise<{ absolute: string; size: number; modified: Date } | null> {
+  const absolute = await resolveInsideAsync(mediaRoot, item.relative);
+  if (!absolute) return null;
+  try {
+    const stat = await fs.promises.stat(absolute);
     return stat.isFile() ? { absolute, size: stat.size, modified: stat.mtime } : null;
   } catch {
     return null;

@@ -25,8 +25,8 @@ const withSubs = (codecs: string[], height = 1080): MediaInfo => ({
 });
 
 describe("which subtitles a film offers", () => {
-  it("lists text and image tracks inside the file, skipping what can't be shown", () => {
-    const tracks = listSubtitles(withSubs(["subrip", "hdmv_pgs_subtitle", "eia_608"]), "/nowhere/film.mkv");
+  it("lists text and image tracks inside the file, skipping what can't be shown", async () => {
+    const tracks = await listSubtitles(withSubs(["subrip", "hdmv_pgs_subtitle", "eia_608"]), "/nowhere/film.mkv");
     expect(tracks).toMatchObject([
       { id: "s2", kind: "text", language: "eng", external: false },
       { id: "s3", kind: "image", language: null }

@@ -8,7 +8,7 @@ import path from "node:path";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type FastifyServerOptions } from "fastify";
 import { z } from "zod";
 import { WATCH_STATES, getMovie, getShow, listMovies, listShows, listTitles, visibleGenres, visibleLibraries, type WatchState } from "./catalog.js";
-import { browserPlayability, continueWatching, dismissContinue, fileOf, findItem, forgetHistory, markAllWatched, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
+import { browserPlayability, continueWatching, dismissContinue, fileOfAsync, findItem, forgetHistory, markAllWatched, movieIdOf, nextEpisode, nextPart, progressFor, purgeOrphanProgress, resumeAt, saveProgress, type PlayableItem } from "./playback.js";
 import { RUNGS, decideDelivery, rungOf, type Delivery, type DeliveryMode, type DeliveryReason, type Rung } from "./delivery.js";
 import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
@@ -17,7 +17,7 @@ import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
-import { HlsBusyError, HlsError, HlsSessions, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
+import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
 import { isInside, isMapped } from "./mounts.js";
 import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, readJobs, saveConversion, saveCopies, saveDetection, saveJobs } from "./settings.js";
 import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, jobSettingsSchema, type CopyKey } from "./copies.js";
@@ -38,7 +38,7 @@ import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
 import { editState, saveEdit, setNames } from "./edits.js";
-import { getPerson, keepPhoto, personVisible, photoFile, rebuildCredits, searchPeople } from "./credits.js";
+import { getPerson, keepPhoto, personVisible, photoFile, rebuildAllCredits, rebuildCredits, searchPeople } from "./credits.js";
 import { resolveGenres } from "./genres.js";
 import { GenreError, addKeyword, createGenre, deleteGenre, reloadGenres, genreOverview, hideWord, mergeGenre, removeKeyword, renameGenre, seedGenres, showWord } from "./genres.js";
 
@@ -106,6 +106,8 @@ const API = `${BASE_PATH}/api`;
 /** Requests here are small JSON; nothing posts a file to the engine. */
 export const BODY_LIMIT = 64 * 1024;
 const LOG_LINES_MAX = 500;
+/** How often a detection pass waiting for viewers looks again. */
+const VIEWER_CHECK_MS = 15_000;
 
 const eventsQuerySchema = z.object({
   level: z.enum(EVENT_LEVELS as [EventLevel, ...EventLevel[]]).optional(),
@@ -363,7 +365,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
    *  container or sound changes); null when the file can't be found or read. */
   const versionAt = async (itemId: string, rung: Rung): Promise<{ plan: HlsPlan | null; title: string; duration: number } | null> => {
     const item = findItem(db, engineIdentity, itemId);
-    const file = item ? fileOf(options.mediaRoot, item) : null;
+    const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
     if (!item || !file) return null;
     const decided = await deliveryFor(item, file, null, null, rung);
     if (!decided) return null;
@@ -429,7 +431,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!copies) return;
     for (const key of copies.pendingCopies()) {
       const item = findItem(db, engineIdentity, key.itemId);
-      const file = item ? fileOf(options.mediaRoot, item) : null;
+      const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
       const decided = item && file ? await deliveryFor(item, file, key.audio >= 0 ? key.audio : null, null, key.rung) : null;
       if (!item || !file || !decided || decided.delivery.mode === "direct" || copiesInsideContainer) {
         copies.remove(key);
@@ -470,6 +472,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
+  // A scan the engine was stopped in the middle of (docker stop, a crash) left
+  // its library queued or scanning; nothing is either on start.
+  db.prepare("UPDATE libraries SET scan_state = 'idle' WHERE scan_state IN ('queued', 'scanning')").run();
   const queued = new Set<string>();
   // Scans and metadata passes queued or running. A restore waits for none: it is
   // refused while there are any, since they would carry on writing into a catalog
@@ -496,12 +501,25 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   /** What an admin asked for (Find again): run at the next season boundary of
    *  whatever long pass is going, not after it — a first pass takes hours. */
   const detectUrgent: { scope: DetectScope; request: FastifyRequest | null }[] = [];
+  /** While someone watches converted video, a pass waits between two seasons or
+   *  films (as copies do): its ffmpeg would take the cores and the disk from them. */
+  const whileWatching = async (signal: AbortSignal) => {
+    while ((hls?.watching() ?? 0) > 0 && !signal.aborted) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(done, VIEWER_CHECK_MS);
+        function done() { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); }
+        signal.addEventListener("abort", done, { once: true });
+      });
+    }
+  };
   const runDetect = async (scope: DetectScope, force: boolean, request: FastifyRequest | null, between?: () => Promise<void>) => {
     if (!detector || detectStop.signal.aborted || !readDetection(db).enabled || !(await toolsReady)) return;
     const started = Date.now();
     const signal = AbortSignal.any([detectStop.signal, detectPause.signal]);
+    // Only the passes queued by scans and on start wait; what an admin asked for runs now.
+    const gate = between ? async () => { await whileWatching(signal); await between(); } : undefined;
     try {
-      const done = await detector.run(scope, force, signal, between);
+      const done = await detector.run(scope, force, signal, gate);
       if (done.seasons + done.films === 0) return;
       note(request, "info", "detect.finished", {
         libraryId: "library" in scope ? scope.library : null,
@@ -588,7 +606,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     purgeOrphanDetected(db);
     purgeOrphanMetadata(db, artDir);
     rebuildSets(db, artDir);
-    rebuildCredits(db, artDir);
+    // In slices: on a big library the whole cast is seconds of work.
+    void rebuildAllCredits(db, artDir).catch((err) => app.log.warn({ err }, "Could not work out the cast and crew again"));
   };
   sweep();
   const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
@@ -675,14 +694,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       queued.delete(libraryId);
       if (!getLibrary(db, libraryId)) return;
       setScanState(db, libraryId, "scanning");
-      // Let the queued answer go out before the disk is read.
-      await new Promise((resolve) => setImmediate(resolve));
       try {
-        const summary = scanLibrary(db, options.mediaRoot, libraryId, options.scan);
+        // The disk is read without holding the engine; only the catalog write is one stretch.
+        const summary = await scanLibrary(db, options.mediaRoot, libraryId, options.scan);
         // Sets the .nfo files name show at once; TMDB's follow with the metadata pass.
         rebuildSets(db, artDir);
-        // So does the cast an .nfo names.
-        rebuildCredits(db, artDir);
+        // So does the cast an .nfo names: of the titles whose .nfo changed, added or gone.
+        rebuildCredits(db, artDir, summary.peopleChanged);
         setScanState(db, libraryId, "idle");
         const growing = summary.growing > 0 ? `, ${summary.growing} file(s) still being copied left for later` : "";
         const unnumbered = summary.unnumbered > 0 ? `, ${summary.unnumbered} file(s) without a season and episode in the name` : "";
@@ -830,7 +848,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const identity = request.identity!;
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
     if (!item) return reply.code(404).send({ error: "Not found" });
-    const file = fileOf(options.mediaRoot, item);
+    const file = await fileOfAsync(options.mediaRoot, item);
     const progress = progressFor(db, identity.historyId, [item.id]).get(item.id) ?? null;
     // After an episode the next one; after a film its next part, else the next of its set.
     const next = item.type === "episode" ? nextEpisode(db, item.show!.id, item.id) : nextPart(db, item) ?? nextInSet(db, identity, item.id);
@@ -846,8 +864,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (file) {
       const probed = mediaProbe && (await toolsReady) ? await mediaProbe.info(item.id, file).catch(() => null) : null;
       probedVideoCodec = probed?.video?.codec ?? null;
-      markers = findMarkers(probed, file.absolute, markers, detectedMarkers(readDetected(db, item.id, file)));
-      const tracks = probed ? listSubtitles(probed, file.absolute) : [];
+      markers = await findMarkers(probed, file.absolute, markers, detectedMarkers(readDetected(db, item.id, file)));
+      const tracks = probed ? await listSubtitles(probed, file.absolute) : [];
       const decided = await deliveryFor(item, file, audioIndex, burnIndexOf(tracks, subtitle), quality.current);
       subtitleTracks = tracks.map((track) => ({
         ...track,
@@ -902,7 +920,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // from disk; the reply is written by hand so nothing buffers a film.
   const serveStream = async (request: FastifyRequest, reply: FastifyReply) => {
     const item = findItem(db, request.identity!, itemIdSchema.parse((request.params as { id: string }).id));
-    const file = item ? fileOf(options.mediaRoot, item) : null;
+    const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
     if (!item || !file) return reply.code(404).send({ error: "Not found" });
     const range = parseRange(request.headers.range, file.size);
     if (range === "invalid") {
@@ -942,7 +960,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const identity = request.identity!;
     const { id, track } = request.params as { id: string; track?: string };
     const item = findItem(db, identity, itemIdSchema.parse(id));
-    const file = item ? fileOf(options.mediaRoot, item) : null;
+    const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
     if (!item || !file || !hls || !mediaProbe) return null;
     // No track in the address (home 4.40.0): the default sound.
     const chosen = track === undefined ? null : /^t(\d{1,3}|-)(?:b(\d{1,3}))?(?:q(\d{3,4}))?$/.exec(track);
@@ -981,6 +999,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const refused = hls!.refusal(found.key, found.plan);
     if (refused) return busyReply(reply, refused);
     if (!segment) {
+      hls!.choose(found.key, found.plan);
       return reply.header("Content-Type", "application/vnd.apple.mpegurl").header("Cache-Control", "private, no-store").send(playlist(found.plan));
     }
     const n = Number(segment[1]);
@@ -990,6 +1009,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       made = await hls!.segment(found.key, found.plan, n, { who: found.who, signal: hungUp.signal, asked });
     } catch (err) {
       if (err instanceof HlsBusyError) return busyReply(reply, err.refusal);
+      // The player has moved on (a seek, another quality): a 4xx, which neither
+      // a player nor a proxy asks again, so it can't drag the run back.
+      if (err instanceof HlsSupersededError) return reply.code(409).send({ error: err.message, code: "superseded" });
       if (!(err instanceof HlsError)) throw err;
       return reply.code(503).header("Retry-After", "2").send({ error: err.message });
     }
@@ -1050,7 +1072,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const { id, name } = request.params as { id: string; name: string };
     const parsedId = subtitleIdSchema.safeParse(/^(.+)\.vtt$/.exec(name)?.[1]);
     const item = findItem(db, request.identity!, itemIdSchema.parse(id));
-    const file = item ? fileOf(options.mediaRoot, item) : null;
+    const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
     if (!parsedId.success || !item || !file || !subtitleCache || !mediaProbe || !(await toolsReady)) return reply.code(404).send({ error: "Not found" });
     let vtt: string | null;
     try {
@@ -1074,19 +1096,19 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (watched !== undefined) return null;
     const marks = readMarks(db, item);
     if (marks.credits) return marks.credits.start;
-    const file = fileOf(options.mediaRoot, item);
+    const file = await fileOfAsync(options.mediaRoot, item);
     if (!file || !mediaProbe || !(await toolsReady)) return null;
     const info = await mediaProbe.info(item.id, file).catch(() => null);
-    return findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file))).credits?.start ?? null;
+    return (await findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file)))).credits?.start ?? null;
   };
 
   /** A title's markers as /play gives them. */
   const markersOf = async (item: PlayableItem) => {
     const marks = readMarks(db, item);
-    const file = fileOf(options.mediaRoot, item);
+    const file = await fileOfAsync(options.mediaRoot, item);
     if (!file || !mediaProbe || !(await toolsReady)) return { markers: marks, duration: null };
     const info = await mediaProbe.info(item.id, file).catch(() => null);
-    return { markers: findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file))), duration: info?.duration ?? null };
+    return { markers: await findMarkers(info, file.absolute, marks, detectedMarkers(readDetected(db, item.id, file))), duration: info?.duration ?? null };
   };
 
   // Look for this episode's season's intros and credits again (or the film's),
@@ -1143,7 +1165,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const identity = request.identity!;
     const asked = copyQuerySchema.safeParse(raw ?? {});
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
-    const file = item ? fileOf(options.mediaRoot, item) : null;
+    const file = item ? await fileOfAsync(options.mediaRoot, item) : null;
     if (!asked.success || !item || !file || !copies) return null;
     const rung = rungOf(asked.data.quality)!;
     // A viewer away from home is held under the admin's cap for copies too.
@@ -1415,7 +1437,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // The folder picker in home's Add library: this engine's folders, under MEDIA_ROOT.
   app.get(`${API}/admin/folders`, { preHandler: requireAdmin }, async (request, reply) => {
     const { path: relative } = foldersQuerySchema.parse(request.query ?? {});
-    const listed = listFolders(options.mediaRoot, relative);
+    const listed = await listFolders(options.mediaRoot, relative);
     return listed ?? reply.code(404).send({ error: "No such folder" });
   });
 
@@ -1844,14 +1866,35 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // The whole catalog for home's backups (home's docs/apps-platform-plan.md →
   // Backups): one consistent copy; the event about it is written after it.
+  // Copied with SQLite's online backup, a few pages at a time between other
+  // work (the picture hashes kept for recaps make the catalog large), into a
+  // file of its own that is then streamed and let go.
   app.get(`${API}/admin/backup`, { preHandler: requireAdmin }, async (request, reply) => {
-    const bytes = db.serialize();
-    note(request, "info", "backup.taken", { detail: `Catalog handed over for a backup (${bytes.length} bytes)` });
-    return reply
-      .type("application/vnd.sqlite3")
-      .header("Cache-Control", "no-store")
-      .header("X-Isputnik-Backup-Version", options.version)
-      .send(bytes);
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "isputnik-video-backup-"));
+    const file = path.join(dir, "video.sqlite");
+    const letGo = () => fs.rm(dir, { recursive: true, force: true }, () => undefined);
+    let size: number;
+    try {
+      await db.backup(file);
+      size = (await fs.promises.stat(file)).size;
+    } catch (err) {
+      letGo();
+      throw err;
+    }
+    note(request, "info", "backup.taken", { detail: `Catalog handed over for a backup (${size} bytes)` });
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "application/vnd.sqlite3",
+      "Content-Length": size,
+      "Cache-Control": "no-store",
+      "X-Isputnik-Backup-Version": options.version
+    });
+    const stream = fs.createReadStream(file);
+    stream.on("error", (err) => reply.raw.destroy(err));
+    // Gone once read, or once home stops reading.
+    stream.on("close", letGo);
+    reply.raw.on("close", () => stream.destroy());
+    stream.pipe(reply.raw);
   });
 
   // And back (restore.ts): home sends a backup it holds, and it is in place when
@@ -1881,7 +1924,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     refuseWhileWorking();
     const from = request.headers["x-isputnik-backup-version"];
     const fromVersion = typeof from === "string" && from ? from : null;
-    const { kept } = restoreDatabase(restoreTarget, request.body, fromVersion);
+    const { kept } = await restoreDatabase(restoreTarget, request.body, fromVersion);
     afterRestore();
     note(request, "info", "backup.restored", {
       detail: `Catalog restored from a backup${fromVersion ? ` of version ${fromVersion}` : ""} (${request.body.length} bytes)${kept ? "; the one it replaced is kept to undo this" : ""}`

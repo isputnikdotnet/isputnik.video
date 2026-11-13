@@ -136,27 +136,31 @@ const undoFile = (target: RestoreTarget) => `${target.dbPath}.pre-restore`;
 const undoMeta = (target: RestoreTarget) => `${undoFile(target)}.json`;
 
 /** Replace the database with a backup. Returns whether the one replaced was kept. */
-export function restoreDatabase(target: RestoreTarget, bytes: Buffer, fromVersion: string | null): { kept: boolean } {
+export async function restoreDatabase(target: RestoreTarget, bytes: Buffer, fromVersion: string | null): Promise<{ kept: boolean }> {
   if (fromVersion && compareVersions(fromVersion, target.version) > 0) {
     throw new RestoreError(409, `That backup is from version ${fromVersion} and this container is ${target.version}. Update this container first.`);
   }
   const backup = openBackup(target, bytes);
   try {
     const keep = target.dbPath !== ":memory:";
-    const replaced = keep ? target.db.serialize() : null;
     // Written first, under another name: a restore that fails leaves the copy kept
-    // from the last one that worked.
+    // from the last one that worked. With SQLite's online backup, a few pages at
+    // a time, not the whole catalog in memory at once.
     const pending = `${undoFile(target)}.tmp`;
-    if (replaced) fs.writeFileSync(pending, replaced);
+    if (keep) {
+      fs.rmSync(pending, { force: true });
+      await target.db.backup(pending);
+    }
     try {
       replaceContents(target, backup);
     } catch (err) {
       fs.rmSync(pending, { force: true });
       throw err;
     }
-    if (replaced) {
+    if (keep) {
+      const bytesKept = fs.statSync(pending).size;
       fs.renameSync(pending, undoFile(target));
-      fs.writeFileSync(undoMeta(target), JSON.stringify({ takenAt: new Date().toISOString(), version: target.version, bytes: replaced.length } satisfies UndoInfo));
+      fs.writeFileSync(undoMeta(target), JSON.stringify({ takenAt: new Date().toISOString(), version: target.version, bytes: bytesKept } satisfies UndoInfo));
     }
     return { kept: keep };
   } finally {

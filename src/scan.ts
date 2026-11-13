@@ -13,14 +13,18 @@
 // A file still being written (a copy in progress) is left out until it has been
 // still for a while, so a half-copied season is never catalogued as something
 // else. A file already in the catalog that is being replaced stays as it was.
+//
+// The disk is read first, a few listings at a time and without holding the
+// engine (a big library on a NAS share takes minutes), into a DiskView; the
+// catalog is then written from it in one short transaction.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Db } from "./db.js";
-import { isIgnoredName, isVideoFile, normalizeRelative, resolveInside } from "./media.js";
+import { inTurns, isIgnoredName, isVideoFile, normalizeRelative, resolveInsideAsync } from "./media.js";
 import { episodeFromFile, episodeTitleFromFile, isExtraFile, isPartFolder, parseFolderName, partFromName, seasonFromFolder, sortTitle, type NameFacts } from "./names.js";
 import { afterScan } from "./edits.js";
-import { readNfo } from "./nfo.js";
+import { parseNfo, readNfoText, type NfoFacts, type NfoRoot } from "./nfo.js";
 
 /** How long a file must have been left alone before it counts as copied. */
 export const SETTLE_MS = 2 * 60 * 1000;
@@ -42,6 +46,9 @@ export interface ScanSummary {
   growing: number;
   /** Video files in a show whose season and episode could not be read. */
   unnumbered: number;
+  /** Titles whose cast and crew are to be worked out again: added, removed, or
+   *  their .nfo naming other people (credits.ts). */
+  peopleChanged: string[];
 }
 
 export class ScanError extends Error {}
@@ -63,24 +70,100 @@ interface FoundFile {
 
 const newId = () => crypto.randomBytes(12).toString("base64url");
 
-function videoFiles(dir: string, settleBefore: number, depth = 0, prefix = ""): FoundFile[] {
-  if (depth > MAX_DEPTH) return [];
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
+interface ListedEntry {
+  name: string;
+  directory: boolean;
+  file: boolean;
+}
+
+/** How many listings, stats and .nfo reads are in flight at once. */
+const DISK_WIDTH = 8;
+const isNfoName = (name: string) => path.extname(name).toLowerCase() === ".nfo";
+
+/** A library's folders as they were read: listings, the size and date of each
+ *  video file and the text of each .nfo found in them. The catalog is written
+ *  from this, so nothing waits on the disk inside the transaction. */
+export class DiskView {
+  private listings = new Map<string, ListedEntry[]>();
+  private stats = new Map<string, { size: number; mtimeMs: number }>();
+  private nfoText = new Map<string, string>();
+  /** The same, by lower-cased path: "Film.NFO" beside "Film.mkv". */
+  private nfoFolded = new Map<string, string>();
+  private parsed = new Map<string, NfoFacts | null>();
+
+  /** Reads `root` and what is under it, `depth` folders down. */
+  static async read(root: string, depth: number): Promise<DiskView> {
+    const view = new DiskView();
+    let level: string[] = [root];
+    for (let at = 0; at <= depth && level.length > 0; at++) {
+      const next: string[][] = await inTurns(level, DISK_WIDTH, (dir) => view.readFolder(dir));
+      level = next.flat();
+    }
+    return view;
   }
+
+  /** One folder: its entries, its video files' stats and its .nfo files.
+   *  Returns the sub-folders to read next. */
+  private async readFolder(dir: string): Promise<string[]> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const listed = entries.filter((entry) => !isIgnoredName(entry.name)).map((entry) => ({ name: entry.name, directory: entry.isDirectory(), file: entry.isFile() }));
+    this.listings.set(dir, listed);
+    const files = listed.filter((entry) => entry.file && (isVideoFile(entry.name) || isNfoName(entry.name)));
+    await inTurns(files, DISK_WIDTH, async (entry) => {
+      const absolute = path.join(dir, entry.name);
+      if (isNfoName(entry.name)) {
+        const text = await readNfoText(absolute);
+        if (text === null) return;
+        this.nfoText.set(absolute, text);
+        this.nfoFolded.set(absolute.toLowerCase(), text);
+        return;
+      }
+      try {
+        const stat = await fs.promises.stat(absolute);
+        this.stats.set(absolute, { size: stat.size, mtimeMs: stat.mtimeMs });
+      } catch {
+        // Gone between the listing and now: as if it had never been listed.
+      }
+    });
+    return listed.filter((entry) => entry.directory).map((entry) => path.join(dir, entry.name));
+  }
+
+  /** A folder's entries, ignored names left out; empty when it couldn't be read. */
+  list(dir: string): ListedEntry[] {
+    return this.listings.get(dir) ?? [];
+  }
+
+  stat(file: string): { size: number; mtimeMs: number } | null {
+    return this.stats.get(file) ?? null;
+  }
+
+  /** The facts in the .nfo at this path, or null when there is none to read. */
+  nfo(file: string, root: NfoRoot): NfoFacts | null {
+    const key = `${root}:${file}`;
+    if (this.parsed.has(key)) return this.parsed.get(key)!;
+    const text = this.nfoText.get(file) ?? this.nfoFolded.get(file.toLowerCase());
+    const facts = text === undefined ? null : parseNfo(text, root);
+    this.parsed.set(key, facts);
+    return facts;
+  }
+}
+
+function videoFiles(disk: DiskView, dir: string, settleBefore: number, depth = 0, prefix = ""): FoundFile[] {
+  if (depth > MAX_DEPTH) return [];
   const found: FoundFile[] = [];
-  for (const entry of entries) {
-    if (isIgnoredName(entry.name)) continue;
+  for (const entry of disk.list(dir)) {
     const absolute = path.join(dir, entry.name);
     const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      found.push(...videoFiles(absolute, settleBefore, depth + 1, relative));
-    } else if (entry.isFile() && isVideoFile(entry.name)) {
-      const stat = fs.statSync(absolute);
-      found.push({ relative, absolute, size: stat.size, modifiedAt: stat.mtime.toISOString(), growing: stat.mtimeMs > settleBefore });
+    if (entry.directory) {
+      found.push(...videoFiles(disk, absolute, settleBefore, depth + 1, relative));
+    } else if (entry.file && isVideoFile(entry.name)) {
+      const stat = disk.stat(absolute);
+      if (stat) found.push({ relative, absolute, size: stat.size, modifiedAt: new Date(stat.mtimeMs).toISOString(), growing: stat.mtimeMs > settleBefore });
     }
   }
   return found;
@@ -122,8 +205,8 @@ function nameOf(file: FoundFile, features: FoundFile[], folderName: string): str
 }
 
 /** Two .nfo files that name a film differently: separate films, whatever the file names say. */
-function nfosDisagree(files: FoundFile[]): boolean {
-  const titles = files.map((file) => readNfo(nfoBeside(file.absolute), "movie")?.title).filter(Boolean);
+function nfosDisagree(disk: DiskView, files: FoundFile[]): boolean {
+  const titles = files.map((file) => disk.nfo(nfoBeside(file.absolute), "movie")?.title).filter(Boolean);
   return new Set(titles).size > 1;
 }
 
@@ -132,7 +215,7 @@ function nfosDisagree(files: FoundFile[]): boolean {
  *  Files whose names differ only by a part number, counting from 1, are one film
  *  in parts. Files that come down to the same name without one are copies of a
  *  film, and the biggest is kept. Any others are films of their own. */
-function filmsIn(files: FoundFile[], options: { folderName: string; beside: boolean }): Film[] {
+function filmsIn(disk: DiskView, files: FoundFile[], options: { folderName: string; beside: boolean }): Film[] {
   if (files.length === 0) return [];
   const whole = (main: FoundFile, named: NameFacts, order: number | null = null): Film => ({ main, parts: [], named, order });
   if (options.beside && files.some((file) => DISC_FOLDER.test(file.relative))) {
@@ -173,7 +256,7 @@ function filmsIn(files: FoundFile[], options: { folderName: string; beside: bool
     }
     const order = [...numbered.keys()].sort((a, b) => a - b);
     const consecutive = order.length >= 2 && order.every((part, at) => part === at + 1);
-    if (consecutive && !nfosDisagree([...numbered.values()])) {
+    if (consecutive && !nfosDisagree(disk, [...numbered.values()])) {
       films.push({
         main: numbered.get(1)!,
         parts: order.slice(1).map((part) => ({ part, file: numbered.get(part)! })),
@@ -192,23 +275,29 @@ function filmsIn(files: FoundFile[], options: { folderName: string; beside: bool
   return films;
 }
 
-export function scanLibrary(db: Db, mediaRoot: string, libraryId: string, options: ScanOptions = {}): ScanSummary {
+export async function scanLibrary(db: Db, mediaRoot: string, libraryId: string, options: ScanOptions = {}): Promise<ScanSummary> {
+  const asked = db.prepare("SELECT id, kind, folder FROM libraries WHERE id = ?").get(libraryId) as LibraryRow | undefined;
+  if (!asked) throw new ScanError("No such library");
+  const root = await resolveInsideAsync(mediaRoot, asked.folder);
+  const isFolder = root ? await fs.promises.stat(root).then((stat) => stat.isDirectory(), () => false) : false;
+  if (!root || !isFolder) throw new ScanError(`The folder "${asked.folder}" is not there on the video app`);
+  // The root, its show or movie folders, and theirs down to MAX_DEPTH.
+  const disk = await DiskView.read(root, MAX_DEPTH + 1);
+  // Changed or removed while the disk was read: the library as it is now.
   const library = db.prepare("SELECT id, kind, folder FROM libraries WHERE id = ?").get(libraryId) as LibraryRow | undefined;
-  if (!library) throw new ScanError("No such library");
-  const root = resolveInside(mediaRoot, library.folder);
-  if (!root || !fs.statSync(root).isDirectory()) throw new ScanError(`The folder "${library.folder}" is not there on the video app`);
+  if (!library || library.folder !== asked.folder || library.kind !== asked.kind) throw new ScanError("The library was changed while it was being scanned");
   const settleBefore = (options.now ?? Date.now()) - (options.settleMs ?? SETTLE_MS);
-  const summary = library.kind === "shows" ? scanShows(db, library, root, settleBefore) : scanMovies(db, library, root, settleBefore);
+  const summary = library.kind === "shows" ? scanShows(db, disk, library, root, settleBefore) : scanMovies(db, disk, library, root, settleBefore);
   // What was found is the new automatic; the admin's edits go back over it.
   afterScan(db, library.id);
   return summary;
 }
 
-function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: number): ScanSummary {
-  const summary: ScanSummary = { titles: 0, episodes: 0, added: 0, removed: 0, growing: 0, unnumbered: 0 };
-  const folders = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory() && !isIgnoredName(entry.name)).map((entry) => entry.name);
+function scanShows(db: Db, disk: DiskView, library: LibraryRow, root: string, settleBefore: number): ScanSummary {
+  const summary: ScanSummary = { titles: 0, episodes: 0, added: 0, removed: 0, growing: 0, unnumbered: 0, peopleChanged: [] };
+  const folders = disk.list(root).filter((entry) => entry.directory).map((entry) => entry.name);
 
-  const findShow = db.prepare("SELECT id FROM shows WHERE library_id = ? AND folder = ?");
+  const findShow = db.prepare("SELECT id, nfo_people FROM shows WHERE library_id = ? AND folder = ?");
   const insertShow = db.prepare(`
     INSERT INTO shows (id, library_id, folder, title, sort_title, original_title, year, plot, premiered, status, genres, imdb_id, tmdb_id, source, nfo_people, added_at)
     VALUES (@id, @library, @folder, @title, @sortTitle, @originalTitle, @year, @plot, @premiered, @status, @genres, @imdbId, @tmdbId, @source, @people, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -235,15 +324,15 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
     const kept = new Set<string>();
     for (const folder of folders) {
       const showDir = path.join(root, folder);
-      const files = videoFiles(showDir, settleBefore);
+      const files = videoFiles(disk, showDir, settleBefore);
       const settled = files.filter((file) => !file.growing);
       summary.growing += files.length - settled.length;
-      const existing = findShow.get(library.id, folder) as { id: string } | undefined;
+      const existing = findShow.get(library.id, folder) as { id: string; nfo_people: string } | undefined;
       // A show still arriving, not yet in the catalog: next scan.
       if (!existing && settled.length === 0) continue;
 
       const named = parseFolderName(folder);
-      const nfo = readNfo(path.join(showDir, "tvshow.nfo"), "tvshow");
+      const nfo = disk.nfo(path.join(showDir, "tvshow.nfo"), "tvshow");
       const title = nfo?.title ?? named.title;
       const row = {
         id: existing?.id ?? newId(),
@@ -267,6 +356,7 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
         insertShow.run(row);
         summary.added++;
       }
+      if (existing?.nfo_people !== row.people) summary.peopleChanged.push(row.id);
       kept.add(row.id);
 
       const keepFiles = new Set(files.map((file) => normalizeRelative(file.relative)));
@@ -275,7 +365,7 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
         const parts = relative.split("/");
         const folderSeason = parts.length > 1 ? seasonFromFolder(parts[parts.length - 2]) : null;
         const fromName = episodeFromFile(parts[parts.length - 1]);
-        const epNfo = readNfo(nfoBeside(file.absolute), "episodedetails");
+        const epNfo = disk.nfo(nfoBeside(file.absolute), "episodedetails");
         const season = epNfo?.season ?? fromName?.season ?? folderSeason;
         const episode = epNfo?.episode ?? fromName?.episode ?? null;
         if (season === null || episode === null) {
@@ -312,6 +402,7 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
       if (!kept.has(show.id)) {
         db.prepare("DELETE FROM shows WHERE id = ?").run(show.id);
         summary.removed++;
+        summary.peopleChanged.push(show.id);
       }
     }
   });
@@ -322,11 +413,11 @@ function scanShows(db: Db, library: LibraryRow, root: string, settleBefore: numb
   return summary;
 }
 
-function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: number): ScanSummary {
-  const summary: ScanSummary = { titles: 0, episodes: 0, added: 0, removed: 0, growing: 0, unnumbered: 0 };
-  const entries = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => !isIgnoredName(entry.name));
+function scanMovies(db: Db, disk: DiskView, library: LibraryRow, root: string, settleBefore: number): ScanSummary {
+  const summary: ScanSummary = { titles: 0, episodes: 0, added: 0, removed: 0, growing: 0, unnumbered: 0, peopleChanged: [] };
+  const entries = disk.list(root);
 
-  const findMovie = db.prepare("SELECT id FROM movies WHERE library_id = ? AND folder = ?");
+  const findMovie = db.prepare("SELECT id, nfo_people FROM movies WHERE library_id = ? AND folder = ?");
   const moveMovie = db.prepare("UPDATE movies SET folder = ? WHERE id = ?");
   const upsertMovie = db.prepare(`
     INSERT INTO movies (id, library_id, folder, file, title, sort_title, original_title, year, plot, genres, imdb_id, tmdb_id, runtime_minutes, set_name, set_overview, set_tmdb_id, set_order, source, nfo_people, size_bytes, modified_at, added_at)
@@ -349,16 +440,18 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
     const seen = new Set<string>();
     // Each film by where its file is, so one found again under another `folder`
     // (its folder has gained a film, or lost one) keeps its id, and with it everyone's place.
-    const catalogued = db.prepare("SELECT id, folder, file FROM movies WHERE library_id = ?").all(library.id) as { id: string; folder: string; file: string }[];
+    const catalogued = db.prepare("SELECT id, folder, file, nfo_people FROM movies WHERE library_id = ?").all(library.id) as { id: string; folder: string; file: string; nfo_people: string }[];
     const atPath = new Map(catalogued.map((movie) => [movie.folder === movie.file ? movie.file : `${movie.folder}/${movie.file}`, movie]));
 
     const place = (film: Film, facts: { folder: string; prefix: string; ownFolder: string | null; setName: string | null; named: NameFacts }, growing: Set<string>) => {
       const file = `${facts.prefix}${normalizeRelative(film.main.relative)}`;
-      const existing = (findMovie.get(library.id, facts.folder) as { id: string } | undefined) ?? atPath.get(facts.folder === file ? file : `${facts.folder}/${file}`);
+      const existing = (findMovie.get(library.id, facts.folder) as { id: string; nfo_people: string } | undefined) ?? atPath.get(facts.folder === file ? file : `${facts.folder}/${file}`);
       if (existing) moveMovie.run(facts.folder, existing.id);
-      const nfo = (facts.ownFolder ? readNfo(path.join(facts.ownFolder, "movie.nfo"), "movie") : null) ?? readNfo(nfoBeside(film.main.absolute), "movie");
+      const nfo = (facts.ownFolder ? disk.nfo(path.join(facts.ownFolder, "movie.nfo"), "movie") : null) ?? disk.nfo(nfoBeside(film.main.absolute), "movie");
       const title = nfo?.title ?? facts.named.title;
       const id = existing?.id ?? newId();
+      const people = JSON.stringify(nfo?.people ?? []);
+      if (existing?.nfo_people !== people) summary.peopleChanged.push(id);
       upsertMovie.run({
         id,
         library: library.id,
@@ -378,7 +471,7 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
         setTmdbId: nfo?.set?.tmdbId ?? null,
         setOrder: film.order,
         source: nfo ? "nfo" : "folder",
-        people: JSON.stringify(nfo?.people ?? []),
+        people,
         size: film.parts.reduce((sum, { file: part }) => sum + part.size, film.main.size),
         modifiedAt: film.main.modifiedAt
       });
@@ -416,15 +509,15 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
 
     const loose: FoundFile[] = [];
     for (const entry of entries) {
-      if (entry.isFile() && isVideoFile(entry.name)) {
+      if (entry.file && isVideoFile(entry.name)) {
         const absolute = path.join(root, entry.name);
-        const stat = fs.statSync(absolute);
-        loose.push({ relative: entry.name, absolute, size: stat.size, modifiedAt: stat.mtime.toISOString(), growing: stat.mtimeMs > settleBefore });
+        const stat = disk.stat(absolute);
+        if (stat) loose.push({ relative: entry.name, absolute, size: stat.size, modifiedAt: new Date(stat.mtimeMs).toISOString(), growing: stat.mtimeMs > settleBefore });
       }
-      if (!entry.isDirectory()) continue;
+      if (!entry.directory) continue;
 
       const movieDir = path.join(root, entry.name);
-      const files = videoFiles(movieDir, settleBefore);
+      const files = videoFiles(disk, movieDir, settleBefore);
       const settled = files.filter((file) => !file.growing);
       const growing = keepGrowing(files, `${entry.name}/`);
       if (settled.length === 0) {
@@ -434,9 +527,9 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
         }
         continue;
       }
-      let films = filmsIn(settled, { folderName: entry.name, beside: true });
+      let films = filmsIn(disk, settled, { folderName: entry.name, beside: true });
       // movie.nfo in the folder says the folder is one film: the one with the biggest file.
-      if (films.length > 1 && readNfo(path.join(movieDir, "movie.nfo"), "movie")) {
+      if (films.length > 1 && disk.nfo(path.join(movieDir, "movie.nfo"), "movie")) {
         const top = biggest(settled);
         const film = films.find((candidate) => candidate.main === top || candidate.parts.some(({ file }) => file === top));
         films = [film ?? films[0]];
@@ -458,7 +551,7 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
     // Loose files, which may be the parts of one film; never a set: they share only the library.
     const settledLoose = loose.filter((file) => !file.growing);
     const growingLoose = keepGrowing(loose, "");
-    for (const film of filmsIn(settledLoose, { folderName: "", beside: false })) {
+    for (const film of filmsIn(disk, settledLoose, { folderName: "", beside: false })) {
       const relative = normalizeRelative(film.main.relative);
       place(film, { folder: relative, prefix: "", ownFolder: null, setName: null, named: film.named }, growingLoose);
     }
@@ -468,6 +561,7 @@ function scanMovies(db: Db, library: LibraryRow, root: string, settleBefore: num
       if (!seen.has(movie.folder)) {
         db.prepare("DELETE FROM movies WHERE id = ?").run(movie.id);
         summary.removed++;
+        summary.peopleChanged.push(movie.id);
       }
     }
   });

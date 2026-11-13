@@ -53,22 +53,60 @@ export interface FolderEntry {
   folders: number;
 }
 
-/** The sub-folders of a folder under the root, for Add library's folder picker. */
-export function listFolders(root: string, relative: string): { path: string; folders: FolderEntry[] } | null {
-  const dir = resolveInside(root, relative);
-  if (!dir || !fs.statSync(dir).isDirectory()) return null;
+/** resolveInside without holding the engine: a disk that has spun down answers
+ *  a lookup only once it is up again, and everyone else would wait for it. */
+export async function resolveInsideAsync(root: string, relative: string): Promise<string | null> {
+  const clean = normalizeRelative(relative);
+  if (clean.split("/").some((part) => part === "..")) return null;
+  let realRoot: string;
+  let real: string;
+  try {
+    realRoot = await fs.promises.realpath(root);
+    real = await fs.promises.realpath(path.resolve(realRoot, clean));
+  } catch {
+    return null;
+  }
+  const inside = real === realRoot || real.startsWith(realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep);
+  return inside ? real : null;
+}
+
+/** Runs `work` over the items at most `width` at a time, in their order. */
+export async function inTurns<T, R>(items: readonly T[], width: number, work: (item: T, at: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length) {
+      const at = next++;
+      results[at] = await work(items[at], at);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, lane));
+  return results;
+}
+
+/** The sub-folders of a folder under the root, for Add library's folder picker.
+ *  A folder of 2000 films is 2000 listings, so they are made a few at a time
+ *  without holding the engine. */
+export async function listFolders(root: string, relative: string): Promise<{ path: string; folders: FolderEntry[] } | null> {
+  const dir = await resolveInsideAsync(root, relative);
+  if (!dir) return null;
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
   const base = normalizeRelative(relative);
-  const folders = fs.readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !isIgnoredName(entry.name))
-    .map((entry) => {
-      let count = 0;
-      try {
-        count = fs.readdirSync(path.join(dir, entry.name), { withFileTypes: true }).filter((child) => child.isDirectory() && !isIgnoredName(child.name)).length;
-      } catch {
-        // Unreadable: listed, with nothing inside it known.
-      }
-      return { name: entry.name, path: base ? `${base}/${entry.name}` : entry.name, folders: count };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true }));
+  const subfolders = entries.filter((entry) => entry.isDirectory() && !isIgnoredName(entry.name));
+  const folders = await inTurns(subfolders, 8, async (entry) => {
+    let count = 0;
+    try {
+      count = (await fs.promises.readdir(path.join(dir, entry.name), { withFileTypes: true })).filter((child) => child.isDirectory() && !isIgnoredName(child.name)).length;
+    } catch {
+      // Unreadable: listed, with nothing inside it known.
+    }
+    return { name: entry.name, path: base ? `${base}/${entry.name}` : entry.name, folders: count };
+  });
+  folders.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true }));
   return { path: base, folders };
 }

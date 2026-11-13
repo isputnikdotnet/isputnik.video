@@ -14,7 +14,7 @@ import type { Db } from "./db.js";
 import type { MediaInfo } from "./ffmpeg.js";
 import type { Identity } from "./identity.js";
 import type { MediaProbe, ProbedFile } from "./media-probe.js";
-import { fileOf, findItem, type PlayableItem } from "./playback.js";
+import { fileOfAsync, findItem, type PlayableItem } from "./playback.js";
 
 /** Sees every library: the engine's own work, not anyone's request. */
 const ENGINE: Identity = { id: "engine", name: "engine", role: "admin", appRole: "manager", libraries: "all", lang: "en", theme: "", historyId: "engine", network: "home" };
@@ -71,7 +71,7 @@ export class KeyframeWarmer {
     for (const id of ids) {
       if (signal.aborted) break;
       const item = findItem(db, ENGINE, id);
-      const file: ProbedFile | null = item ? fileOf(mediaRoot, item) : null;
+      const file: ProbedFile | null = item ? await fileOfAsync(mediaRoot, item) : null;
       if (!item || !file || probe.hasKeyframes(id, file)) continue;
       await this.waitForViewers(signal);
       if (signal.aborted) break;

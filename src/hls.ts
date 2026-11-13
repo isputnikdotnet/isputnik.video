@@ -457,6 +457,14 @@ export interface KeptFilm {
 
 export class HlsError extends Error {}
 
+/** A request for a version the player has moved off (another quality, sound or
+ *  subtitles asked for since): answered so that nobody asks it again. */
+export class HlsSupersededError extends HlsError {
+  constructor() {
+    super("Superseded");
+  }
+}
+
 /** Why someone may not start converting a film now: every place the admin
  *  allows is taken ("household"), or they are watching another film converted
  *  ("person" — on another screen, or a tab left playing; it lets go once it
@@ -556,6 +564,11 @@ export class HlsSessions {
   finishFrom = 0.7;
   /** Half-filled versions a job left (filling.json), by variant: its folder. */
   private partials = new Map<string, string>();
+  /** The version whose playlist each viewer ("<person>:<item>") asked for last.
+   *  A switch of quality, sound or subtitles asks for the new playlist first, so
+   *  a segment of any other version is a request left over from before it, and
+   *  must not stop the new version's run to start its own (turn about, issue 3). */
+  private chosen = new Map<string, string>();
 
   /** Where segments are made: for the Disks answer home's Dashboard reads. */
   get folder(): string {
@@ -638,6 +651,14 @@ export class HlsSessions {
     return this.refusal(key) === null;
   }
 
+  /** The player asked for this version's playlist: it is the one it plays now. */
+  choose(key: string, plan: HlsPlan): void {
+    this.chosen.delete(key);
+    this.chosen.set(key, variantOf(plan));
+    // Players that never said they left: the oldest go.
+    while (this.chosen.size > 1000) this.chosen.delete(this.chosen.keys().next().value!);
+  }
+
   /** Segment `n`, made if it isn't there yet. `who` names the viewer for the
    *  admin; `signal` is the player hanging up (a seek cancels the segment it
    *  was loading), which ends the wait; `asked` is when the request came in. */
@@ -649,6 +670,8 @@ export class HlsSessions {
     // Another file under the same id, another sound track, other subtitles burned
     // in or another quality rung: another version (its cuts and its picture differ).
     const variant = variantOf(plan);
+    const chosen = this.chosen.get(key);
+    if (chosen !== undefined && chosen !== variant) throw new HlsSupersededError();
     if (viewer && viewer.entry.variant !== variant) {
       this.stop(key);
       viewer = undefined;
@@ -690,7 +713,7 @@ export class HlsSessions {
         if (started && !viewer.run) throw new HlsError(viewer.failure ?? "The conversion stopped");
         // A newer request moved the run elsewhere: this one is not what the
         // player wants any more, and restarting for it would undo the seek.
-        if (ask !== viewer.asked) throw new HlsError("Superseded");
+        if (ask !== viewer.asked) throw new HlsSupersededError();
         this.start(viewer, n);
         started = true;
       }
@@ -704,6 +727,7 @@ export class HlsSessions {
   /** The player has gone: stop now, and refuse what it asked before it went. */
   leave(key: string): void {
     this.left.set(key, Date.now());
+    this.chosen.delete(key);
     this.stop(key);
   }
 
@@ -1062,7 +1086,7 @@ export class HlsSessions {
       const reason = stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`;
       // The GPU failed: the same segments again on the CPU, for the rest of this
       // version, unless the admin asked for the GPU only.
-      if (gpu && this.hardware?.failed(reason)) {
+      if (gpu && this.hardware?.failed(reason, stderr)) {
         this.log.warn({ item: entry.plan.itemId, reason, stderr: stderr.trim() }, "The GPU could not convert this; converting it on the CPU");
         entry.cpuOnly = true;
         let next = run.from;

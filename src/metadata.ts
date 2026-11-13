@@ -21,11 +21,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { Db } from "./db.js";
-import { resolveInside } from "./media.js";
+import { resolveInside, resolveInsideAsync } from "./media.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, type Fetch, type TmdbKind } from "./tmdb.js";
 import { countSets, markSetChecked, rebuildSets, saveSetTmdb, setsDueForTmdb } from "./sets.js";
 import { partsOfMovie } from "./playback.js";
-import { rebuildCredits } from "./credits.js";
+import { rebuildCredits, relinkNamedPeople } from "./credits.js";
 import { execFile } from "node:child_process";
 import type { Tools } from "./ffmpeg.js";
 
@@ -208,16 +208,23 @@ interface EpisodeRow { id: string; season: number; episode: number; file: string
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const posix = (...parts: string[]) => parts.filter(Boolean).join("/");
 
-/** The first image in `dir` named one of `names` (any case, any image extension). */
-function findImage(mediaRoot: string, dir: string, names: string[]): string | null {
-  const absolute = resolveInside(mediaRoot, dir);
-  if (!absolute) return null;
-  let entries: string[];
-  try {
-    entries = fs.readdirSync(absolute);
-  } catch {
-    return null;
+/** Folders listed during one pass, each once: a season's folder serves all its
+ *  episodes. Read without holding the engine. */
+export type Listings = Map<string, Promise<string[] | null>>;
+
+function listFolder(mediaRoot: string, dir: string, listings: Listings): Promise<string[] | null> {
+  let listed = listings.get(dir);
+  if (!listed) {
+    listed = resolveInsideAsync(mediaRoot, dir).then((absolute) => (absolute ? fs.promises.readdir(absolute) : null)).catch(() => null);
+    listings.set(dir, listed);
   }
+  return listed;
+}
+
+/** The first image in `dir` named one of `names` (any case, any image extension). */
+async function findImage(mediaRoot: string, dir: string, names: string[], listings: Listings): Promise<string | null> {
+  const entries = await listFolder(mediaRoot, dir, listings);
+  if (!entries) return null;
   for (const name of names) {
     const hit = entries.find((entry) => {
       const ext = path.extname(entry).toLowerCase();
@@ -237,6 +244,11 @@ function emptyRow(itemId: string, kind: MetaKind): MetaRow {
     poster_choice: null, poster_upload: null, people: "[]", people_checked: 0
   };
 }
+
+const ROW_FIELDS = Object.keys(emptyRow("", "show")) as (keyof MetaRow)[];
+
+/** Whether a row comes out of the pass as it went in: then nothing is written. */
+const unchanged = (before: MetaRow | undefined, after: MetaRow) => Boolean(before) && ROW_FIELDS.every((field) => before![field] === after[field]);
 
 function saveRow(db: Db, row: MetaRow): void {
   db.prepare(`
@@ -402,7 +414,7 @@ export class MetadataRunner {
   }
 
   /** One show or movie: its art beside the files, and TMDB when it is due. */
-  private async refreshTitle(tmdb: Tmdb | null, library: Library, title: TitleRow, showEpisodes: EpisodeRow[], force: boolean, summary: MetadataSummary): Promise<void> {
+  private async refreshTitle(tmdb: Tmdb | null, library: Library, title: TitleRow, showEpisodes: EpisodeRow[], force: boolean, summary: MetadataSummary, listings: Listings = new Map()): Promise<void> {
     const { db, mediaRoot } = this.ctx;
     const kind: MetaKind = library.kind === "shows" ? "show" : "movie";
     const tmdbKind: TmdbKind = kind === "show" ? "tv" : "movie";
@@ -424,8 +436,8 @@ export class MetadataRunner {
     const dir = loose ? path.posix.dirname(posix(library.folder, title.folder)) : posix(library.folder, title.folder);
     const stem = title.file ? path.basename(title.file, path.extname(title.file)) : null;
     const ownNames = (suffixes: string[]) => (stem ? suffixes.map((suffix) => `${stem}-${suffix}`) : []);
-    const localPoster = findImage(mediaRoot, dir, loose ? [...ownNames(["poster"]), stem!] : [...ownNames(["poster"]), ...POSTER_NAMES]);
-    const localBackdrop = findImage(mediaRoot, dir, loose ? ownNames(["fanart", "backdrop"]) : [...ownNames(["fanart", "backdrop"]), ...BACKDROP_NAMES]);
+    const localPoster = await findImage(mediaRoot, dir, loose ? [...ownNames(["poster"]), stem!] : [...ownNames(["poster"]), ...POSTER_NAMES], listings);
+    const localBackdrop = await findImage(mediaRoot, dir, loose ? ownNames(["fanart", "backdrop"]) : [...ownNames(["fanart", "backdrop"]), ...BACKDROP_NAMES], listings);
 
     const now = Date.now();
     let details: Awaited<ReturnType<Tmdb["details"]>> | null = null;
@@ -474,9 +486,13 @@ export class MetadataRunner {
     } catch (err) {
       summary.error ??= `${title.title}: ${(err as Error).message}`;
     }
-    saveRow(db, row);
-    // Its cast and crew, from its .nfo and what TMDB said just now.
-    rebuildCredits(db, this.ctx.artDir, [title.id]);
+    // A title nothing new was found for is left as it is: on a big library most
+    // are, and a write each is minutes of disk commits after every scan.
+    const before = existing.get(title.id);
+    if (!unchanged(before, row)) saveRow(db, row);
+    // Its cast and crew, when TMDB said something new about them (the scan
+    // works out those of an .nfo that changed).
+    if ((before?.people ?? "[]") !== row.people) rebuildCredits(db, this.ctx.artDir, [title.id]);
     if (row.tmdb_state === "matched") summary.matched += 1;
     else if (row.tmdb_state === "unmatched") summary.unmatched += 1;
     else if (row.tmdb_state === "error") summary.failed += 1;
@@ -504,7 +520,7 @@ export class MetadataRunner {
       }
       const episodeDir = path.posix.dirname(posix(dir, episode.file));
       const episodeStem = path.basename(episode.file, path.extname(episode.file));
-      const localThumb = findImage(mediaRoot, episodeDir, [`${episodeStem}-thumb`, episodeStem]);
+      const localThumb = await findImage(mediaRoot, episodeDir, [`${episodeStem}-thumb`, episodeStem], listings);
       const before = own.still;
       try {
         own.still = await this.pick(tmdb, own, "still", localThumb, own.still_path);
@@ -517,7 +533,7 @@ export class MetadataRunner {
         summary.error ??= `${title.title} S${episode.season}E${episode.episode}: ${(err as Error).message}`;
       }
       own.checked_at ??= new Date(now).toISOString();
-      saveRow(db, own);
+      if (!unchanged(existing.get(episode.id), own)) saveRow(db, own);
     }
   }
 
@@ -532,13 +548,17 @@ export class MetadataRunner {
       ? db.prepare("SELECT id, folder, NULL AS file, title, original_title, year, imdb_id, tmdb_id FROM shows WHERE library_id = ? ORDER BY sort_title").all(library.id) as TitleRow[]
       : db.prepare("SELECT id, folder, file, title, original_title, year, imdb_id, tmdb_id FROM movies WHERE library_id = ? ORDER BY sort_title").all(library.id) as TitleRow[];
     let refused = false;
+    const listings: Listings = new Map();
     for (const title of titles) {
+      // A turn for everyone else between titles: with nothing to ask TMDB and
+      // no frame to take, every await below resolves at once.
+      await new Promise((resolve) => setImmediate(resolve));
       const episodes = library.kind === "shows"
         ? db.prepare("SELECT id, season, episode, file FROM episodes WHERE show_id = ? ORDER BY season, episode").all(title.id) as EpisodeRow[]
         : [];
       summary.titles += 1;
       try {
-        await this.refreshTitle(tmdb, library, { ...title, file: title.file ?? undefined }, episodes, force, summary);
+        await this.refreshTitle(tmdb, library, { ...title, file: title.file ?? undefined }, episodes, force, summary, listings);
       } catch (err) {
         if (err instanceof TmdbError && err.status === 401) {
           summary.error = "TMDB refused the key; nothing more was asked";
@@ -548,6 +568,8 @@ export class MetadataRunner {
         throw err;
       }
     }
+    // A name an .nfo gives without an id that TMDB now has a person of.
+    relinkNamedPeople(db, this.ctx.artDir);
     if (library.kind === "movies") {
       try {
         await this.refreshSets(refused ? null : tmdb, force, summary);
@@ -610,6 +632,7 @@ export class MetadataRunner {
     const summary: MetadataSummary = { titles: 1, matched: 0, unmatched: 0, failed: 0, posters: 0, sets: 0, error: null };
     const tmdb = this.tmdb();
     await this.refreshTitle(tmdb, library, { ...title, file: title.file ?? undefined }, episodes, true, summary);
+    relinkNamedPeople(db, this.ctx.artDir);
     if (movie) await this.refreshSets(tmdb, false);
     return true;
   }

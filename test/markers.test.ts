@@ -150,7 +150,7 @@ describe("a chaptered film", () => {
   it("has its chapters probed", async () => {
     const info = await probe(tools, film);
     expect(info.chapters.map((entry) => entry.title)).toEqual(["Cold open", "Intro", "Chapter 3", "Титры"]);
-    expect(findMarkers(info, film).intro).toEqual({ start: 5, end: 15, source: "chapter" });
+    expect((await findMarkers(info, film)).intro).toEqual({ start: 5, end: 15, source: "chapter" });
   });
 
   const play = async () => (await app.inject({ method: "GET", url: `/video/api/play/${id}`, headers })).json();

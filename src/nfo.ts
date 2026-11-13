@@ -110,17 +110,34 @@ function date(value: unknown): string | null {
   return raw && /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null;
 }
 
+export type NfoRoot = "tvshow" | "episodedetails" | "movie";
+
 /** The facts in an .nfo, or null when the file is missing, too big or not XML. */
-export function readNfo(file: string, root: "tvshow" | "episodedetails" | "movie"): NfoFacts | null {
+export function readNfo(file: string, root: NfoRoot): NfoFacts | null {
   let raw: string;
   try {
     if (fs.statSync(file).size > MAX_BYTES) return null;
     raw = fs.readFileSync(file, "utf8");
-    // A byte-order mark in front of the XML declaration (Windows editors add one).
-    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   } catch {
     return null;
   }
+  return parseNfo(raw, root);
+}
+
+/** An .nfo's text, read without holding the engine; null when missing or too big. */
+export async function readNfoText(file: string): Promise<string | null> {
+  try {
+    if ((await fs.promises.stat(file)).size > MAX_BYTES) return null;
+    return await fs.promises.readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** The facts in an .nfo's text, or null when it is not XML or not this kind. */
+export function parseNfo(raw: string, root: NfoRoot): NfoFacts | null {
+  // A byte-order mark in front of the XML declaration (Windows editors add one).
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   let doc: Record<string, unknown>;
   try {
     doc = parser.parse(raw) as Record<string, unknown>;
