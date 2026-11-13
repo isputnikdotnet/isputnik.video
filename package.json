@@ -1,7 +1,7 @@
 {
   "name": "isputnik-video",
   "private": true,
-  "version": "0.36.1",
+  "version": "0.37.0",
   "stage": "alpha",
   "description": "Add-on for isputnik.home: the video engine that scans, describes and plays TV shows and movies for it. Requires the isputnik.home container; installed beside it and reached through home's /video gateway, it has no pages of its own.",
   "license": "AGPL-3.0-only",
