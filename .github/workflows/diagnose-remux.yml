@@ -22,6 +22,7 @@ jobs:
       - name: Variants
         shell: bash
         run: |
+          set +e
           STATIC=$(node -e "console.log(require('ffmpeg-static'))")
           for F in "$STATIC" /usr/bin/ffmpeg; do
             echo "=== $F: $("$F" -version | head -1)"
@@ -31,6 +32,9 @@ jobs:
             ls "$D"
             try() { name=$1; shift; cat "$D"/[0-9].ts | "$F" -hide_banner -v error -y -f mpegts -i pipe:0 -map 0 -c copy "$@" "$D/out.mp4"; echo "$name: exit $?"; }
             try "plain"
+            try "plain, mp4 named" -f mp4
+            try "no audio" -an
+            try "no video" -vn
             try "bsf" -bsf:a aac_adtstoasc
             try "faststart" -movflags +faststart
             try "bsf+faststart" -bsf:a aac_adtstoasc -movflags +faststart -f mp4
