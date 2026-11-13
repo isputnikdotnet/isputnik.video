@@ -3,6 +3,15 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.35.0 — Memory first, one cache, kept ready
+
+- **Converted video stays out of the container.** The engine now checks whether `/transcode` is a disk mapped into the container. If it isn't (the Unraid template's Transcode path left empty), video is converted in memory only and no copies for download are prepared there, so nothing fills `docker.img`. With a disk, the admin picks memory only, memory then the disk (the default), or the disk only, and one memory limit is shared by everyone watching (a tenth of the server's memory, at most 1 GB, to start with). isputnik.home 4.88 shows the disk and its free space on Settings › Video › Converting video. Older homes keep working with their memory-per-viewer setting.
+- **One conversion per version, shared.** Two people watching the same film at the same quality and sound track now share one conversion instead of making it twice, and joining a film someone is already watching takes no place from the household's limit.
+- **Films kept once converted all the way through.** With a disk, a film whose picture had to be re-encoded is kept once someone has watched it to the end, so it plays next time with nothing converted, also after a restart. A film left at 70% or more is finished off in the background so it is kept too. Kept films and copies for download share one limit (Room for kept video, 50 GB to start with); the ones used longest ago go first.
+- **Copies for download are made through the same cache.** A copy whose picture is re-encoded is made as the version a viewer would get, a stretch at a time and resumable, then put together into the MP4 in seconds. Copies asked for are carried on after a restart.
+- **Keep ready.** An admin can keep a film, a show or one season ready at 1080p, 720p or 480p (`/admin/keep-ready`): converted ahead of time in the background and never removed to make room. A show's new episodes follow unless asked not to.
+- **When downloads are prepared.** The queue runs right away, only when the server is idle, or only between two times at night, with a number of jobs at once and a limit on how many downloads one member may have waiting (`/admin/jobs`). Copies going to someone away from home can be held to a download speed so streaming keeps its share of the upload link.
+
 ## 0.34.0 — Off the row, and new again
 
 - **Take something off Continue watching.** `DELETE /video/api/continue/:id` takes a show (asked by any of its episodes) or a film (every part of it) off the row for the person asking, so isputnik.home 4.86 can offer **Remove from Continue watching** on each card. Nothing is forgotten: the place in it stays, and playing it again, or marking it watched or unwatched, brings it back. Before, a film abandoned halfway or a show nobody meant to go on with stayed on the row for good.
