@@ -224,6 +224,19 @@ const FAILURES_ALLOWED = 3;
 const FAILURE_WINDOW_MS = 60 * 60 * 1000;
 
 /** What the admin sees on Settings → Video. */
+export interface GpuFailure {
+  at: string;
+  /** ffmpeg's last line. */
+  reason: string;
+  /** The end of what it wrote. */
+  stderr: string;
+  /** false: the film's doing (no mastering data), not the GPU's. */
+  counted: boolean;
+}
+
+/** How many GPU failures the diagnostics report gets to see. */
+const FAILURES_KEPT = 10;
+
 export interface HardwareState extends GpuCapabilities {
   mode: HardwareMode;
   checking: boolean;
@@ -238,6 +251,8 @@ export class Hardware {
   private caps: GpuCapabilities | null = null;
   private checking: Promise<void> | null = null;
   private failures: number[] = [];
+  /** The last few GPU failures, with ffmpeg's own words, for the diagnostics report. */
+  private failureLog: GpuFailure[] = [];
 
   constructor(private detect: () => Promise<GpuCapabilities>, private log: { info(obj: object, msg: string): void; warn(obj: object, msg: string): void }) {}
 
@@ -296,13 +311,21 @@ export class Hardware {
    *  mastering display data is the film's doing, not the GPU's — it goes to the
    *  CPU, and doesn't count towards setting the GPU aside for everything. */
   failed(reason: string, stderr = ""): boolean {
-    if (NO_MASTERING.test(stderr) || NO_MASTERING.test(reason)) {
+    const filmsFault = NO_MASTERING.test(stderr) || NO_MASTERING.test(reason);
+    this.failureLog = [...this.failureLog, { at: new Date().toISOString(), reason, stderr: stderr.trim().slice(-1500), counted: !filmsFault }].slice(-FAILURES_KEPT);
+    if (filmsFault) {
       this.log.info({ reason }, "This film has no mastering display data for the GPU to tone-map it by; converting it on the CPU");
       return true;
     }
     this.failures.push(Date.now());
     if (this.setAside) this.log.warn({ reason }, `The GPU failed ${FAILURES_ALLOWED} times within an hour: converting on the CPU until the admin checks again`);
     return this.mode !== "gpu";
+  }
+
+  /** The last GPU failures, oldest first: when, why, and whether each counted
+   *  towards setting the GPU aside. Kept until the engine restarts. */
+  recentFailures(): GpuFailure[] {
+    return [...this.failureLog];
   }
 
   state(): HardwareState {

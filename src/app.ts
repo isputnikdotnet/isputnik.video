@@ -26,6 +26,7 @@ import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
 import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { KeyframeWarmer } from "./keyframe-warmer.js";
+import { ffmpegVersionOf, problemLines, systemFacts } from "./diagnostics.js";
 import { BASE_PATH } from "./config.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase, upgradeDatabase } from "./db.js";
@@ -1866,6 +1867,32 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       available: Boolean(options.logBuffer)
     };
   });
+
+  // For home's diagnostics report (diagnostics.ts): what a bug report needs to be
+  // answered. Sent as it is; home hides the names and paths unless the admin opts in.
+  app.get(`${API}/admin/diagnostics`, { preHandler: requireAdmin }, async () => ({
+    engine: { name: "isputnik.video", version: options.version, stage: options.stage, ...systemFacts() },
+    ffmpeg: { found: Boolean(tools) && (await toolsReady), version: await ffmpegVersionOf(tools) },
+    gpu: hardware ? { ...hardware.state(), recentFailures: hardware.recentFailures() } : null,
+    conversion: {
+      settings: readConversion(db),
+      storage: hls?.storage ?? null,
+      diskMapped: hls?.mapped ?? false,
+      watching: hls?.watching() ?? 0,
+      runs: hls?.active() ?? 0,
+      memoryBytes: hls?.usage().memoryBytes ?? 0,
+      diskBytes: hls?.usage().diskBytes ?? 0
+    },
+    detection: detectionState(),
+    metadata: { tmdbKey: Boolean(readTmdbKey(db)) },
+    libraries: listLibraries(db).map((library) => ({
+      name: library.name, kind: library.kind, folder: library.folder, language: library.language, state: library.state,
+      scanState: library.scanState, scanError: library.scanError, lastScanAt: library.lastScanAt,
+      titles: library.titles, episodes: library.episodes, sizeBytes: library.sizeBytes
+    })),
+    paths: { media: options.mediaRoot, database: options.dbPath, art: artDir, transcode: hls?.folder ?? null },
+    log: problemLines(options.logBuffer)
+  }));
 
   // The whole catalog for home's backups (home's docs/apps-platform-plan.md →
   // Backups): one consistent copy; the event about it is written after it.

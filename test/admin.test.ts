@@ -63,7 +63,7 @@ describe("the gateway check", () => {
 
 describe("admin routes", () => {
   it("answer an admin only", async () => {
-    for (const url of ["/video/api/admin/libraries", "/video/api/admin/folders", "/video/api/admin/events", "/video/api/admin/log", "/video/api/admin/backup", "/video/api/admin/disks"]) {
+    for (const url of ["/video/api/admin/libraries", "/video/api/admin/folders", "/video/api/admin/events", "/video/api/admin/log", "/video/api/admin/backup", "/video/api/admin/disks", "/video/api/admin/diagnostics"]) {
       expect((await get(url, mum)).statusCode, url).toBe(403);
       expect((await get(url, admin)).statusCode, url).toBe(200);
     }
@@ -120,6 +120,23 @@ describe("admin routes", () => {
     expect(body.available).toBe(true);
     const line = body.lines.map((raw: string) => JSON.parse(raw)).find((entry: { msg: string; reqId?: string }) => entry.msg === "request completed" && entry.reqId === "home-mum");
     expect(line).toMatchObject({ user: "mum", ip: "192.168.2.10" });
+  });
+
+  it("give home's diagnostics report the versions, the machine, the libraries and the log's problems", async () => {
+    await get("/video/api/nope", admin);
+    app.log.warn({ item: "x" }, "Something to report");
+    const body = (await get("/video/api/admin/diagnostics", admin)).json();
+    expect(body.engine).toMatchObject({ name: "isputnik.video", version: "0.0.0-test", node: process.version, platform: process.platform });
+    expect(body.engine.cpus).toBeGreaterThan(0);
+    expect(body.libraries).toEqual(expect.any(Array));
+    expect(body.conversion).toMatchObject({ watching: 0, runs: 0 });
+    expect(body.metadata).toEqual({ tmdbKey: false });
+    expect(body.paths.media).toBe(fixture.root);
+    // Only warnings and errors from the log, never the requests that went well.
+    const levels = body.log.map((raw: string) => JSON.parse(raw).level as number);
+    expect(levels.length).toBeGreaterThan(0);
+    expect(levels.every((level: number) => level >= 40)).toBe(true);
+    expect(body.log.some((raw: string) => JSON.parse(raw).msg === "Something to report")).toBe(true);
   });
 
   it("answer an unknown address with JSON, never a page", async () => {

@@ -125,6 +125,12 @@ describe("where a film is converted", () => {
     for (let i = 0; i < 3; i++) expect(hardware.failed("Error while filtering: Invalid argument", stderr)).toBe(true);
     expect(hardware.state().setAside).toBe(false);
     expect(hardware.choose(info, decideDelivery(info, ".mkv"))).not.toBeNull();
+    // Kept for the diagnostics report, marked as the film's doing.
+    hardware.failed("boom", "[h264_vaapi] boom");
+    expect(hardware.recentFailures().map((failure) => [failure.reason, failure.counted])).toEqual([
+      ["Error while filtering: Invalid argument", false], ["Error while filtering: Invalid argument", false], ["Error while filtering: Invalid argument", false], ["boom", true]
+    ]);
+    expect(hardware.recentFailures()[3].stderr).toBe("[h264_vaapi] boom");
   });
 
   it("never falls back in GPU only, so the failure shows", async () => {
