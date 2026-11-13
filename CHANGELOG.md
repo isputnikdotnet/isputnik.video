@@ -3,6 +3,10 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.38.1 — Diagnostics, released
+
+- **0.38.0 reaches the image.** It was never published: a test that runs before the image is built looked at the conversion's memory and disk once, right as a new segment sat on the disk on its way into memory, and failed. It now waits for that moment to pass. This release carries everything in 0.38.0: the engine's part of home's diagnostics report (home 4.89.0), and the GPU's recent failures kept with ffmpeg's own words.
+
 ## 0.38.0 — Diagnostics for bug reports
 
 - **The engine reports on itself for a bug report.** Home's new Control panel › Infrastructure › Diagnostics page asks it for its version and machine, the ffmpeg it runs, what the GPU check found, its conversion settings, its libraries' counts and states, and the warnings and errors in its log. Home hides names, folders and addresses unless the admin asks to include them, and nothing leaves home unless the admin copies the report out. Needs isputnik.home 4.89.0 to be seen.

@@ -1,5 +1,12 @@
 [
   {
+    "version": "0.38.1",
+    "label": "Diagnostics, released",
+    "changes": [
+      "**0.38.0 reaches the image.** It was never published: a test that runs before the image is built looked at the conversion's memory and disk once, right as a new segment sat on the disk on its way into memory, and failed. It now waits for that moment to pass. This release carries everything in 0.38.0: the engine's part of home's diagnostics report (home 4.89.0), and the GPU's recent failures kept with ffmpeg's own words."
+    ]
+  },
+  {
     "version": "0.38.0",
     "label": "Diagnostics for bug reports",
     "changes": [
