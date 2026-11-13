@@ -3,16 +3,36 @@
 // setting never saved, or one that no longer reads, is its default.
 import { z } from "zod";
 import type { Db } from "./db.js";
-import { DEFAULT_CONVERSION, type ConversionSettings } from "./hls.js";
+import { DEFAULT_CONVERSION, MEMORY_MAX_MB, MEMORY_MIN_MB, fromLegacy, legacyOf, type ConversionSettings } from "./hls.js";
 import { DEFAULT_COPIES, copySettingsSchema, type CopySettings } from "./copies.js";
 
 export const conversionSchema = z.object({
-  memoryPerViewerMb: z.number().int().min(0).max(16_384),
+  storage: z.enum(["memory", "memory-disk", "disk"]),
+  memoryMb: z.number().int().min(MEMORY_MIN_MB).max(MEMORY_MAX_MB),
   maxViewers: z.number().int().min(1).max(50),
-  whenFull: z.enum(["disk", "wait"]),
   hardware: z.enum(["auto", "cpu", "gpu"]),
   remoteQuality: z.union([z.literal(1080), z.literal(720), z.literal(480)]).nullable()
 });
+
+/** What engines before 0.35 had, and a home of then still sends. */
+const legacySchema = z.object({
+  memoryPerViewerMb: z.number().int().min(0).max(MEMORY_MAX_MB),
+  whenFull: z.enum(["disk", "wait"])
+}).partial();
+
+/** `patch` over `current`. A patch in the old words (a home from before 0.35,
+ *  or a row saved then) that says something else than the new settings
+ *  amount to is taken in the old words; one that only repeats them is not
+ *  (home's new page sends the new words alone). */
+export function mergeConversion(current: ConversionSettings, patch: unknown): ConversionSettings {
+  const body = patch && typeof patch === "object" ? patch as Record<string, unknown> : {};
+  const merged = conversionSchema.parse({ ...current, ...body });
+  const legacy = legacySchema.parse({ memoryPerViewerMb: body.memoryPerViewerMb, whenFull: body.whenFull });
+  const was = legacyOf(merged);
+  const asked = { memoryPerViewerMb: legacy.memoryPerViewerMb ?? was.memoryPerViewerMb, whenFull: legacy.whenFull ?? was.whenFull };
+  if (asked.memoryPerViewerMb === was.memoryPerViewerMb && asked.whenFull === was.whenFull) return merged;
+  return { ...merged, ...fromLegacy(asked, merged.maxViewers, merged.memoryMb) };
+}
 
 const CONVERSION_KEY = "conversion";
 
@@ -20,7 +40,7 @@ export function readConversion(db: Db): ConversionSettings {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(CONVERSION_KEY) as { value: string } | undefined;
   if (!row) return { ...DEFAULT_CONVERSION };
   try {
-    return conversionSchema.parse({ ...DEFAULT_CONVERSION, ...(JSON.parse(row.value) as object) });
+    return mergeConversion(DEFAULT_CONVERSION, JSON.parse(row.value));
   } catch {
     return { ...DEFAULT_CONVERSION };
   }

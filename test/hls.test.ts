@@ -309,7 +309,7 @@ describe("real segments", () => {
     fs.copyFileSync(film, second);
     fs.utimesSync(second, hourAgo, hourAgo);
 
-    app = await buildApp({ gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null, fastify: { logger: false } });
+    app = await buildApp({ gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, transcodeDir: path.join(fixture.root, ".transcode"), isMapped: () => true, version: "0.0.0-test", stage: null, fastify: { logger: false } });
     await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: { ...headers, "x-isputnik-user-role": "admin" }, payload: { name: "Films", kind: "movies", folder: "Movies" } });
     await app.scansSettled();
     const films = (await app.inject({ method: "GET", url: "/video/api/movies", headers })).json().items as { id: string; title: string }[];
@@ -424,12 +424,14 @@ describe("real segments", () => {
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
     let state = await conversion();
-    expect(state.settings).toEqual({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto", remoteQuality: 720 });
+    expect(state.settings).toMatchObject({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3, hardware: "auto", remoteQuality: 720 });
+    expect(state.disk).toMatchObject({ mapped: true });
+    expect(state.storage).toBe("memory-disk");
     expect(state.usage.viewers).toMatchObject([{ user: "Mum", title: "Loud Film", mode: "remux" }]);
     expect(state.usage.memoryBytes).toBeGreaterThan(0);
     expect(state.usage.diskBytes).toBe(0);
 
-    expect((await setConversion({ memoryPerViewerMb: 0, maxViewers: 3, whenFull: "disk" })).statusCode).toBe(200);
+    expect((await setConversion({ storage: "disk" })).statusCode).toBe(200);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     const segment = await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/1.ts`, headers });
     expect(segment.statusCode).toBe(200);
@@ -438,11 +440,11 @@ describe("real segments", () => {
     expect(state.usage.memoryBytes).toBe(0);
     expect(state.usage.diskBytes).toBeGreaterThan(0);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
-    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+    await setConversion({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3 });
   }, 60_000);
 
   it("turns away a viewer past the admin's limit, and lets them in once a place is free", async () => {
-    await setConversion({ memoryPerViewerMb: 300, maxViewers: 1, whenFull: "wait" });
+    await setConversion({ storage: "memory", maxViewers: 1 });
     const dad = { ...headers, "x-isputnik-user-id": "dad", "x-isputnik-user-name": "Dad" };
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers })).statusCode).toBe(200);
 
@@ -458,7 +460,7 @@ describe("real segments", () => {
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers });
     expect((await app.inject({ method: "GET", url: `/video/api/hls/${filmId}/0.ts`, headers: dad })).statusCode).toBe(200);
     await app.inject({ method: "DELETE", url: `/video/api/hls/${filmId}`, headers: dad });
-    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+    await setConversion({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3 });
   }, 60_000);
 
   it("converts one film at a time for each person, refusing a second rather than taking over the first", async () => {
@@ -481,17 +483,28 @@ describe("real segments", () => {
   }, 60_000);
 
   it("keeps the admin's settings, refuses ones out of range, and lets only an admin near them", async () => {
-    expect((await setConversion({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait" })).json().settings)
-      .toEqual({ memoryPerViewerMb: 512, maxViewers: 2, whenFull: "wait", hardware: "auto", remoteQuality: 720 });
-    expect((await conversion()).settings.memoryPerViewerMb).toBe(512);
-    expect((await setConversion({ memoryPerViewerMb: -1, maxViewers: 2, whenFull: "wait" })).statusCode).toBe(400);
-    expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 0, whenFull: "wait" })).statusCode).toBe(400);
-    expect((await setConversion({ memoryPerViewerMb: 100, maxViewers: 2, whenFull: "swap" })).statusCode).toBe(400);
+    expect((await setConversion({ storage: "memory", memoryMb: 512, maxViewers: 2 })).json().settings)
+      .toEqual({ storage: "memory", memoryMb: 512, maxViewers: 2, hardware: "auto", remoteQuality: 720, memoryPerViewerMb: 256, whenFull: "wait" });
+    expect((await conversion()).settings.memoryMb).toBe(512);
+    expect((await setConversion({ memoryMb: 10 })).statusCode).toBe(400);
+    expect((await setConversion({ maxViewers: 0 })).statusCode).toBe(400);
+    expect((await setConversion({ storage: "swap" })).statusCode).toBe(400);
+    expect((await setConversion({ whenFull: "swap" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/video/api/admin/conversion", headers })).statusCode).toBe(403);
-    expect((await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers, payload: { memoryPerViewerMb: 1, maxViewers: 1, whenFull: "disk" } })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers, payload: { storage: "disk" } })).statusCode).toBe(403);
     const events = (await app.inject({ method: "GET", url: "/video/api/admin/events?event=conversion.changed", headers: adminHeaders })).json();
-    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting on the GPU where it can, 512 MB of memory each, then waiting; away from home up to 720p");
-    await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" });
+    expect(events.events[0].detail).toBe("Up to 2 viewer(s) converting on the GPU where it can, 512 MB of memory, then waiting; away from home up to 720p");
+
+    // A home from before 0.35 sends back what it read, in the old words, with its change.
+    const old = (await conversion()).settings;
+    expect((await setConversion({ ...old, whenFull: "disk" })).json().settings).toMatchObject({ storage: "memory-disk", memoryMb: 512 });
+    expect((await setConversion({ memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk" })).json().settings).toMatchObject({ storage: "memory-disk", memoryMb: 900 });
+    expect((await setConversion({ memoryPerViewerMb: 0, maxViewers: 3, whenFull: "disk" })).json().settings).toMatchObject({ storage: "disk", memoryMb: 900 });
+    // …and a repeat of the old words alone changes nothing.
+    const now = (await conversion()).settings;
+    expect((await setConversion({ ...now, remoteQuality: 480 })).json().settings).toMatchObject({ storage: "disk", memoryMb: 900, remoteQuality: 480 });
+    await setConversion({ remoteQuality: 720 });
+    await setConversion({ storage: "memory-disk", memoryMb: DEFAULT_CONVERSION.memoryMb, maxViewers: 3 });
   });
 
   it("refuses a segment that isn't in the playlist, and someone who can't see the film", async () => {

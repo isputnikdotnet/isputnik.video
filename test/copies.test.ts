@@ -208,3 +208,29 @@ describe("the room copies take", () => {
     expect(fs.existsSync(path.join(root, COPIES_FOLDER, "kept.mp4"))).toBe(true);
   });
 });
+
+describe("a conversion folder that is no disk of its own", () => {
+  it("converts in memory only and makes no copies there, saying why", async () => {
+    // As in the image with the Transcode path left empty: /transcode is inside the container.
+    await app.close();
+    const transcode = path.join(fixture.root, "transcode");
+    app = await buildApp({
+      gatewaySecret: SECRET, devUser: null, dbPath: ":memory:", mediaRoot: fixture.root, version: "0.0.0-test", stage: null,
+      scan: { settleMs: 60_000 }, transcodeDir: transcode, copiesDir: path.join(transcode, COPIES_FOLDER), isMapped: () => false,
+      fastify: { logger: false }
+    });
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_mov", headers: as("admin"), payload: { name: "Films", kind: "movies", folder: "Movies" } });
+    await app.scansSettled();
+
+    const conversion = (await get("/video/api/admin/conversion", "admin")).json();
+    expect(conversion.disk).toMatchObject({ mapped: false, folder: transcode });
+    // What the admin chose is kept, but memory only is what is in force.
+    expect(conversion.settings.storage).toBe("memory-disk");
+    expect(conversion.storage).toBe("memory");
+
+    const id = await idOf("Tall Film");
+    const asked = (await put(`/video/api/copies/${id}`, { quality: 480 })).json() as Answer & { unavailable?: string };
+    expect(asked).toMatchObject({ state: "none", unavailable: "no-disk" });
+    expect((await get("/video/api/admin/copies", "admin")).json()).toMatchObject({ insideContainer: true, copies: [] });
+  }, 60_000);
+});

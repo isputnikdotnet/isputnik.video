@@ -17,8 +17,9 @@ import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
-import { HlsBusyError, HlsError, HlsSessions, buildPlan, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
-import { conversionSchema, detectionSchema, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
+import { HlsBusyError, HlsError, HlsSessions, buildPlan, legacyOf, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
+import { isInside, isMapped } from "./mounts.js";
+import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
 import { Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
@@ -70,6 +71,10 @@ export interface AppOptions {
   /** Where segments are made while someone watches (TRANSCODE_PATH); emptied on
    *  start and removed on close. A fresh temporary folder when left out. */
   transcodeDir?: string;
+  /** Whether a folder is a disk mapped into the container (mounts.ts); tests
+   *  hand in their own. Without one, conversion is in memory only and no copies
+   *  are made inside the conversion folder. */
+  isMapped?: (folder: string) => boolean;
   /** Where TMDB's posters and backdrops are kept (ART_PATH); a fresh temporary
    *  folder when left out. */
   artDir?: string;
@@ -212,6 +217,16 @@ const markBodySchema = z.object({
 const ORIGINAL_UNSAFE = new Set(["mpeg4", "msmpeg4v1", "msmpeg4v2", "msmpeg4v3"]);
 const originalUnsafe = (codec: string | null) => codec !== null && ORIGINAL_UNSAFE.has(codec);
 
+/** Room on the disk a folder is on; nulls where it can't be read. */
+function freeSpace(folder: string): { freeBytes: number | null; totalBytes: number | null } {
+  try {
+    const stats = fs.statfsSync(folder);
+    return { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+  } catch {
+    return { freeBytes: null, totalBytes: null };
+  }
+}
+
 const ART_TYPES: Record<string, string> = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
 
 const continueQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(50).default(20) });
@@ -268,6 +283,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const hardware = tools ? new Hardware(() => (options.detectGpu ?? detectGpu)(tools), engineLog) : null;
   const hls = tools ? new HlsSessions(tools, options.transcodeDir ?? null, engineLog, hardware) : null;
   hls?.configure(readConversion(db));
+  hls?.setMapped((options.isMapped ?? isMapped)(hls.folder));
   // Not once the app has closed (a short test can close before ffmpeg answers).
   let closed = false;
   void toolsReady.then((ok) => { if (ok && !closed) hardware?.configure(readConversion(db).hardware); });
@@ -276,6 +292,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
   const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.active() ?? 0) > 0) : null;
   copies?.configure(readCopies(db));
+  // Copies kept inside a conversion folder that is no disk of its own would fill
+  // the container (on Unraid, docker.img): none are made there. Ones made before
+  // are still handed out until the admin deletes them.
+  const copiesInsideContainer = Boolean(hls && isInside(copiesDir, hls.folder) && !hls.mapped);
 
   // Posters and TMDB (metadata.ts): after each scan, one library at a time.
   const artDir = options.artDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-art-"));
@@ -982,7 +1002,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (delivery.mode === "direct") return { state: "unneeded" as const, url: `${API}/stream/${item.id}` };
     const status = copies!.status(key, file);
     const estimateSeconds = estimateCopySeconds(info, delivery, Boolean(hardware?.choose(info, delivery)));
-    if (!status) return { state: "none" as const, estimateSeconds };
+    // No disk for copies (copiesInsideContainer): home's downloader converts as it
+    // downloads instead, as it did before copies were made.
+    if (!status || (copiesInsideContainer && status.state !== "ready")) {
+      return { state: "none" as const, estimateSeconds, ...(copiesInsideContainer ? { unavailable: "no-disk" as const } : {}) };
+    }
     return { ...status, estimateSeconds, url: status.state === "ready" ? `${API}/copies/${item.id}/file?quality=${key.rung}&audio=${key.audio}` : null };
   };
 
@@ -994,7 +1018,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.put(`${API}/copies/:id`, { preHandler: requireIdentity }, async (request, reply) => {
     const target = await copyTarget(request, request.body);
     if (!target) return reply.code(404).send({ error: "Not found" });
-    if (target.delivery.mode !== "direct") {
+    if (target.delivery.mode !== "direct" && !copiesInsideContainer) {
       copies!.request({ ...target.key, title: target.title, file: target.file, info: target.info, delivery: target.delivery });
     }
     return copyAnswer(target);
@@ -1031,8 +1055,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
 
   // The copies kept, what they take and how much they may: home's Settings → Video.
+  // Engine 0.35+: insideContainer — the copies' folder is no disk of its own, so
+  // no new ones are made; those there are handed out until deleted.
+  const copiesList = (made: Copies) => ({ ...made.list(), insideContainer: copiesInsideContainer });
   app.get(`${API}/admin/copies`, { preHandler: requireAdmin }, async (_request, reply) =>
-    (copies ? copies.list() : reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" })));
+    (copies ? copiesList(copies) : reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" })));
 
   app.put(`${API}/admin/copies`, { preHandler: requireAdmin }, async (request, reply) => {
     if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" });
@@ -1040,14 +1067,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     saveCopies(db, settings);
     copies.configure(settings);
     note(request, "info", "copies.changed", { detail: `Copies to download may take ${settings.limitGb} GB` });
-    return copies.list();
+    return copiesList(copies);
   });
 
   app.delete(`${API}/admin/copies`, { preHandler: requireAdmin }, async (request, reply) => {
     if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: no copies can be made" });
     const removed = copies.clear();
     note(request, "info", "copies.cleared", { detail: `${removed} copies to download removed` });
-    return copies.list();
+    return copiesList(copies);
   });
 
   // Marked by hand, several at once (home's issue #101): a whole show, one season
@@ -1153,23 +1180,32 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // ── The admin's window, read by home through the gateway ─────────────────
 
   // Watching converted video: the admin's limits, and who is using what now.
-  const conversion = () => ({
-    available: Boolean(hls),
-    settings: readConversion(db),
-    usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 },
-    // What the GPU does here (engine 0.20+); null without ffmpeg.
-    hardware: hardware?.state() ?? null
-  });
+  const conversion = () => {
+    const settings = readConversion(db);
+    return {
+      available: Boolean(hls),
+      // The old words beside the new ones, for a home from before engine 0.35.
+      settings: { ...settings, ...legacyOf(settings) },
+      // Engine 0.35+: whether the conversion folder is a disk of its own, and the
+      // storage in force (memory only without one, whatever was chosen).
+      disk: hls ? { mapped: hls.mapped, folder: hls.folder, ...freeSpace(hls.folder) } : null,
+      storage: hls?.storage ?? null,
+      usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 },
+      // What the GPU does here (engine 0.20+); null without ffmpeg.
+      hardware: hardware?.state() ?? null
+    };
+  };
 
   app.get(`${API}/admin/conversion`, { preHandler: requireAdmin }, async () => conversion());
 
   app.put(`${API}/admin/conversion`, { preHandler: requireAdmin }, async (request) => {
-    // A home from before 0.20 sends no `hardware`: what was chosen stays.
-    const settings = conversionSchema.parse({ ...readConversion(db), ...(request.body as object) });
+    // A home from before 0.20 sends no `hardware`: what was chosen stays. One
+    // from before 0.35 speaks of memory per viewer (mergeConversion).
+    const settings = mergeConversion(readConversion(db), request.body);
     saveConversion(db, settings);
     hls?.configure(settings);
     hardware?.configure(settings.hardware);
-    const memory = settings.memoryPerViewerMb === 0 ? "no memory" : `${settings.memoryPerViewerMb} MB of memory each, then ${settings.whenFull === "disk" ? "the disk" : "waiting"}`;
+    const memory = { memory: `${settings.memoryMb} MB of memory, then waiting`, "memory-disk": `${settings.memoryMb} MB of memory, then the disk`, disk: "the disk only" }[settings.storage];
     const where = { auto: "on the GPU where it can", cpu: "on the CPU only", gpu: "on the GPU only" }[settings.hardware];
     const away = settings.remoteQuality === null ? "the original" : `${settings.remoteQuality}p`;
     note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting ${where}, ${memory}; away from home up to ${away}` });

@@ -114,7 +114,7 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
           Target="/transcode"
           Default=""
           Mode="rw"
-          Description="Optional. Where a video is converted while someone watches it (a few hundred MB per viewer, deleted as they go). Point it at RAM (/tmp/isputnik-video) or a cache-pool folder to keep it off the array; left empty, it stays inside the container."
+          Description="Optional fast disk for video: conversion that overflows memory, and copies prepared for download. Point it at a cache-pool or SSD folder. Left empty, video is converted in memory only and no copies are prepared; how much memory is set in the app (Videos › Settings)."
           Type="Path"
           Display="advanced"
           Required="false"

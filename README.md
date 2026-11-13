@@ -90,7 +90,7 @@ name (`-trailer`, `Extras/`), and a `movie.nfo` says the folder is one film.
 | `MEDIA_ROOT` | `data/media` | the video folders, mounted read-only (image: `/media`) |
 | `DB_PATH` | `data/video.sqlite` | the catalog (image: `/config/video.sqlite`) |
 | `PORT` / `HOST` | `4300` / `127.0.0.1` | |
-| `TRANSCODE_PATH` | temp folder | where ffmpeg writes segments while someone watches (image: `/transcode`); finished ones move into memory up to the share set on home's Apps → Installed, the rest stay here; emptied on start |
+| `TRANSCODE_PATH` | temp folder | where ffmpeg writes segments while someone watches (image: `/transcode`), and where copies for download are kept; finished segments move into memory up to the amount set on home's Videos → Settings, the rest stay here (memory only when this is not a disk mapped into the container); emptied on start, copies kept |
 | `ART_PATH` | `art` beside `DB_PATH` | posters, backdrops and stills fetched from TMDB (image: `/config/art`); not in backups — fetched again |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | on `PATH` | the image installs both; a checkout uses the ffmpeg-static dev dependencies |
 | `LOG_LEVEL` | `info` | |
@@ -102,7 +102,7 @@ The image is `ghcr.io/isputnikdotnet/isputnik.video` (what the Unraid template
 pulls) and, the same bytes, `isputnikdotnet/isputnik.video` on Docker Hub; every
 release tag publishes both, and `latest` is the newest release. Mount `/config`
 (the catalog) and `/media` (the video share, read-only) — and, if you like,
-`/transcode` on RAM or a fast disk — then:
+`/transcode` on a fast disk (without it video is converted in memory only and no copies are prepared for download) — then:
 
 1. In home, Control panel → Settings → Apps → Video: **Generate secret** and copy
    it; paste it here as `GATEWAY_SECRET`. The container won't start without it.

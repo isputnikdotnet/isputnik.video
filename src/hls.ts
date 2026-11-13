@@ -14,9 +14,10 @@
 // is stopped and its segments deleted.
 //
 // ffmpeg writes each segment to the transcode folder; once it is finished it is
-// read into memory and the file goes, up to the admin's share per viewer
-// (ConversionSettings). Past that share a segment either stays on the disk or
-// the run waits for the player to catch up. Only so many people convert at
+// read into memory and the file goes, up to the memory the admin gives every
+// viewer together (ConversionSettings). Past that a segment stays on the disk,
+// or with memory only the run waits for the player to catch up — which is all
+// there is when the folder is not a disk mapped into the container (mounts.ts). Only so many people convert at
 // once; the next one is told so (HlsBusyError) rather than everyone slowing.
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -229,14 +230,20 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   return args;
 }
 
+/** Where finished segments are kept (home's docs/video-cache-plan.md → Storage):
+ *  memory only (once it is full a run stays a few segments ahead and waits),
+ *  memory and then the disk, or the disk only. The disk modes are in force only
+ *  when the conversion folder is a disk mapped into the container (mounts.ts);
+ *  otherwise it is memory only, whatever was chosen. */
+export type ConversionStorage = "memory" | "memory-disk" | "disk";
+
 /** What the admin sets on home's Apps page (GET/PUT /admin/conversion). */
 export interface ConversionSettings {
-  /** MB of finished segments each viewer keeps in memory; 0 keeps them all on the disk. */
-  memoryPerViewerMb: number;
+  storage: ConversionStorage;
+  /** MB of finished segments the engine keeps in memory, everyone together. */
+  memoryMb: number;
   /** How many people may watch a converted film at once. */
   maxViewers: number;
-  /** Once a viewer's memory is full: carry on on the disk, or stay that far ahead. */
-  whenFull: "disk" | "wait";
   /** Where a picture is re-encoded (hardware.ts): the GPU where it can, the CPU only, or the GPU only. */
   hardware: HardwareMode;
   /** The most a viewer away from home (on the internet, by the gateway's network
@@ -244,7 +251,40 @@ export interface ConversionSettings {
   remoteQuality: Rung | null;
 }
 
-export const DEFAULT_CONVERSION: ConversionSettings = { memoryPerViewerMb: 300, maxViewers: 3, whenFull: "disk", hardware: "auto", remoteQuality: 720 };
+/** The memory one engine may use to start with: a tenth of the server's, at most 1 GB. */
+export const MEMORY_MIN_MB = 64;
+export const MEMORY_MAX_MB = 16_384;
+export function defaultMemoryMb(totalBytes = os.totalmem()): number {
+  const tenth = Math.floor(totalBytes / 10 / 1024 / 1024 / 64) * 64;
+  return Math.max(256, Math.min(1024, tenth));
+}
+
+export const DEFAULT_CONVERSION: ConversionSettings = { storage: "memory-disk", memoryMb: defaultMemoryMb(), maxViewers: 3, hardware: "auto", remoteQuality: 720 };
+
+/** The settings of engines before 0.35, which a home of then still sends:
+ *  memory per viewer, and what to do when it was full. */
+export interface LegacyConversion {
+  memoryPerViewerMb: number;
+  whenFull: "disk" | "wait";
+}
+
+/** The old words for the new settings, for a home that only knows them. */
+export function legacyOf(settings: Pick<ConversionSettings, "storage" | "memoryMb" | "maxViewers">): LegacyConversion {
+  return {
+    memoryPerViewerMb: settings.storage === "disk" ? 0 : Math.max(1, Math.round(settings.memoryMb / settings.maxViewers)),
+    whenFull: settings.storage === "memory" ? "wait" : "disk"
+  };
+}
+
+/** The old settings in the new words: no memory was the disk only; "wait" was
+ *  memory only; memory per viewer becomes the pool it amounted to. */
+export function fromLegacy(legacy: LegacyConversion, maxViewers: number, memoryMb: number): Pick<ConversionSettings, "storage" | "memoryMb"> {
+  if (legacy.memoryPerViewerMb === 0) return { storage: "disk", memoryMb };
+  return {
+    storage: legacy.whenFull === "wait" ? "memory" : "memory-disk",
+    memoryMb: Math.min(MEMORY_MAX_MB, Math.max(MEMORY_MIN_MB, legacy.memoryPerViewerMb * maxViewers))
+  };
+}
 
 /** A finished segment: in memory, or a file in the transcode folder. */
 export type SegmentData = { data: Buffer } | { file: string; size: number };
@@ -369,6 +409,22 @@ export class HlsSessions {
   /** A folder made here (no TRANSCODE_PATH, or it was unusable): removed on close. */
   private ownsRoot: boolean;
   private settings: ConversionSettings = { ...DEFAULT_CONVERSION };
+  private diskMapped = false;
+
+  /** Whether the conversion folder is a disk mapped into the container
+   *  (mounts.ts), told by the app; a folder made here never is. */
+  setMapped(mapped: boolean): void {
+    this.diskMapped = mapped;
+  }
+
+  get mapped(): boolean {
+    return this.diskMapped && !this.ownsRoot;
+  }
+
+  /** The storage in force: what the admin chose, but memory only without a disk. */
+  get storage(): ConversionStorage {
+    return this.mapped ? this.settings.storage : "memory";
+  }
 
   /** `root` null: a fresh temporary folder. `hardware`: the GPU, when the
    *  engine looks for one; without it everything is converted on the CPU. */
@@ -518,13 +574,23 @@ export class HlsSessions {
     if (this.ownsRoot) fs.rm(this.root, { recursive: true, force: true }, () => undefined);
   }
 
+  /** The memory everyone's segments may take together; none for the disk only. */
   private get budget(): number {
-    return this.settings.memoryPerViewerMb * 1024 * 1024;
+    return this.storage === "disk" ? 0 : this.settings.memoryMb * 1024 * 1024;
   }
 
-  /** "wait" and memory full: the run goes no further ahead. */
-  private full(session: Session): boolean {
-    return this.settings.whenFull === "wait" && this.budget > 0 && session.memoryBytes >= this.budget;
+  /** Bytes of segments in memory, every viewer together. */
+  private get pooled(): number {
+    let sum = 0;
+    for (const session of this.sessions.values()) sum += session.memoryBytes;
+    return sum;
+  }
+
+  /** Memory only and the memory full: a run goes no further than a few
+   *  segments ahead of its player (each still gets those, so one viewer
+   *  can't starve the rest). */
+  private full(): boolean {
+    return this.storage === "memory" && this.pooled >= this.budget;
   }
 
   private open(key: string, plan: HlsPlan, who: { user: string; title: string }): Session {
@@ -599,10 +665,10 @@ export class HlsSessions {
     }
   }
 
-  /** A finished segment: into memory while the viewer's share allows (its bytes
-   *  counted at once, so two read in together can't both squeeze in), else left
-   *  on the disk. With "wait" everything goes into memory, and refresh stops the
-   *  run once the share is used. */
+  /** A finished segment: into memory while the pool allows (its bytes counted
+   *  at once, so two read in together can't both squeeze in), else left on the
+   *  disk. With memory only everything goes into memory, and refresh stops the
+   *  run once the pool is used. */
   private settle(session: Session, n: number): void {
     session.done.add(n);
     const file = path.join(session.dir, `${n}.ts`);
@@ -614,7 +680,7 @@ export class HlsSessions {
       return;
     }
     const budget = this.budget;
-    const toMemory = budget > 0 && (this.settings.whenFull === "wait" || session.memoryBytes + size <= budget);
+    const toMemory = budget > 0 && (this.storage === "memory" || this.pooled + size <= budget);
     if (!toMemory) {
       session.onDisk.set(n, size);
       return;
@@ -647,7 +713,7 @@ export class HlsSessions {
       if (!session.done.has(n)) this.settle(session, n);
     }
     const ahead = session.writing - session.lastWanted;
-    if (ahead > MAX_AHEAD || (this.full(session) && ahead >= MIN_AHEAD)) this.kill(session);
+    if (ahead > MAX_AHEAD || (this.full() && ahead >= MIN_AHEAD)) this.kill(session);
   }
 
   /** Near the end of what was made and nothing running: carry on from there. */
@@ -657,7 +723,7 @@ export class HlsSessions {
     while (session.done.has(next)) next += 1;
     if (next >= session.plan.starts.length || next - n > RESTART_WITHIN) return;
     // Memory full: only once the player is nearly out of what was made.
-    if (this.full(session) && next - n >= MIN_AHEAD) return;
+    if (this.full() && next - n >= MIN_AHEAD) return;
     this.start(session, next);
   }
 
@@ -678,7 +744,7 @@ export class HlsSessions {
     }
     // Memory full: what is behind the player goes first, to make room ahead.
     for (const done of [...session.done].filter((at) => at < n).sort((a, b) => a - b)) {
-      if (!this.full(session)) break;
+      if (!this.full()) break;
       if (session.memory.has(done)) this.forget(session, done);
     }
   }
