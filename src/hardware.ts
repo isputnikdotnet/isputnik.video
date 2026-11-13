@@ -70,7 +70,7 @@ const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
 const TEST_TIMEOUT_MS = 20_000;
 /** A typical HDR10 grade's mastering display (P3 primaries, D65, 1000 to 0.0001
  *  nits), in x265's notation, for the tone-mapping test's sample. */
-const HDR10_MASTER_DISPLAY = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)";
+export const HDR10_MASTER_DISPLAY = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)";
 /** What tonemap_vaapi says of a frame with no mastering display data. */
 const NO_MASTERING = /No mastering display data/i;
 
@@ -262,6 +262,9 @@ export class Hardware {
     if (mode !== "cpu" && (was === "cpu" || !this.caps)) void this.check();
   }
 
+  /** Told what each check found (the app notes a change of GPU, driver or ffmpeg). */
+  onChecked: ((caps: GpuCapabilities) => void) | null = null;
+
   /** Finds out again, and forgets the failures. */
   check(): Promise<void> {
     if (this.mode === "cpu") return Promise.resolve();
@@ -269,6 +272,11 @@ export class Hardware {
       .then((caps) => {
         this.caps = caps;
         this.failures = [];
+        try {
+          this.onChecked?.(caps);
+        } catch (err) {
+          this.log.warn({ err }, "Could not note what the GPU check found");
+        }
         if (caps.error) this.log.info({ gpu: caps }, `Converting on the CPU: ${caps.error}`);
         else this.log.info({ gpu: caps }, `Converting on the GPU (${caps.device}${caps.driver ? `, ${caps.driver}` : ""}); it decodes ${caps.decode.join(", ") || "nothing"}${caps.tonemap ? "; tone-maps HDR" : ""}${caps.overlay ? "; draws subtitles" : ""}`);
       })
@@ -289,9 +297,17 @@ export class Hardware {
    *  draws the subtitle there too), or null for the CPU. A picture copied as it
    *  is needs neither. */
   choose(info: MediaInfo, delivery: Delivery): GpuRun | null {
-    if (delivery.videoCopy || !info.video || this.mode === "cpu") return null;
+    if (this.mode === "cpu" || this.setAside) return null;
+    return this.gpuFor(info, delivery);
+  }
+
+  /** What the GPU would do with this film whatever the admin chose and however
+   *  it has failed lately: for the hardware test (hardware-test.ts), which
+   *  measures the GPU even when conversions are kept on the CPU. */
+  gpuFor(info: MediaInfo, delivery: Delivery): GpuRun | null {
+    if (delivery.videoCopy || !info.video) return null;
     const caps = this.caps;
-    if (!caps?.encode || !caps.device || this.setAside) return null;
+    if (!caps?.encode || !caps.device) return null;
     const key = decodeKeyOf(info);
     const kind = hdrOf(info.video);
     const hdr = kind !== null;

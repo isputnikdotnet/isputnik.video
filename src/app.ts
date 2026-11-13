@@ -27,6 +27,8 @@ import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { KeyframeWarmer } from "./keyframe-warmer.js";
 import { ffmpegVersionOf, problemLines, systemFacts } from "./diagnostics.js";
+import { HardwareTester, fingerprintOf, listChanges, listTests, noteHardware, type HardwareTest, type Scenario, type TestLimits } from "./hardware-test.js";
+import { DiskChecker, listDiskChecks, type DiskCheck, type DiskLimits } from "./disk-check.js";
 import { BASE_PATH } from "./config.js";
 import { groupByDisk, type DiskHolding } from "./disks.js";
 import { openDatabase, upgradeDatabase } from "./db.js";
@@ -88,6 +90,13 @@ export interface AppOptions {
   /** Where copies made for download are kept (copies.ts); a fresh temporary
    *  folder, removed on close, when left out. */
   copiesDir?: string;
+  /** Where the hardware test keeps its clips (hardware-test.ts); beside the
+   *  catalog when left out, or a temporary folder for one in memory. */
+  samplesDir?: string;
+  /** Tests run the hardware test on small clips, quickly. */
+  hardwareTest?: { scenarios?: readonly Scenario[]; limits?: Partial<TestLimits> };
+  /** Tests read less in the disk check. */
+  diskCheck?: Partial<DiskLimits>;
   /** How TMDB is reached; tests hand in their own. */
   fetch?: Fetch;
   /** Tests settle files at once instead of waiting out a copy. */
@@ -301,9 +310,44 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   let closed = false;
   void toolsReady.then((ok) => { if (ok && !closed) hardware?.configure(readConversion(db).hardware); });
   const subtitleCache = tools ? new SubtitleCache(tools) : null;
+  // The hardware test (hardware-test.ts): only when an admin asks, never while
+  // someone watches converted video; the work below waits while it runs.
+  const samplesDir = options.samplesDir ?? (options.dbPath === ":memory:"
+    ? path.join(os.tmpdir(), "isputnik-video-samples")
+    : path.join(path.dirname(path.resolve(options.dbPath)), "samples"));
+  const tester = tools && hardware ? new HardwareTester({
+    db,
+    tools,
+    samplesDir,
+    ffmpegVersion: () => ffmpegVersionOf(tools),
+    gpuFor: (info, delivery) => hardware.gpuFor(info, delivery),
+    gpuState: () => {
+      const state = hardware.state();
+      return { device: state.device, driver: state.driver, decode: state.decode, tonemap: state.tonemap, overlay: state.overlay, error: state.error };
+    },
+    maxViewers: () => readConversion(db).maxViewers,
+    log: engineLog,
+    ...options.hardwareTest
+  }) : null;
+  // The disk check (disk-check.ts): the same rules as the hardware test.
+  const disks = new DiskChecker({ db, mediaRoot: options.mediaRoot, log: engineLog, limits: options.diskCheck });
+  /** Someone watches converted video, or a test or disk check runs: background work waits. */
+  const busyConverting = () => (hls?.watching() ?? 0) > 0 || (tester?.running() ?? false) || disks.running();
+  // A GPU, driver or ffmpeg different from the last start's is noted (H2).
+  if (hardware && tools) {
+    hardware.onChecked = (caps) => {
+      void ffmpegVersionOf(tools).then((version) => {
+        if (closed || !db.open) return;
+        const change = noteHardware(db, fingerprintOf(caps, version));
+        if (!change) return;
+        recordEvent(db, { level: "info", event: "hardware.changed", detail: change.summary });
+        app.log.info({ change: change.summary }, "The hardware changed since the last check");
+      });
+    };
+  }
   // Copies made for download: a queue of its own, which waits while anyone watches.
   const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
-  const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.watching() ?? 0) > 0, hls) : null;
+  const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, busyConverting, hls) : null;
   // When the queue works, and how much (C4): home's Settings › Video › Downloads and Keep ready.
   copies?.configureJobs(readJobs(db));
   // One bucket for every copy going to someone away from home (throttle.ts).
@@ -458,7 +502,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       const delivery = decideDelivery(info, path.extname(item.relative));
       return delivery.mode !== "direct" && delivery.videoCopy;
     },
-    busy: () => (hls?.active() ?? 0) > 0,
+    busy: () => (hls?.active() ?? 0) > 0 || (tester?.running() ?? false) || disks.running(),
     log: engineLog
   }) : null;
   const warmKeyframes = () => {
@@ -505,7 +549,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   /** While someone watches converted video, a pass waits between two seasons or
    *  films (as copies do): its ffmpeg would take the cores and the disk from them. */
   const whileWatching = async (signal: AbortSignal) => {
-    while ((hls?.watching() ?? 0) > 0 && !signal.aborted) {
+    while (busyConverting() && !signal.aborted) {
       await new Promise<void>((resolve) => {
         const timer = setTimeout(done, VIEWER_CHECK_MS);
         function done() { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); }
@@ -585,6 +629,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     copies?.close();
     if (options.copiesDir === undefined) fs.rmSync(copiesDir, { recursive: true, force: true });
     detectStop.abort();
+    tester?.stop("The engine is stopping");
+    disks.stop("The engine is stopping");
+    await tester?.settled();
+    await disks.settled();
     warmStop.abort();
     await detectChain.catch(() => undefined);
     await warmer?.settled();
@@ -1891,8 +1939,112 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       titles: library.titles, episodes: library.episodes, sizeBytes: library.sizeBytes
     })),
     paths: { media: options.mediaRoot, database: options.dbPath, art: artDir, transcode: hls?.folder ?? null },
-    log: problemLines(options.logBuffer)
+    log: problemLines(options.logBuffer),
+    hardwareTest: testSummary(listTests(db, 1)[0] ?? null),
+    hardwareChanges: listChanges(db, 5).map((change) => `${change.at.slice(0, 16).replace("T", " ")} ${change.summary}`),
+    diskCheck: diskSummary(listDiskChecks(db, 1)[0] ?? null)
   }));
+
+  /** The last disk check, a line a library, for the diagnostics report. */
+  function diskSummary(check: DiskCheck | null) {
+    if (!check) return null;
+    return {
+      at: check.startedAt,
+      phase: check.phase,
+      ...(check.reason ? { reason: check.reason } : {}),
+      libraries: check.libraries.map((entry) => entry.error
+        ? `${entry.name}: failed (${entry.error})`
+        : `${entry.name}: first answer ${entry.wake.slowestMs ?? "?"} ms at the slowest${entry.wake.asleep ? " (a disk was asleep)" : ""}; reads ${entry.read?.mbitPerSecond != null ? `${entry.read.mbitPerSecond} Mbit/s` : "?"}; heaviest film ${entry.heaviestMbit ?? "?"} Mbit/s; ${entry.verdict}`)
+    };
+  }
+
+  // ── The hardware test (hardware-test.ts) ─────────────────────────────────
+
+  /** The last test in a few lines, for the diagnostics report. */
+  function testSummary(test: HardwareTest | null) {
+    if (!test) return null;
+    const speed = (run: HardwareTest["scenarios"][number]["gpuRun"]) => (run ? (run.speed === null ? `failed (${run.error ?? "?"})` : `${run.speed}x ${run.verdict}`) : "-");
+    return {
+      at: test.startedAt,
+      phase: test.phase,
+      ...(test.reason ? { reason: test.reason } : {}),
+      scenarios: test.scenarios.map((entry) => entry.skipped ? `${entry.label}: skipped (${entry.skipped})` : `${entry.label}: GPU ${speed(entry.gpuRun)}, CPU ${speed(entry.cpuRun)}`),
+      atOnce: test.together.map((entry) => `${entry.label} on the ${entry.converter.toUpperCase()}: ${entry.atOnce}${entry.atLeast ? " or more" : ""}`),
+      suggestedViewers: test.suggestedViewers
+    };
+  }
+
+  // While a test or a disk check runs, someone starting to watch converted video
+  // stops it: they come first.
+  let testWatch: NodeJS.Timeout | null = null;
+  const watchTest = () => {
+    if (testWatch) clearInterval(testWatch);
+    testWatch = setInterval(() => {
+      if (!tester?.running() && !disks.running()) {
+        clearInterval(testWatch!);
+        testWatch = null;
+        return;
+      }
+      if ((hls?.watching() ?? 0) > 0) {
+        tester?.stop("Someone started watching converted video");
+        disks.stop("Someone started watching converted video");
+      }
+    }, 1000);
+    testWatch.unref();
+  };
+
+  app.post(`${API}/admin/hardware/test`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!tester || !(await toolsReady)) return reply.code(404).send({ error: "ffmpeg is missing: nothing can be tested" });
+    if ((hls?.watching() ?? 0) > 0) return reply.code(409).send({ error: "Someone is watching converted video. Try again when they've finished.", code: "watching" });
+    if (tester.running()) return reply.code(409).send({ error: "A test is running already", code: "running" });
+    if (disks.running()) return reply.code(409).send({ error: "A disk check is running", code: "disks" });
+    const test = tester.start();
+    watchTest();
+    note(request, "info", "hardware.test", { detail: "Hardware test started" });
+    return reply.code(202).send({ test });
+  });
+
+  app.get(`${API}/admin/hardware/test`, { preHandler: requireAdmin }, async () => ({
+    running: tester?.progress() ?? null,
+    last: listTests(db, 1)[0] ?? null,
+    available: Boolean(tester)
+  }));
+
+  app.delete(`${API}/admin/hardware/test`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!tester?.running()) return reply.code(404).send({ error: "No test is running" });
+    tester.stop(`Stopped by ${request.identity?.name || "an admin"}`);
+    await tester.settled();
+    return { last: listTests(db, 1)[0] ?? null };
+  });
+
+  app.get(`${API}/admin/hardware/history`, { preHandler: requireAdmin }, async () => ({
+    tests: listTests(db),
+    changes: listChanges(db),
+    diskChecks: listDiskChecks(db)
+  }));
+
+  // The disk check (disk-check.ts): each library's wake-up and reading speed.
+  app.post(`${API}/admin/hardware/disks`, { preHandler: requireAdmin }, async (request, reply) => {
+    if ((hls?.watching() ?? 0) > 0) return reply.code(409).send({ error: "Someone is watching converted video. Try again when they've finished.", code: "watching" });
+    if (disks.running()) return reply.code(409).send({ error: "A disk check is running already", code: "running" });
+    if (tester?.running()) return reply.code(409).send({ error: "A hardware test is running", code: "test" });
+    const check = disks.start();
+    watchTest();
+    note(request, "info", "hardware.disks", { detail: "Disk check started" });
+    return reply.code(202).send({ check });
+  });
+
+  app.get(`${API}/admin/hardware/disks`, { preHandler: requireAdmin }, async () => ({
+    running: disks.progress(),
+    last: listDiskChecks(db, 1)[0] ?? null
+  }));
+
+  app.delete(`${API}/admin/hardware/disks`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!disks.running()) return reply.code(404).send({ error: "No disk check is running" });
+    disks.stop(`Stopped by ${request.identity?.name || "an admin"}`);
+    await disks.settled();
+    return { last: listDiskChecks(db, 1)[0] ?? null };
+  });
 
   // The whole catalog for home's backups (home's docs/apps-platform-plan.md →
   // Backups): one consistent copy; the event about it is written after it.

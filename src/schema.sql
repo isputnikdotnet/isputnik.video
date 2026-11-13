@@ -423,3 +423,31 @@ CREATE TABLE IF NOT EXISTS keep_ready (
   title        TEXT NOT NULL,
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- The hardware test (hardware-test.ts): each run whole, as JSON, the last 20 kept.
+CREATE TABLE IF NOT EXISTS hardware_tests (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at   TEXT NOT NULL,
+  finished_at  TEXT,
+  phase        TEXT NOT NULL,
+  result       TEXT NOT NULL
+);
+
+-- What the GPU check found changing between starts: a GPU, its driver, ffmpeg
+-- (hardware-test.ts, noteHardware). The last 50 kept.
+CREATE TABLE IF NOT EXISTS hardware_changes (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  at       TEXT NOT NULL,
+  before   TEXT NOT NULL,
+  after    TEXT NOT NULL,
+  summary  TEXT NOT NULL
+);
+
+-- The disk check (disk-check.ts): each run whole, as JSON, the last 20 kept.
+CREATE TABLE IF NOT EXISTS disk_checks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at   TEXT NOT NULL,
+  finished_at  TEXT,
+  phase        TEXT NOT NULL,
+  result       TEXT NOT NULL
+);
