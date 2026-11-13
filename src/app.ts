@@ -17,10 +17,11 @@ import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFile, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
-import { HlsBusyError, HlsError, HlsSessions, buildPlan, legacyOf, playlist, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
+import { HlsBusyError, HlsError, HlsSessions, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
 import { isInside, isMapped } from "./mounts.js";
 import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
-import { Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
+import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
+import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
 import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { BASE_PATH } from "./config.js";
@@ -291,7 +292,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const subtitleCache = tools ? new SubtitleCache(tools) : null;
   // Copies made for download: a queue of its own, which waits while anyone watches.
   const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
-  const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.active() ?? 0) > 0) : null;
+  const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.watching() ?? 0) > 0, hls) : null;
+  // Titles an admin keeps ready (keep-ready.ts): their kept versions are never trimmed.
+  const keepReady = new KeepReady(db);
   copies?.configure(readCopies(db));
   // Copies kept inside a conversion folder that is no disk of its own would fill
   // the container (on Unraid, docker.img): none are made there. Ones made before
@@ -302,9 +305,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const copyId = (key: CopyKey) => `${key.itemId}:${key.rung}:${key.audio}`;
   const trimCache = (justMade: string | null = null) => {
     if (!copies) return;
+    const pinned = keepReady.pinned();
     const things: KeptThing[] = [
       ...copies.readyItems().map((copy) => ({ kind: "copy" as const, id: copyId(copy.key), sizeBytes: copy.sizeBytes, usedAt: copy.usedAt, held: copyId(copy.key) === justMade })),
-      ...(hls?.keptFilms() ?? []).map((film) => ({ kind: "film" as const, id: film.variant, sizeBytes: film.sizeBytes, usedAt: film.usedAt, held: Boolean(film.inUse) || film.variant === justMade }))
+      ...(hls?.keptFilms() ?? []).map((film) => ({ kind: "film" as const, id: film.variant, sizeBytes: film.sizeBytes, usedAt: film.usedAt, held: Boolean(film.inUse) || film.variant === justMade || pinned.has(`${film.itemId}:${film.rung}`) }))
     ];
     const ready = new Map(copies.readyItems().map((copy) => [copyId(copy.key), copy.key]));
     for (const thing of overLimit(things, readCopies(db).limitGb * 1024 ** 3)) {
@@ -335,6 +339,98 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return null;
     }
   };
+
+  // ── Background work on the shared cache (home's docs/video-cache-plan.md C3) ──
+  // Whoever asked, the engine finds the files itself: every library is its own.
+  const engineIdentity = devIdentity("engine:Engine");
+  /** Whether versions can be kept here at all: a disk of its own, and not memory only. */
+  const canKeep = () => Boolean(copies && hls && !copiesInsideContainer && hls.canKeep);
+
+  /** An episode or film at a quality: its version's plan when its picture has to
+   *  be re-encoded there; `plan` null when it plays as it is (or only its
+   *  container or sound changes); null when the file can't be found or read. */
+  const versionAt = async (itemId: string, rung: Rung): Promise<{ plan: HlsPlan | null; title: string; duration: number } | null> => {
+    const item = findItem(db, engineIdentity, itemId);
+    const file = item ? fileOf(options.mediaRoot, item) : null;
+    if (!item || !file) return null;
+    const decided = await deliveryFor(item, file, null, null, rung);
+    if (!decided) return null;
+    const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
+    if (decided.delivery.mode === "direct" || decided.delivery.videoCopy) return { plan: null, title, duration: decided.info.duration };
+    return { plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, null, fileStamp(file)), title, duration: decided.info.duration };
+  };
+  const keepJobId = (plan: HlsPlan) => `keep:${variantOf(plan)}`;
+
+  /** Every marked version not yet kept goes on the queue (once): on start, after
+   *  each scan (new episodes), and when a title is marked. */
+  let keepQueuing: Promise<void> = Promise.resolve();
+  const queueKeepReady = () => {
+    keepQueuing = keepQueuing.then(async () => {
+      if (!canKeep() || closed) return;
+      for (const row of keepReady.list()) {
+        for (const item of keepReady.itemsOf(row)) {
+          for (const rung of row.rungs) {
+            const version = await versionAt(item.itemId, rung);
+            if (!version?.plan || hls!.isKept(version.plan)) continue;
+            copies!.queueFill({ id: keepJobId(version.plan), kind: "keep", itemId: item.itemId, title: version.title, plan: version.plan });
+          }
+        }
+      }
+    }).catch((err) => app.log.warn({ err }, "Could not queue the titles kept ready"));
+    return keepQueuing;
+  };
+
+  /** How a marked title stands: how many of its versions are kept, play as they
+   *  are, wait or are being made, what they take and about what the rest will. */
+  const keepStatus = async (row: KeepReadyRow) => {
+    const sizes = new Map((hls?.keptFilms() ?? []).map((film) => [film.variant, film.sizeBytes]));
+    let total = 0, ready = 0, asIs = 0, waiting = 0, missing = 0, sizeBytes = 0, estimateBytes = 0;
+    let making: { title: string; rung: Rung; progress: number } | null = null;
+    for (const item of keepReady.itemsOf(row)) {
+      for (const rung of row.rungs) {
+        total += 1;
+        const version = await versionAt(item.itemId, rung);
+        if (!version) { missing += 1; continue; }
+        if (!version.plan) { asIs += 1; continue; }
+        const size = sizes.get(variantOf(version.plan));
+        if (size !== undefined) { ready += 1; sizeBytes += size; continue; }
+        waiting += 1;
+        const limits = COPY_LIMITS[rung];
+        estimateBytes += Math.round((version.duration * (limits.bitRate + limits.audioRate)) / 8);
+        const queued = copies?.fillStatus(keepJobId(version.plan));
+        if (queued?.state === "running") making = { title: version.title, rung, progress: queued.progress };
+      }
+    }
+    return { ...row, total, ready, asIs, waiting, missing, sizeBytes, estimateBytes, making };
+  };
+
+  // A version a viewer left mostly made is finished off, so it is kept.
+  if (hls) {
+    hls.onUnfinished = (plan, title) => {
+      if (canKeep()) copies!.queueFill({ id: `finish:${variantOf(plan)}`, kind: "finish", itemId: plan.itemId, title, plan });
+    };
+  }
+
+  /** Copies asked for before a restart are asked for again; ones whose film has
+   *  gone are forgotten. */
+  const resumeCopies = async () => {
+    if (!copies) return;
+    for (const key of copies.pendingCopies()) {
+      const item = findItem(db, engineIdentity, key.itemId);
+      const file = item ? fileOf(options.mediaRoot, item) : null;
+      const decided = item && file ? await deliveryFor(item, file, key.audio >= 0 ? key.audio : null, null, key.rung) : null;
+      if (!item || !file || !decided || decided.delivery.mode === "direct" || copiesInsideContainer) {
+        copies.remove(key);
+        continue;
+      }
+      const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
+      copies.resume({ ...key, title, file, info: decided.info, delivery: decided.delivery });
+    }
+  };
+  void toolsReady.then((ok) => {
+    if (!ok || closed) return;
+    void resumeCopies().then(() => queueKeepReady());
+  });
 
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
@@ -558,6 +654,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         });
         queueMetadata(libraryId, null, false);
         queueDetect({ library: libraryId }, false, null);
+        void queueKeepReady();
       } catch (err) {
         const message = err instanceof ScanError ? err.message : `The scan failed: ${(err as Error).message}`;
         setScanState(db, libraryId, "error", message);
@@ -1074,6 +1171,46 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     stream.on("error", (err) => reply.raw.destroy(err));
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
+  });
+
+  // Keep ready (keep-ready.ts): the titles an admin keeps converted ahead of time.
+  // `available` is false where nothing can be kept (no disk of its own, or memory only).
+  const keepAnswer = async () => ({
+    available: canKeep(),
+    titles: await Promise.all(keepReady.list().map((row) => keepStatus(row)))
+  });
+  app.get(`${API}/admin/keep-ready`, { preHandler: requireAdmin }, async () => keepAnswer());
+
+  app.put(`${API}/admin/keep-ready`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!canKeep()) return reply.code(409).send({ error: "Nothing can be kept ready: the video container's Transcode folder is not a disk of its own, or memory only is chosen" });
+    const input = keepReadySchema.parse(request.body);
+    const before = keepReady.list().find((row) => row.targetId === input.id && row.kind === input.kind && (input.kind !== "season" || row.season === input.season));
+    const row = keepReady.set(input);
+    if (!row) return reply.code(404).send({ error: "Not found" });
+    // What everything kept ready takes and will take, against the room for kept video.
+    const all = await keepAnswer();
+    const needed = all.titles.reduce((sum, title) => sum + title.sizeBytes + title.estimateBytes, 0);
+    const limit = readCopies(db).limitGb * 1024 ** 3;
+    if (needed > limit * 0.8) {
+      if (before) keepReady.set({ kind: before.kind, id: before.targetId, season: before.season, rungs: before.rungs, newEpisodes: before.newEpisodes });
+      else keepReady.remove(row.id);
+      return reply.code(409).send({ error: "Not enough room for kept video", code: "room", neededBytes: needed, limitBytes: limit });
+    }
+    note(request, "info", "keep.changed", { detail: `${row.title} kept ready at ${row.rungs.map((rung) => `${rung}p`).join(", ")}` });
+    void queueKeepReady();
+    return keepAnswer();
+  });
+
+  app.delete(`${API}/admin/keep-ready`, { preHandler: requireAdmin }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().min(1).max(200) }).parse(request.query);
+    const row = keepReady.remove(id);
+    if (!row) return reply.code(404).send({ error: "Not found" });
+    const items = new Set(keepReady.itemsOf(row).map((item) => item.itemId));
+    copies?.cancelFills((job) => job.kind === "keep" && items.has(job.itemId));
+    note(request, "info", "keep.removed", { detail: `${row.title} no longer kept ready` });
+    // Another marked title may want some of the same versions.
+    void queueKeepReady();
+    return keepAnswer();
   });
 
   // The copies kept, what they take and how much they may: home's Settings → Video.

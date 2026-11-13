@@ -408,3 +408,18 @@ CREATE TABLE IF NOT EXISTS copies (
   used_at          TEXT,
   PRIMARY KEY (item_id, rung, audio)
 );
+
+-- Keep ready (keep-ready.ts, home's docs/video-cache-plan.md C3): titles an admin
+-- wants converted ahead of time at the qualities named, and kept. A film, a whole
+-- show, or one season of it; `items` is the episodes there were when it was set,
+-- for a show or season whose new episodes are not to follow (NULL: they follow).
+CREATE TABLE IF NOT EXISTS keep_ready (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL CHECK (kind IN ('movie', 'show', 'season')),
+  target_id    TEXT NOT NULL,
+  season       INTEGER,
+  rungs        TEXT NOT NULL,
+  items        TEXT,
+  title        TEXT NOT NULL,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

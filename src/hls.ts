@@ -41,6 +41,10 @@ export const COPIES_FOLDER = "copies";
  *  the way through kept (with an entry.json) between restarts. */
 export const CACHE_FOLDER = "cache";
 const ENTRY_FILE = "entry.json";
+/** A version a job is filling: kept over a restart, so the job carries on. */
+const FILLING_FILE = "filling.json";
+/** A half-filled version whose job never came back is removed after this long. */
+const FILLING_MAX_AGE_MS = 7 * 24 * 3600_000;
 /** A half-made version kept on the disk is dropped this long after its last viewer. */
 const ENTRY_GRACE_MS = 10 * 60_000;
 
@@ -97,6 +101,9 @@ export function segmentStarts(info: MediaInfo, videoCopy: boolean, keyframes: nu
 
 const round = (value: number) => Math.round(value * 1000) / 1000;
 
+/** A file's stamp for its plan: its size and time, so a changed file is another version. */
+export const fileStamp = (file: { size: number; modified: Date }) => `${file.size}:${file.modified.getTime()}`;
+
 export function buildPlan(itemId: string, file: string, info: MediaInfo, delivery: Delivery, keyframes: number[] | null, stamp?: string): HlsPlan {
   const starts = segmentStarts(info, delivery.videoCopy, keyframes);
   return { itemId, file, info, delivery, starts, end: Math.max(info.start + info.duration, starts[starts.length - 1] + 0.1), ...(stamp ? { stamp } : {}) };
@@ -144,7 +151,15 @@ export interface WholeFile {
 /** ffmpeg's arguments for a run that starts at segment `from`. `gpu`: the
  *  picture is encoded on the GPU (hardware.ts), and decoded there too when
  *  it says so; null keeps it all on the CPU. */
-export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null): string[] {
+/** How a background job (copies.ts) encodes its segments: a copy's limits, a
+ *  slower preset than live (it has time, and the file is kept), fewer threads. */
+export interface JobEncode {
+  limits: { bitRate: number; maxRate: number; audioRate: number };
+  threads?: number;
+  preset?: string;
+}
+
+export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null, job: JobEncode | null = null): string[] {
   const { info, delivery } = plan;
   const args = ["-hide_banner", "-nostdin", "-v", "error", "-y"];
   // A whole file says how far it is on its standard output, for whoever waits.
@@ -164,7 +179,8 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   const burn = info.video ? delivery.burn : null;
   // The rung asked, else the tallest a conversion makes; and what it may cost.
   const maxHeight = delivery.rung ?? MAX_HEIGHT;
-  const limits = whole?.limits ?? RUNG_LIMITS[delivery.rung ?? 1080];
+  const limits = whole?.limits ?? job?.limits ?? RUNG_LIMITS[delivery.rung ?? 1080];
+  const threads = whole?.threads ?? job?.threads;
   const shrink = info.video !== null && info.video.height > maxHeight;
   // The GPU's scaler takes no "keep the shape" width: worked out here, even.
   const shrunkWidth = info.video && shrink ? Math.max(2, Math.round((info.video.width * maxHeight) / info.video.height / 2) * 2) : 0;
@@ -212,13 +228,13 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
     args.push("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", rate(limits.bitRate), "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2), "-profile:v", "high");
     if (!whole) args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
   } else {
-    args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2),
+    args.push("-c:v", "libx264", "-preset", job?.preset ?? "veryfast", "-crf", "22", "-maxrate", rate(limits.maxRate), "-bufsize", rate(limits.maxRate * 2),
       "-profile:v", "high", "-pix_fmt", "yuv420p");
     const filters = [shrink ? `scale=-2:${maxHeight}` : null, cpuTone].filter(Boolean);
     if (filters.length > 0 && !burn) args.push("-vf", filters.join(","));
     // A keyframe on every cut, so every segment starts on one.
     if (!whole) args.push("-force_key_frames", plan.starts.slice(from).map((at) => at.toFixed(3)).join(","));
-    if (whole?.threads) args.push("-threads", String(whole.threads));
+    if (threads) args.push("-threads", String(threads));
   }
   if (delivery.audio) {
     if (delivery.audioCopy) args.push("-c:a", "copy");
@@ -364,6 +380,8 @@ interface Entry {
   complete: boolean;
   /** When its last viewer went; 0 while someone watches. */
   idleSince: number;
+  /** Background fills working on it: it is not dropped meanwhile. */
+  holds: number;
 }
 
 /** One ffmpeg run, writing into a folder of its own and handing each finished
@@ -379,11 +397,33 @@ interface Run {
   from: number;
   /** The last segment it has started writing. */
   writing: number;
+  /** A job's run, stood still while someone watches converted video. */
+  paused?: boolean;
 }
+
+/** How a background fill stands. */
+export interface FillState {
+  done: number;
+  total: number;
+  complete: boolean;
+}
+
+/** What a fill is asked to do. */
+export interface FillOptions {
+  encode: JobEncode;
+  /** Below everything else that runs here (nice), where the system has a word for it. */
+  polite: boolean;
+  signal: AbortSignal;
+  onProgress?: (state: FillState) => void;
+}
+
+export class FillError extends Error {}
 
 /** Someone watching: a person and a film ("<person>:<item>"), at a place in an entry. */
 interface Viewer {
   key: string;
+  /** A background job's stand-in (fill): not in the viewers, never counted. */
+  job?: boolean;
   entry: Entry;
   /** Whose and what, for the admin's list. */
   user: string;
@@ -476,7 +516,9 @@ export function prepareRoot(root: string, log: Pick<HlsLog, "warn">): string | n
 function sweepCache(cache: string): void {
   for (const name of fs.readdirSync(cache)) {
     const dir = path.join(cache, name);
-    if (!fs.existsSync(path.join(dir, ENTRY_FILE))) {
+    const filling = path.join(dir, FILLING_FILE);
+    const stale = fs.existsSync(filling) && Date.now() - fs.statSync(filling).mtimeMs > FILLING_MAX_AGE_MS;
+    if (stale || (!fs.existsSync(path.join(dir, ENTRY_FILE)) && !fs.existsSync(filling))) {
       fs.rmSync(dir, { recursive: true, force: true });
       continue;
     }
@@ -505,6 +547,13 @@ export class HlsSessions {
   private runCount = 0;
   /** A film was just kept whole: the app keeps everything kept under its limit. */
   onKept: (() => void) | null = null;
+  /** A version mostly made, left by its last viewer: the app may finish it off
+   *  in the background (copies.ts) so it is kept. */
+  onUnfinished: ((plan: HlsPlan, title: string) => void) | null = null;
+  /** Share of segments made from which a version left behind is finished off. */
+  finishFrom = 0.7;
+  /** Half-filled versions a job left (filling.json), by variant: its folder. */
+  private partials = new Map<string, string>();
 
   /** Where segments are made: for the Disks answer home's Dashboard reads. */
   get folder(): string {
@@ -666,11 +715,15 @@ export class HlsSessions {
     entry.viewers.delete(viewer);
     if (entry.viewers.size > 0) return;
     entry.idleSince = Date.now();
-    if (entry.complete) {
+    if (entry.holds > 0) {
+      for (const n of [...entry.memory.keys()]) this.dropMemory(entry, n);
+    } else if (entry.complete) {
       this.drop(entry, false);
     } else if (this.keeps(entry)) {
       // Kept a while on the disk for whoever comes next; memory goes now.
       for (const n of [...entry.memory.keys()]) this.dropMemory(entry, n);
+      // Mostly made: finished off in the background, so it is kept.
+      if (entry.onDisk.size >= entry.plan.starts.length * this.finishFrom) this.onUnfinished?.(entry.plan, entry.title);
     } else {
       this.drop(entry, true);
     }
@@ -729,6 +782,140 @@ export class HlsSessions {
     return true;
   }
 
+  /** How far a version is made: a live entry, a kept film, or nothing yet. */
+  fillState(plan: HlsPlan): FillState {
+    const variant = variantOf(plan);
+    const total = plan.starts.length;
+    if (this.kept.has(variant)) return { done: total, total, complete: true };
+    const entry = this.entries.get(variant);
+    if (entry) return { done: entry.onDisk.size, total, complete: entry.complete };
+    const partial = this.partials.get(variant);
+    if (partial) {
+      const made = fs.readdirSync(path.join(this.root, CACHE_FOLDER, partial)).filter((name) => /^\d+\.ts$/.test(name)).length;
+      return { done: made, total, complete: false };
+    }
+    return { done: 0, total, complete: false };
+  }
+
+  /** Whether a fill can finish here: kept versions need the disk. */
+  get canKeep(): boolean {
+    return this.storage !== "memory";
+  }
+
+  /** Makes every missing segment of a version in the background, a gap at a
+   *  time, alongside whoever watches it (what they make counts; what this
+   *  makes they get), until it is kept whole. Its folder is noted, so after a
+   *  restart the same job carries on where it was. Rejects with FillError when
+   *  it can't; resolves once kept. */
+  async fill(plan: HlsPlan, title: string, options: FillOptions): Promise<void> {
+    if (!this.canKeep) throw new FillError("Nothing can be kept: the conversion folder is not a disk of its own, or memory only is chosen");
+    const variant = variantOf(plan);
+    if (this.kept.has(variant)) return;
+    const entry = this.entries.get(variant) ?? this.open(variant, plan, title);
+    entry.holds += 1;
+    entry.idleSince = 0;
+    const stand: Viewer = { key: `job:${variant}`, job: true, entry, user: "", title, run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const note = path.join(entry.dir, FILLING_FILE);
+    try {
+      fs.writeFileSync(note, JSON.stringify({ variant, itemId: plan.itemId, title }));
+      const total = plan.starts.length;
+      for (;;) {
+        if (options.signal.aborted) throw new FillError("Stopped");
+        if (this.entries.get(variant) !== entry) throw new FillError("Stopped");
+        for (const run of [...entry.runs]) this.refresh(run);
+        options.onProgress?.({ done: entry.onDisk.size, total, complete: entry.complete });
+        if (entry.complete) return;
+        let next = 0;
+        while (next < total && entry.onDisk.has(next)) next += 1;
+        if (next >= total) {
+          // Every segment made, some only in memory a moment ago: kept now, or never.
+          this.complete(entry);
+          if (!entry.complete) throw new FillError("The version could not be kept");
+          return;
+        }
+        if (stand.failure) throw new FillError(stand.failure);
+        const coming = [...entry.runs].some((run) => next >= run.from && next <= run.writing + JUMP_AHEAD);
+        if (!coming && !stand.run) this.start(stand, next, { encode: options.encode, polite: options.polite });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    } finally {
+      if (stand.run) this.kill(stand.run);
+      entry.holds -= 1;
+      if (entry.complete) fs.rm(note, { force: true }, () => undefined);
+      if (entry.holds === 0 && entry.viewers.size === 0) {
+        entry.idleSince = Date.now();
+        if (entry.complete) this.drop(entry, false);
+      }
+    }
+  }
+
+  /** A job given up: its half-made version goes, unless someone is watching it. */
+  dropFill(plan: HlsPlan): void {
+    const variant = variantOf(plan);
+    const partial = this.partials.get(variant);
+    if (partial) {
+      this.partials.delete(variant);
+      fs.rm(path.join(this.root, CACHE_FOLDER, partial), { recursive: true, force: true }, () => undefined);
+    }
+    const entry = this.entries.get(variant);
+    if (entry && !entry.complete && entry.viewers.size === 0 && entry.holds === 0) this.drop(entry, true);
+  }
+
+  /** A kept version's segments in order, for a copy made of them (copies.ts). */
+  keptSegments(plan: HlsPlan): string[] | null {
+    const film = this.kept.get(variantOf(plan));
+    if (!film) return null;
+    const dir = path.join(this.root, CACHE_FOLDER, film.folder);
+    const files = plan.starts.map((_, n) => path.join(dir, `${n}.ts`));
+    return files.every((file) => fs.existsSync(file)) ? files : null;
+  }
+
+  /** Whether a version is kept whole. */
+  isKept(plan: HlsPlan): boolean {
+    return this.kept.has(variantOf(plan));
+  }
+
+  /** Stands background fills still while someone watches converted video, and
+   *  lets them go on after. (Not on Windows, which has no way to say so.) */
+  pauseFills(paused: boolean): void {
+    if (process.platform === "win32") return;
+    for (const entry of this.entries.values()) {
+      for (const run of entry.runs) {
+        if (!run.owner.job || Boolean(run.paused) === paused) continue;
+        run.paused = paused;
+        run.proc.kill(paused ? "SIGSTOP" : "SIGCONT");
+      }
+    }
+  }
+
+  /** Viewers watching converted video now (not background fills). */
+  watching(): number {
+    let runs = 0;
+    for (const entry of this.entries.values()) for (const run of entry.runs) if (!run.owner.job) runs += 1;
+    return runs;
+  }
+
+  /** A half-filled folder taken up again: whatever segments it has count. */
+  private adopt(variant: string, plan: HlsPlan, title: string, dir: string): Entry {
+    for (const inner of fs.readdirSync(dir)) {
+      if (inner.startsWith("run-")) fs.rmSync(path.join(dir, inner), { recursive: true, force: true });
+    }
+    const onDisk = new Map<number, number>();
+    for (let n = 0; n < plan.starts.length; n++) {
+      try {
+        onDisk.set(n, fs.statSync(path.join(dir, `${n}.ts`)).size);
+      } catch {
+        /* still to make */
+      }
+    }
+    const entry: Entry = {
+      variant, plan, title, dir, done: new Set(onDisk.keys()), memory: new Map(), memoryBytes: 0, onDisk, settling: new Map(),
+      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: false, idleSince: 0, holds: 0
+    };
+    this.entries.set(variant, entry);
+    return entry;
+  }
+
   close(): void {
     clearInterval(this.sweeper);
     for (const key of [...this.viewers.keys()]) this.stop(key);
@@ -782,10 +969,13 @@ export class HlsSessions {
 
   private open(variant: string, plan: HlsPlan, title: string): Entry {
     fs.mkdirSync(path.join(this.root, CACHE_FOLDER), { recursive: true });
+    const partial = this.partials.get(variant);
+    this.partials.delete(variant);
+    if (partial) return this.adopt(variant, plan, title, path.join(this.root, CACHE_FOLDER, partial));
     const dir = fs.mkdtempSync(path.join(this.root, CACHE_FOLDER, `${variant}-`));
     const entry: Entry = {
       variant, plan, title, dir, done: new Set(), memory: new Map(), memoryBytes: 0, onDisk: new Map(), settling: new Map(),
-      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: false, idleSince: 0
+      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: false, idleSince: 0, holds: 0
     };
     this.entries.set(variant, entry);
     return entry;
@@ -812,7 +1002,7 @@ export class HlsSessions {
     }
     const entry: Entry = {
       variant, plan, title, dir, done: new Set(onDisk.keys()), memory: new Map(), memoryBytes: 0, onDisk, settling: new Map(),
-      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: true, idleSince: 0
+      runs: new Set(), cpuOnly: false, viewers: new Set(), complete: true, idleSince: 0, holds: 0
     };
     this.entries.set(variant, entry);
     return entry;
@@ -824,18 +1014,19 @@ export class HlsSessions {
     entry.memory.clear();
     entry.memoryBytes = 0;
     if (this.entries.get(entry.variant) === entry) this.entries.delete(entry.variant);
-    if (files && !entry.complete) fs.rm(entry.dir, { recursive: true, force: true }, () => undefined);
+    if (files && !entry.complete && entry.holds === 0) fs.rm(entry.dir, { recursive: true, force: true }, () => undefined);
   }
 
-  private start(viewer: Viewer, from: number): void {
+  private start(viewer: Viewer, from: number, job: { encode: JobEncode; polite: boolean } | null = null): void {
     const entry = viewer.entry;
     if (viewer.run) this.kill(viewer.run);
     viewer.failure = null;
     const gpu = entry.cpuOnly ? null : this.hardware?.choose(entry.plan.info, entry.plan.delivery) ?? null;
     const dir = path.join(entry.dir, `run-${++this.runCount}`);
     fs.mkdirSync(dir, { recursive: true });
-    const args = ffmpegArgs(entry.plan, from, dir, gpu);
-    const proc = spawn(this.tools.ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const args = ffmpegArgs(entry.plan, from, dir, gpu, null, job?.encode ?? null);
+    const polite = Boolean(job?.polite) && process.platform !== "win32";
+    const proc = spawn(polite ? "nice" : this.tools.ffmpeg, polite ? ["-n", "15", this.tools.ffmpeg, ...args] : args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     const run: Run = { entry, owner: viewer, proc, dir, gpu, from, writing: from - 1 };
     entry.runs.add(run);
     viewer.run = run;
@@ -885,6 +1076,7 @@ export class HlsSessions {
   /** Stops a run; the segment it was in the middle of goes with its folder. */
   private kill(run: Run): void {
     if (!run.entry.runs.has(run)) return;
+    if (run.paused) run.proc.kill("SIGCONT");
     run.proc.kill("SIGKILL");
     this.end(run);
   }
@@ -911,7 +1103,8 @@ export class HlsSessions {
     entry.done.add(n);
     entry.onDisk.set(n, size);
     const budget = this.budget;
-    const toMemory = budget > 0 && (this.storage === "memory" || this.pooled + size <= budget);
+    // Nobody watching (a background fill): straight to the disk.
+    const toMemory = budget > 0 && entry.viewers.size > 0 && (this.storage === "memory" || this.pooled + size <= budget);
     if (!toMemory) {
       this.complete(entry);
       return;
@@ -983,6 +1176,13 @@ export class HlsSessions {
       try {
         const film = JSON.parse(fs.readFileSync(path.join(cache, name, ENTRY_FILE), "utf8")) as KeptFilm;
         if (typeof film.variant === "string") this.kept.set(film.variant, { ...film, folder: name });
+        continue;
+      } catch {
+        /* not kept whole */
+      }
+      try {
+        const filling = JSON.parse(fs.readFileSync(path.join(cache, name, FILLING_FILE), "utf8")) as { variant?: string };
+        if (typeof filling.variant === "string") this.partials.set(filling.variant, name);
       } catch {
         /* not kept: prepareRoot removed it, or it is someone's leftover */
       }
@@ -1002,6 +1202,7 @@ export class HlsSessions {
       if (fs.existsSync(file)) this.settle(entry, n, file);
     }
     if (!entry.runs.has(run)) return;
+    if (run.owner.job) run.owner.lastWanted = run.writing;
     const ahead = run.writing - run.owner.lastWanted;
     // The segment it is writing now was made already, or a run started ahead of
     // it is making it: from here on it would only repeat what is there.
@@ -1073,7 +1274,7 @@ export class HlsSessions {
     }
     // Half-made versions nobody has come back to.
     for (const entry of [...this.entries.values()]) {
-      if (entry.viewers.size === 0 && entry.idleSince > 0 && now - entry.idleSince > ENTRY_GRACE_MS) this.drop(entry, true);
+      if (entry.viewers.size === 0 && entry.holds === 0 && entry.idleSince > 0 && now - entry.idleSince > ENTRY_GRACE_MS) this.drop(entry, true);
     }
     for (const [key, at] of this.left) {
       if (now - at > IDLE_MS) this.left.delete(key);

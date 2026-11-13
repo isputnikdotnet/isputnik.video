@@ -42,7 +42,7 @@ beforeEach(async () => {
   const file = path.join(fixture.root, "Movies", "Tall Film (2020).mkv");
   fs.mkdirSync(path.dirname(file), { recursive: true });
   execFileSync(tools.ffmpeg, ["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x540:rate=12", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-    "-t", "14", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-c:a", "ac3", file]);
+    "-t", "30", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-c:a", "ac3", file]);
   const hourAgo = new Date(Date.now() - 3_600_000);
   fs.utimesSync(file, hourAgo, hourAgo);
   await boot();
@@ -127,5 +127,82 @@ describe("one limit for everything kept", () => {
     expect(overLimit(things, 100).map((t) => t.id)).toEqual(["older"]);
     expect(overLimit(things, 50).map((t) => t.id)).toEqual(["older", "old", "new"]);
     expect(overLimit(things, 1000)).toEqual([]);
+  });
+});
+
+const put = (url: string, body: unknown, who = "mum") => app.inject({ method: "PUT", url, headers: as(who), payload: body as Record<string, unknown> });
+
+/** Asks until `check` holds, or gives up. */
+async function until(what: string, check: () => Promise<boolean>, tries = 600): Promise<void> {
+  for (let n = 0; n < tries; n++) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Never ${what}`);
+}
+
+describe("jobs on the shared cache", () => {
+  it("makes a copy to download as the version a viewer gets, keeps that version, and puts the MP4 together", async () => {
+    const id = await tallId();
+    const asked = (await put(`/video/api/copies/${id}`, { quality: 480 })).json();
+    expect(["queued", "running"]).toContain(asked.state);
+    await until("ready", async () => (await get(`/video/api/copies/${id}?quality=480`)).json().state === "ready");
+    const ready = (await get(`/video/api/copies/${id}?quality=480`)).json();
+    const mp4 = await get(ready.url);
+    expect(mp4.headers["content-type"]).toBe("video/mp4");
+    const file = path.join(fixture.root, "copy.mp4");
+    fs.writeFileSync(file, mp4.rawPayload);
+    const probed = JSON.parse(execFileSync(tools.ffprobe, ["-v", "error", "-show_entries", "format=duration:stream=codec_type,height", "-of", "json", file], { encoding: "utf8" }));
+    expect(Number(probed.format.duration)).toBeGreaterThan(28);
+    expect(Number(probed.format.duration)).toBeLessThan(32);
+    expect(probed.streams.find((stream: { codec_type: string }) => stream.codec_type === "video").height).toBe(480);
+    // The version itself is kept: watching it now converts nothing.
+    await keptCount(1);
+    const { url } = await watchAll("480", "dad");
+    expect(url).toContain("q480");
+  }, 120_000);
+
+  it("carries on with a copy asked for before a restart", async () => {
+    const id = await tallId();
+    await put(`/video/api/copies/${id}`, { quality: 480 });
+    await app.close();
+    await boot();
+    await until("ready after a restart", async () => (await get(`/video/api/copies/${id}?quality=480`)).json().state === "ready");
+  }, 120_000);
+
+  it("finishes off a version a viewer left mostly made", async () => {
+    const id = await tallId();
+    const url = (await get(`/video/api/play/${id}?quality=480`)).json().playback.url as string;
+    const segments = (await get(url)).body.split("\n").filter((line) => line.endsWith(".ts")).length;
+    for (let n = 0; n < segments - 1; n++) expect((await get(url.replace("index.m3u8", `${n}.ts`))).statusCode).toBe(200);
+    await keptCount(0);
+    await app.inject({ method: "DELETE", url: `/video/api/hls/${id}`, headers: as("mum") });
+    await keptCount(1);
+  }, 120_000);
+});
+
+describe("keep ready", () => {
+  it("lets an admin keep a film ready, makes it, and stops when unmarked", async () => {
+    const id = await tallId();
+    expect((await put("/video/api/admin/keep-ready", { kind: "movie", id, rungs: [480] })).statusCode).toBe(403);
+    const marked = await put("/video/api/admin/keep-ready", { kind: "movie", id, rungs: [480, 1080] }, "admin");
+    expect(marked.statusCode).toBe(200);
+    expect(marked.json().titles).toMatchObject([{ id: `movie:${id}`, title: "Tall Film (2020)", rungs: [1080, 480], total: 2 }]);
+    // 1080p is above the film's own 540p: it plays as it is there; 480p is made.
+    await until("kept ready", async () => (await get("/video/api/admin/keep-ready", "admin")).json().titles[0].ready === 1);
+    expect((await get("/video/api/admin/keep-ready", "admin")).json().titles[0]).toMatchObject({ ready: 1, asIs: 1, waiting: 0 });
+    // Kept ready, it is never trimmed, even with no room.
+    await put("/video/api/admin/copies", { limitGb: 1 }, "admin");
+    expect((await conversion()).usage.kept.count).toBe(1);
+
+    const removed = await app.inject({ method: "DELETE", url: `/video/api/admin/keep-ready?id=${encodeURIComponent(`movie:${id}`)}`, headers: as("admin") });
+    expect(removed.json().titles).toEqual([]);
+    expect((await app.inject({ method: "PUT", url: "/video/api/admin/keep-ready", headers: as("admin"), payload: { kind: "movie", id: "nope", rungs: [480] } })).statusCode).toBe(404);
+  }, 120_000);
+
+  it("is not offered where nothing can be kept", async () => {
+    await app.inject({ method: "PUT", url: "/video/api/admin/conversion", headers: as("admin"), payload: { storage: "memory" } });
+    expect((await get("/video/api/admin/keep-ready", "admin")).json().available).toBe(false);
+    expect((await put("/video/api/admin/keep-ready", { kind: "movie", id: await tallId(), rungs: [480] }, "admin")).statusCode).toBe(409);
   });
 });

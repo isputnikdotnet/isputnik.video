@@ -14,8 +14,15 @@
 // past it the ones used longest ago go. A copy of a file that has changed since
 // is made again.
 //
-// What waits or runs is only in memory: a restart drops it, and whoever is
-// waiting asks again (home's downloader does, on its next look).
+// A copy whose picture is re-encoded is made as the version a viewer would get
+// (hls.ts fill, home's docs/video-cache-plan.md C3): its segments go into the
+// shared cache, a gap at a time, alongside anyone watching it, and survive a
+// restart; once all are there they are put together into the MP4 in seconds.
+// The same queue fills versions an admin wants kept ready, and finishes off
+// ones a viewer left mostly made — copies first, then those, then these.
+// Copies asked for are noted in the catalog and asked for again after a
+// restart (the app's resumeCopies); the other fills are asked for again by
+// whoever wants them (Keep ready on start, finish-off when next left).
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -25,7 +32,7 @@ import type { Db } from "./db.js";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import type { MediaInfo, Tools } from "./ffmpeg.js";
 import type { GpuRun, Hardware } from "./hardware.js";
-import { buildPlan, ffmpegArgs, type HlsLog } from "./hls.js";
+import { buildPlan, fileStamp, ffmpegArgs, type FillOptions, type FillState, type HlsLog, type HlsPlan } from "./hls.js";
 import type { ProbedFile } from "./media-probe.js";
 
 /** What a copy may cost: a rung's own limits, but 1080p held lower than a
@@ -91,11 +98,39 @@ interface CopyRow {
 
 interface Running {
   job: CopyJob;
-  proc: ChildProcess;
+  /** ffmpeg making the whole file, or putting a filled version together; null while filling. */
+  proc: ChildProcess | null;
   gpu: GpuRun | null;
   startedAt: number;
   progress: number;
   paused: boolean;
+  /** A copy made through the shared cache: stops its fill. */
+  abort?: AbortController;
+}
+
+/** What the queue needs of the shared cache (hls.ts). */
+export interface Filler {
+  readonly canKeep: boolean;
+  fill(plan: HlsPlan, title: string, options: FillOptions): Promise<void>;
+  fillState(plan: HlsPlan): FillState;
+  keptSegments(plan: HlsPlan): string[] | null;
+  pauseFills(paused: boolean): void;
+}
+
+/** A version to fill with no copy made of it: kept ready, or finished off. */
+export interface FillJob {
+  /** Its own name in the queue: one job per version. */
+  id: string;
+  kind: "keep" | "finish";
+  itemId: string;
+  title: string;
+  plan: HlsPlan;
+}
+
+interface Filling {
+  job: FillJob;
+  abort: AbortController;
+  progress: number;
 }
 
 const keyOf = (key: CopyKey) => `${key.itemId}:${key.rung}:${key.audio}`;
@@ -113,6 +148,9 @@ export function estimateCopySeconds(info: MediaInfo, delivery: Delivery, gpu: bo
 export class Copies {
   private queue: CopyJob[] = [];
   private running: Running | null = null;
+  /** Fills waiting, Keep ready before finish-off, and the one under way. */
+  private fills: FillJob[] = [];
+  private filling: Filling | null = null;
   private settings: CopySettings = { ...DEFAULT_COPIES };
   private watcher: NodeJS.Timeout;
   private settled: (() => void)[] = [];
@@ -125,15 +163,16 @@ export class Copies {
     readonly dir: string,
     private log: HlsLog,
     private hardware: Pick<Hardware, "choose" | "failed"> | null,
-    private busy: () => boolean = () => false
+    private busy: () => boolean = () => false,
+    private filler: Filler | null = null
   ) {
     fs.mkdirSync(dir, { recursive: true });
-    // Nothing outlives a restart but the finished copies: half-made files go, and
-    // so does the word of anything that was waiting.
+    // Half-made files go; copies asked for wait to be asked for again
+    // (resumeCopies), what was being made with them.
     for (const entry of fs.readdirSync(dir)) {
-      if (entry.endsWith(".part")) fs.rmSync(path.join(dir, entry), { force: true });
+      if (entry.endsWith(".part") || entry.endsWith(".list")) fs.rmSync(path.join(dir, entry), { force: true });
     }
-    db.prepare("DELETE FROM copies WHERE state IN ('queued', 'running')").run();
+    db.prepare("UPDATE copies SET state = 'queued' WHERE state = 'running'").run();
     this.watcher = setInterval(() => this.yieldToViewers(), 3000);
     this.watcher.unref();
   }
@@ -193,6 +232,46 @@ export class Copies {
     return { path: file, size: stat.size, modified: stat.mtime };
   }
 
+  /** The copies asked for and not yet made, oldest first: the app asks for them
+   *  again after a restart, and removes the ones it can't (their film is gone). */
+  pendingCopies(): CopyKey[] {
+    const rows = this.db.prepare("SELECT item_id, rung, audio FROM copies WHERE state = 'queued' ORDER BY requested_at").all() as CopyRow[];
+    return rows.map((row) => ({ itemId: row.item_id, rung: row.rung as Rung, audio: row.audio }));
+  }
+
+  /** A fill to do: queued once (Keep ready ahead of finish-off), unless under way. */
+  queueFill(job: FillJob): void {
+    if (this.closed || this.filling?.job.id === job.id || this.fills.some((queued) => queued.id === job.id)) return;
+    if (job.kind === "keep") {
+      const at = this.fills.findIndex((queued) => queued.kind === "finish");
+      if (at < 0) this.fills.push(job);
+      else this.fills.splice(at, 0, job);
+    } else {
+      this.fills.push(job);
+    }
+    this.next();
+  }
+
+  /** How a fill stands in the queue: waiting (how many before it), under way, or not here. */
+  fillStatus(id: string): { state: "queued"; ahead: number } | { state: "running"; progress: number } | null {
+    if (this.filling?.job.id === id) return { state: "running", progress: this.filling.progress };
+    const at = this.fills.findIndex((job) => job.id === id);
+    return at < 0 ? null : { state: "queued", ahead: at + this.queue.length + (this.running || this.filling ? 1 : 0) };
+  }
+
+  /** Takes the fills it picks off the queue, and stops the one under way if it is one. */
+  cancelFills(which: (job: FillJob) => boolean): void {
+    this.fills = this.fills.filter((job) => !which(job));
+    if (this.filling && which(this.filling.job)) this.filling.abort.abort();
+  }
+
+  /** A copy asked for before a restart, asked for again: back on the queue. */
+  resume(job: CopyJob): void {
+    if (this.closed || this.queue.some((queued) => keyOf(queued) === keyOf(job)) || (this.running && keyOf(this.running.job) === keyOf(job))) return;
+    this.queue.push(job);
+    this.next();
+  }
+
   /** A copy was just made: the app keeps everything kept under one limit (cache.ts). */
   onReady: ((key: CopyKey) => void) | null = null;
 
@@ -248,7 +327,7 @@ export class Copies {
 
   /** Once nothing waits or runs: for tests, and for closing. */
   idle(): Promise<void> {
-    if (!this.running && this.queue.length === 0) return Promise.resolve();
+    if (!this.running && !this.filling && this.queue.length === 0 && this.fills.length === 0) return Promise.resolve();
     return new Promise((resolve) => this.settled.push(resolve));
   }
 
@@ -256,6 +335,8 @@ export class Copies {
     this.closed = true;
     clearInterval(this.watcher);
     this.queue = [];
+    this.fills = [];
+    this.filling?.abort.abort();
     this.stop();
     for (const done of this.settled.splice(0)) done();
   }
@@ -281,23 +362,140 @@ export class Copies {
     const running = this.running;
     if (!running) return;
     this.running = null;
-    if (running.paused) running.proc.kill("SIGCONT");
-    running.proc.kill("SIGKILL");
+    running.abort?.abort();
+    if (running.proc) {
+      if (running.paused) running.proc.kill("SIGCONT");
+      running.proc.kill("SIGKILL");
+    }
     fs.rm(`${path.join(this.dir, fileName(running.job))}.part`, { force: true }, () => undefined);
     if (!this.closed) this.next();
   }
 
   private next(): void {
-    if (this.closed || this.running) return;
+    if (this.closed || this.running || this.filling) return;
     const job = this.queue.shift();
-    if (!job) {
-      for (const done of this.settled.splice(0)) done();
+    if (job) {
+      this.start(job, false);
       return;
     }
-    this.start(job, false);
+    const fill = this.fills.shift();
+    if (fill) {
+      this.startFill(fill);
+      return;
+    }
+    for (const done of this.settled.splice(0)) done();
+  }
+
+  /** How a job encodes: a copy's limits, and on the CPU half the cores at a
+   *  slower preset (the server has other things to do, and the result is kept). */
+  private jobEncode(rung: Rung, gpu: boolean): FillOptions["encode"] {
+    return { limits: COPY_LIMITS[rung], threads: gpu ? undefined : Math.max(1, Math.floor(os.cpus().length / 2)), preset: "medium" };
+  }
+
+  /** A version kept ready or finished off: filled, nothing else. */
+  private startFill(job: FillJob): void {
+    const filling: Filling = { job, abort: new AbortController(), progress: 0 };
+    this.filling = filling;
+    const rung = (job.plan.delivery.rung ?? 1080) as Rung;
+    const gpu = Boolean(this.hardware?.choose(job.plan.info, job.plan.delivery));
+    this.log.info({ item: job.itemId, kind: job.kind, quality: job.plan.delivery.rung }, job.kind === "keep" ? "Keeping a version ready" : "Finishing off a version left mostly made");
+    const done = (failure: string | null) => {
+      if (this.filling !== filling) return;
+      this.filling = null;
+      if (failure && !filling.abort.signal.aborted) this.log.warn({ item: job.itemId, kind: job.kind }, failure);
+      this.next();
+    };
+    if (!this.filler) {
+      done("Nothing can be kept here");
+      return;
+    }
+    this.filler.fill(job.plan, job.title, {
+      encode: this.jobEncode(rung, gpu), polite: true, signal: filling.abort.signal,
+      onProgress: (state) => { filling.progress = state.total > 0 ? state.done / state.total : 0; }
+    }).then(() => done(null), (err: Error) => done(err.message));
+  }
+
+  /** A copy whose picture is re-encoded: made as the version a viewer would get,
+   *  into the shared cache (resumable, shared), then put together as one MP4. */
+  private startFilled(job: CopyJob): void {
+    const filler = this.filler!;
+    const plan = buildPlan(job.itemId, job.file.absolute, job.info, job.delivery, null, fileStamp(job.file));
+    const abort = new AbortController();
+    const gpu = this.hardware?.choose(job.info, job.delivery) ?? null;
+    const running: Running = { job, proc: null, gpu, startedAt: Date.now(), progress: 0, paused: false, abort };
+    this.running = running;
+    this.db.prepare("UPDATE copies SET state = 'running' WHERE item_id = ? AND rung = ? AND audio = ?").run(job.itemId, job.rung, job.audio);
+    this.log.info({ item: job.itemId, quality: job.rung, mode: job.delivery.mode, through: "cache" }, "Making a copy to download");
+    filler.fill(plan, job.title, {
+      encode: this.jobEncode(job.rung, Boolean(gpu)), polite: true, signal: abort.signal,
+      onProgress: (state) => { running.progress = state.total > 0 ? Math.min(0.97, (0.97 * state.done) / state.total) : 0; }
+    }).then(
+      () => { if (this.running === running) this.putTogether(running, plan); },
+      (err: Error) => this.finish(running, `The copy could not be made: ${err.message}`, "")
+    );
+  }
+
+  /** The kept version's segments, one after another, into an MP4: copied, not
+   *  encoded, so it takes seconds. */
+  private putTogether(running: Running, plan: HlsPlan): void {
+    const job = running.job;
+    const files = this.filler?.keptSegments(plan) ?? null;
+    if (!files) {
+      this.finish(running, "The copy could not be made: its version was not kept whole", "");
+      return;
+    }
+    const out = path.join(this.dir, fileName(job));
+    const list = `${out}.list`;
+    fs.writeFileSync(list, files.map((file) => `file '${file.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"));
+    // ADTS AAC (a converted sound, or AAC copied) needs its headers made MP4's.
+    const aac = Boolean(job.delivery.audio) && (!job.delivery.audioCopy || job.delivery.audio?.codec === "aac");
+    const args = ["-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", list, "-map", "0", "-c", "copy",
+      ...(aac ? ["-bsf:a", "aac_adtstoasc"] : []), "-movflags", "+faststart", "-f", "mp4", `${out}.part`];
+    const proc = spawn(this.tools.ffmpeg, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    running.proc = proc;
+    let stderr = "";
+    proc.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
+    proc.on("error", (err) => this.finish(running, `ffmpeg could not start: ${err.message}`, stderr));
+    proc.on("exit", (code, signal) => {
+      fs.rm(list, { force: true }, () => undefined);
+      if (code === 0) this.finish(running, null, stderr);
+      else this.finish(running, `The copy could not be put together: ${stderr.trim().split(/\r?\n/).pop() || `exit ${code ?? signal}`}`, stderr);
+    });
+  }
+
+  /** A copy is done: kept and ready, or failed, and the next job goes. */
+  private finish(running: Running, failure: string | null, stderr: string): void {
+    if (this.running !== running) return;
+    this.running = null;
+    const job = running.job;
+    const out = path.join(this.dir, fileName(job));
+    const part = `${out}.part`;
+    if (failure === null) {
+      try {
+        fs.renameSync(part, out);
+        const size = fs.statSync(out).size;
+        this.db.prepare("UPDATE copies SET state = 'ready', size_bytes = ?, ready_at = ?, used_at = ?, error = NULL WHERE item_id = ? AND rung = ? AND audio = ?")
+          .run(size, now(), now(), job.itemId, job.rung, job.audio);
+        this.log.info({ item: job.itemId, quality: job.rung, size, seconds: Math.round((Date.now() - running.startedAt) / 1000), gpu: Boolean(running.gpu) }, "A copy is ready to download");
+        this.trim(job);
+        this.onReady?.(job);
+      } catch (err) {
+        failure = `The copy could not be kept: ${(err as Error).message}`;
+      }
+    }
+    if (failure !== null) {
+      fs.rm(part, { force: true }, () => undefined);
+      this.db.prepare("UPDATE copies SET state = 'failed', error = ? WHERE item_id = ? AND rung = ? AND audio = ?").run(failure, job.itemId, job.rung, job.audio);
+      this.log.warn({ item: job.itemId, quality: job.rung, stderr: stderr.trim() }, failure);
+    }
+    this.next();
   }
 
   private start(job: CopyJob, cpuOnly: boolean): void {
+    if (this.filler?.canKeep && !job.delivery.videoCopy) {
+      this.startFilled(job);
+      return;
+    }
     const out = path.join(this.dir, fileName(job));
     const part = `${out}.part`;
     const gpu = cpuOnly ? null : this.hardware?.choose(job.info, job.delivery) ?? null;
@@ -320,29 +518,7 @@ export class Copies {
       for (let match = at.exec(chunk.toString()); match; match = at.exec(chunk.toString())) last = match;
       if (last && job.info.duration > 0) running.progress = Math.min(0.999, Number(last[1]) / 1_000_000 / job.info.duration);
     });
-    const finish = (failure: string | null) => {
-      if (this.running !== running) return;
-      this.running = null;
-      if (failure === null) {
-        try {
-          fs.renameSync(part, out);
-          const size = fs.statSync(out).size;
-          this.db.prepare("UPDATE copies SET state = 'ready', size_bytes = ?, ready_at = ?, used_at = ?, error = NULL WHERE item_id = ? AND rung = ? AND audio = ?")
-            .run(size, now(), now(), job.itemId, job.rung, job.audio);
-          this.log.info({ item: job.itemId, quality: job.rung, size, seconds: Math.round((Date.now() - running.startedAt) / 1000), gpu: Boolean(gpu) }, "A copy is ready to download");
-          this.trim(job);
-          this.onReady?.(job);
-        } catch (err) {
-          failure = `The copy could not be kept: ${(err as Error).message}`;
-        }
-      }
-      if (failure !== null) {
-        fs.rm(part, { force: true }, () => undefined);
-        this.db.prepare("UPDATE copies SET state = 'failed', error = ? WHERE item_id = ? AND rung = ? AND audio = ?").run(failure, job.itemId, job.rung, job.audio);
-        this.log.warn({ item: job.itemId, quality: job.rung, stderr: stderr.trim() }, failure);
-      }
-      this.next();
-    };
+    const finish = (failure: string | null) => this.finish(running, failure, stderr);
     proc.on("error", (err) => finish(`ffmpeg could not start: ${err.message}`));
     proc.on("exit", (code, signal) => {
       if (this.running !== running) return;
@@ -364,10 +540,12 @@ export class Copies {
   /** Someone watching comes first: the copy stands still while video is converted
    *  for a viewer, and carries on after. (Not on Windows, which has no way to say so.) */
   private yieldToViewers(): void {
-    const running = this.running;
-    if (!running || process.platform === "win32") return;
+    if (process.platform === "win32") return;
     const wanted = this.busy();
-    if (wanted === running.paused) return;
+    // Fills (through the cache) stand still in hls.ts.
+    if (this.filling || this.running?.abort) this.filler?.pauseFills(wanted);
+    const running = this.running;
+    if (!running?.proc || running.abort || wanted === running.paused) return;
     running.paused = wanted;
     running.proc.kill(wanted ? "SIGSTOP" : "SIGCONT");
   }
