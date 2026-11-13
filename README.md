@@ -130,4 +130,7 @@ npm test
 npm run typecheck && npm run lint
 ```
 
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) (commits are
+signed off under the DCO).
+
 License: AGPL-3.0-only.
