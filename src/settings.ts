@@ -4,7 +4,7 @@
 import { z } from "zod";
 import type { Db } from "./db.js";
 import { DEFAULT_CONVERSION, MEMORY_MAX_MB, MEMORY_MIN_MB, fromLegacy, legacyOf, type ConversionSettings } from "./hls.js";
-import { DEFAULT_COPIES, copySettingsSchema, type CopySettings } from "./copies.js";
+import { DEFAULT_COPIES, DEFAULT_JOBS, copySettingsSchema, jobSettingsSchema, type CopySettings, type JobSettings } from "./copies.js";
 
 export const conversionSchema = z.object({
   storage: z.enum(["memory", "memory-disk", "disk"]),
@@ -54,6 +54,22 @@ function save(db: Db, key: string, value: unknown): void {
   db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`)
     .run(key, JSON.stringify(value));
+}
+
+// When the queue of copies and fills works (copies.ts, home's Settings › Video).
+const JOBS_KEY = "jobs";
+
+export function readJobs(db: Db): JobSettings {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(JOBS_KEY) as { value: string } | undefined;
+  try {
+    return row ? jobSettingsSchema.parse({ ...DEFAULT_JOBS, ...(JSON.parse(row.value) as object) }) : { ...DEFAULT_JOBS };
+  } catch {
+    return { ...DEFAULT_JOBS };
+  }
+}
+
+export function saveJobs(db: Db, settings: JobSettings): void {
+  save(db, JOBS_KEY, settings);
 }
 
 // Copies kept for download (copies.ts): how much room they may take together.

@@ -19,8 +19,9 @@ import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmd
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
 import { isInside, isMapped } from "./mounts.js";
-import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, saveConversion, saveCopies, saveDetection } from "./settings.js";
-import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, type CopyKey } from "./copies.js";
+import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, readJobs, saveConversion, saveCopies, saveDetection, saveJobs } from "./settings.js";
+import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, jobSettingsSchema, type CopyKey } from "./copies.js";
+import { Bucket, throttled } from "./throttle.js";
 import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
 import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
@@ -293,6 +294,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // Copies made for download: a queue of its own, which waits while anyone watches.
   const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
   const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, () => (hls?.watching() ?? 0) > 0, hls) : null;
+  // When the queue works, and how much (C4): home's Settings › Video › Downloads and Keep ready.
+  copies?.configureJobs(readJobs(db));
+  // One bucket for every copy going to someone away from home (throttle.ts).
+  const remoteBucket = new Bucket(() => copies?.remoteBytesPerSecond ?? 0);
   // Titles an admin keeps ready (keep-ready.ts): their kept versions are never trimmed.
   const keepReady = new KeepReady(db);
   copies?.configure(readCopies(db));
@@ -1138,7 +1143,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const target = await copyTarget(request, request.body);
     if (!target) return reply.code(404).send({ error: "Not found" });
     if (target.delivery.mode !== "direct" && !copiesInsideContainer) {
-      copies!.request({ ...target.key, title: target.title, file: target.file, info: target.info, delivery: target.delivery });
+      const identity = request.identity!;
+      const existing = copies!.status(target.key, target.file);
+      // A member has only so many copies waiting at once; an admin any number.
+      if ((!existing || existing.state === "failed") && identity.role !== "admin" && copies!.waitingFor(identity.id) >= copies!.perPerson) {
+        return { ...copyAnswer(target), state: "failed" as const, code: "limit", error: `You already have ${copies!.perPerson} downloads being prepared; this one can be asked for once one of them is ready` };
+      }
+      copies!.request({ ...target.key, title: target.title, file: target.file, info: target.info, delivery: target.delivery, by: identity.id });
     }
     return copyAnswer(target);
   });
@@ -1169,8 +1180,40 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     }
     const stream = fs.createReadStream(made.path, { start, end });
     stream.on("error", (err) => reply.raw.destroy(err));
-    reply.raw.on("close", () => stream.destroy());
-    stream.pipe(reply.raw);
+    // Away from home, held to the admin's speed (all such copies together).
+    const slow = request.identity!.network === "internet" && (copies?.remoteBytesPerSecond ?? 0) > 0 ? throttled(remoteBucket) : null;
+    reply.raw.on("close", () => { stream.destroy(); slow?.destroy(); });
+    if (slow) stream.pipe(slow).pipe(reply.raw);
+    else stream.pipe(reply.raw);
+  });
+
+  // The queue of copies and fills (C4): when it works, what runs and waits, and
+  // the admin's hand on it — first in line, run now, take off.
+  app.get(`${API}/admin/jobs`, { preHandler: requireAdmin }, async (_request, reply) =>
+    (copies ? copies.jobs() : reply.code(404).send({ error: "ffmpeg is missing: nothing is made" })));
+
+  app.put(`${API}/admin/jobs`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies) return reply.code(404).send({ error: "ffmpeg is missing: nothing is made" });
+    const settings = jobSettingsSchema.parse({ ...readJobs(db), ...(request.body as object) });
+    saveJobs(db, settings);
+    copies.configureJobs(settings);
+    const when = { now: "right away", idle: "when the server is idle", night: `between ${settings.nightStart} and ${settings.nightEnd}` }[settings.when];
+    note(request, "info", "jobs.changed", { detail: `Prepared ${when}, ${settings.atOnce} at once, ${settings.perPerson} waiting per member${settings.remoteMbps > 0 ? `, ${settings.remoteMbps} Mbit/s away from home` : ""}` });
+    return copies.jobs();
+  });
+
+  const jobIdSchema = z.object({ id: z.string().min(1).max(300) });
+  app.post(`${API}/admin/jobs/top`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies?.moveToTop(jobIdSchema.parse(request.body).id)) return reply.code(404).send({ error: "Not waiting" });
+    return copies.jobs();
+  });
+  app.post(`${API}/admin/jobs/run`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies?.runNow(jobIdSchema.parse(request.body).id)) return reply.code(404).send({ error: "Not waiting" });
+    return copies.jobs();
+  });
+  app.delete(`${API}/admin/jobs`, { preHandler: requireAdmin }, async (request, reply) => {
+    if (!copies?.cancel(jobIdSchema.parse(request.query).id)) return reply.code(404).send({ error: "Not found" });
+    return copies.jobs();
   });
 
   // Keep ready (keep-ready.ts): the titles an admin keeps converted ahead of time.

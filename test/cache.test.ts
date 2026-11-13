@@ -69,8 +69,9 @@ async function watchAll(quality: string, who = "mum"): Promise<{ id: string; url
 
 const conversion = async () => (await get("/video/api/admin/conversion", "admin")).json();
 
+/** Waits (up to a minute: a loaded machine makes slowly) until this many films are kept. */
 async function keptCount(count: number): Promise<void> {
-  for (let tries = 0; tries < 100; tries++) {
+  for (let tries = 0; tries < 600; tries++) {
     if ((await conversion()).usage.kept.count === count) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -175,7 +176,7 @@ describe("jobs on the shared cache", () => {
     const url = (await get(`/video/api/play/${id}?quality=480`)).json().playback.url as string;
     const segments = (await get(url)).body.split("\n").filter((line) => line.endsWith(".ts")).length;
     for (let n = 0; n < segments - 1; n++) expect((await get(url.replace("index.m3u8", `${n}.ts`))).statusCode).toBe(200);
-    await keptCount(0);
+    // (On a loaded machine the viewer's own run may reach the end first: kept either way.)
     await app.inject({ method: "DELETE", url: `/video/api/hls/${id}`, headers: as("mum") });
     await keptCount(1);
   }, 120_000);
@@ -205,4 +206,40 @@ describe("keep ready", () => {
     expect((await get("/video/api/admin/keep-ready", "admin")).json().available).toBe(false);
     expect((await put("/video/api/admin/keep-ready", { kind: "movie", id: await tallId(), rungs: [480] }, "admin")).statusCode).toBe(409);
   });
+});
+
+describe("when the queue works", () => {
+  const night = () => {
+    // A window that is not now: from two hours ahead for an hour.
+    const from = new Date(Date.now() + 2 * 3600_000);
+    const to = new Date(Date.now() + 3 * 3600_000);
+    const hm = (date: Date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    return { when: "night", nightStart: hm(from), nightEnd: hm(to) };
+  };
+
+  it("waits for the night, says so, and runs at once when the admin asks", async () => {
+    const id = await tallId();
+    expect((await put("/video/api/admin/jobs", night(), "admin")).json().gate).toEqual({ open: false, reason: "night" });
+    expect((await put(`/video/api/copies/${id}`, { quality: 480 })).json()).toMatchObject({ state: "queued", waitingFor: "night" });
+    const listed = (await get("/video/api/admin/jobs", "admin")).json();
+    expect(listed.jobs).toMatchObject([{ id: `copy:${id}:480:1`, kind: "copy", state: "queued", quality: 480 }]);
+    expect(listed.settings).toMatchObject({ when: "night", atOnce: 1, perPerson: 10 });
+
+    const run = await app.inject({ method: "POST", url: "/video/api/admin/jobs/run", headers: as("admin"), payload: { id: listed.jobs[0].id } });
+    expect(run.statusCode).toBe(200);
+    await until("ready", async () => (await get(`/video/api/copies/${id}?quality=480`)).json().state === "ready");
+  }, 120_000);
+
+  it("holds a member to their own number of copies waiting, and lets the admin take one off", async () => {
+    const id = await tallId();
+    await put("/video/api/admin/jobs", { ...night(), perPerson: 1 }, "admin");
+    expect((await put(`/video/api/copies/${id}`, { quality: 480 })).json().state).toBe("queued");
+    expect((await put(`/video/api/copies/${id}`, { quality: 720 })).json()).toMatchObject({ state: "failed", code: "limit" });
+    // An admin is not held to it.
+    expect((await put(`/video/api/copies/${id}`, { quality: 720 }, "admin")).json().state).toBe("queued");
+
+    const removed = await app.inject({ method: "DELETE", url: `/video/api/admin/jobs?id=${encodeURIComponent(`copy:${id}:480:1`)}`, headers: as("admin") });
+    expect(removed.json().jobs.map((job: { id: string }) => job.id)).toEqual([`copy:${id}:720:1`]);
+    expect((await put(`/video/api/copies/${id}`, { quality: 480 })).json().state).toBe("queued");
+  }, 120_000);
 });

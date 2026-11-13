@@ -382,6 +382,8 @@ interface Entry {
   idleSince: number;
   /** Background fills working on it: it is not dropped meanwhile. */
   holds: number;
+  /** A job is filling it (filling.json): dropped, its folder stays for the job to carry on. */
+  filling?: boolean;
 }
 
 /** One ffmpeg run, writing into a folder of its own and handing each finished
@@ -818,6 +820,7 @@ export class HlsSessions {
     const note = path.join(entry.dir, FILLING_FILE);
     try {
       fs.writeFileSync(note, JSON.stringify({ variant, itemId: plan.itemId, title }));
+      entry.filling = true;
       const total = plan.starts.length;
       for (;;) {
         if (options.signal.aborted) throw new FillError("Stopped");
@@ -841,7 +844,10 @@ export class HlsSessions {
     } finally {
       if (stand.run) this.kill(stand.run);
       entry.holds -= 1;
-      if (entry.complete) fs.rm(note, { force: true }, () => undefined);
+      if (entry.complete) {
+        entry.filling = false;
+        fs.rm(note, { force: true }, () => undefined);
+      }
       if (entry.holds === 0 && entry.viewers.size === 0) {
         entry.idleSince = Date.now();
         if (entry.complete) this.drop(entry, false);
@@ -1014,7 +1020,11 @@ export class HlsSessions {
     entry.memory.clear();
     entry.memoryBytes = 0;
     if (this.entries.get(entry.variant) === entry) this.entries.delete(entry.variant);
-    if (files && !entry.complete && entry.holds === 0) fs.rm(entry.dir, { recursive: true, force: true }, () => undefined);
+    if (files && !entry.complete && entry.holds === 0) {
+      // A job's half-filled version waits for the job to come back (night, idle).
+      if (entry.filling) this.partials.set(entry.variant, path.basename(entry.dir));
+      else fs.rm(entry.dir, { recursive: true, force: true }, () => undefined);
+    }
   }
 
   private start(viewer: Viewer, from: number, job: { encode: JobEncode; polite: boolean } | null = null): void {
