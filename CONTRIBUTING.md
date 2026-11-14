@@ -34,9 +34,12 @@ share, say), from a checkout rather than the image:
 
 ```
 npm run bench:scan -- <folder holding Movies/ and Shows/>
+npm run bench:scan -- /mnt/user/Media --shows Series --movies Films
 ```
 
-Run it with no folder to use a generated fake library.
+`--movies` and `--shows` name the libraries' folders when they are not `Movies`
+and `Shows` (exact names: `Series` is not `series`). Run it with no folder to use
+a generated fake library.
 
 ## The engine's ground rules
 
