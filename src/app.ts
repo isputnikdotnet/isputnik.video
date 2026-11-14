@@ -395,6 +395,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const metadata = new MetadataRunner({ db, mediaRoot: options.mediaRoot, artDir, fetch: options.fetch, tools, log: { warn: (obj, msg) => app.log.warn(obj, msg) } });
   let metadataChain: Promise<void> = Promise.resolve();
   const metadataQueued = new Set<string>();
+  /** Each library's metadata pass, while one waits or runs: what home shows ("Getting details… 12 of 50"). */
+  const metadataWork = new Map<string, { state: "queued" | "running"; done: number; total: number; startedAt: string | null; tmdb: boolean }>();
+  /** A library as home sees it, with its metadata pass if one is going. */
+  const withWork = <T extends { id: string }>(library: T) => ({ ...library, metadata: metadataWork.get(library.id) ?? null });
 
   /** How the file reaches the browser, from what ffprobe finds inside it; null
    *  when ffmpeg is missing or can't read the file. */
@@ -789,10 +793,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (metadataQueued.has(key)) return;
     metadataQueued.add(key);
     catalogWork += 1;
+    // Waiting behind another pass: shown as such, not as nothing.
+    if (!metadataWork.has(libraryId)) metadataWork.set(libraryId, { state: "queued", done: 0, total: 0, startedAt: null, tmdb: Boolean(readTmdbKey(db)) });
     metadataChain = metadataChain.then(async () => {
       metadataQueued.delete(key);
+      const work = { state: "running" as const, done: 0, total: 0, startedAt: new Date().toISOString(), tmdb: Boolean(readTmdbKey(db)) };
+      metadataWork.set(libraryId, work);
       try {
-        const summary = await metadata.refreshLibrary(libraryId, force);
+        const summary = await metadata.refreshLibrary(libraryId, force, (done, total) => { work.done = done; work.total = total; });
         if (!summary) return;
         const asked = readTmdbKey(db) ? `; TMDB: ${summary.matched} matched, ${summary.unmatched} not found, ${summary.failed} failed` : "; no TMDB key";
         note(request, summary.error ? "warn" : "info", "metadata.finished", {
@@ -802,6 +810,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       } catch (err) {
         note(request, "error", "metadata.failed", { libraryId, detail: (err as Error).message });
         app.log.error({ err, libraryId }, "Metadata pass failed");
+      } finally {
+        // Another pass for it may be queued behind this one: it shows as waiting.
+        if ([...metadataQueued].some((queued) => queued.startsWith(`${libraryId}:`))) metadataWork.set(libraryId, { ...work, state: "queued", done: 0, total: 0, startedAt: null });
+        else metadataWork.delete(libraryId);
       }
     }).finally(() => { catalogWork -= 1; });
   };
@@ -1437,7 +1449,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // ── Libraries, as home manages them (home's server calls these) ─────────
 
-  app.get(`${API}/admin/libraries`, { preHandler: requireAdmin }, async () => ({ libraries: listLibraries(db) }));
+  app.get(`${API}/admin/libraries`, { preHandler: requireAdmin }, async () => ({ libraries: listLibraries(db).map(withWork) }));
 
   // The disks this engine's files sit on, for home's Dashboard (disks.ts): each
   // library folder, the catalog, the posters and the conversion folder.
@@ -1908,7 +1920,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const id = libraryIdSchema.parse((request.params as { id: string }).id);
     if (!getLibrary(db, id)) return reply.code(404).send({ error: "No such library" });
     queueMetadata(id, request, true);
-    return reply.code(202).send({ library: getLibrary(db, id) });
+    return reply.code(202).send({ library: withWork(getLibrary(db, id)!) });
   });
 
   app.get(`${API}/admin/events`, { preHandler: requireAdmin }, async (request) => {
@@ -1965,6 +1977,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     paths: { media: options.mediaRoot, database: options.dbPath, art: artDir, transcode: hls?.folder ?? null },
     // Every line while detailed logging is on (and for an hour after); else the problems.
     log: logging.detailed() ? everyLine(options.logBuffer) : problemLines(options.logBuffer),
+    // A metadata pass waiting or running, per library.
+    catalogWork: [...metadataWork].map(([libraryId, work]) => ({ library: getLibrary(db, libraryId)?.name ?? libraryId, ...work })),
     logging: { level: logging.state().level, until: logging.state().until },
     hardwareTest: testSummary(listTests(db, 1)[0] ?? null),
     hardwareChanges: listChanges(db, 5).map((change) => `${change.at.slice(0, 16).replace("T", " ")} ${change.summary}`),

@@ -224,6 +224,17 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_at ON events (at DESC);
 CREATE INDEX IF NOT EXISTS events_event ON events (event, at DESC);
 
+-- Episodes whose frame ffmpeg couldn't take (metadata.ts frame()): remembered with
+-- the file's size and time, so a pass doesn't try again — three ffmpeg runs an
+-- episode — until the file changes. A damaged file, or one with no picture.
+CREATE TABLE IF NOT EXISTS frame_misses (
+  item_id   TEXT PRIMARY KEY,
+  file      TEXT NOT NULL,
+  size      INTEGER NOT NULL,
+  mtime_ms  INTEGER NOT NULL,
+  at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 -- Posters, backdrops, stills and TMDB's words for each show, movie and episode
 -- (metadata.ts). Apart from what the scan writes, so a rescan never undoes it and
 -- a match fixed by hand (`locked`) stays. Picture columns say where the file is:

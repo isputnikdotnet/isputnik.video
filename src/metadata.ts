@@ -331,6 +331,12 @@ export class MetadataRunner {
     if (current === `cache:${file}` && fs.existsSync(target)) return current;
     const absolute = resolveInside(this.ctx.mediaRoot, relative);
     if (!absolute || !fs.existsSync(absolute)) return null;
+    // Tried before and failed, and the file is as it was: not again (frame_misses).
+    const { db } = this.ctx;
+    const stat = fs.statSync(absolute);
+    const mtime = Math.round(stat.mtimeMs);
+    const missed = db.prepare("SELECT file, size, mtime_ms FROM frame_misses WHERE item_id = ?").get(itemId) as { file: string; size: number; mtime_ms: number } | undefined;
+    if (missed && missed.file === relative && missed.size === stat.size && missed.mtime_ms === mtime) return null;
     fs.mkdirSync(this.ctx.artDir, { recursive: true });
     for (const at of FRAME_AT_SECONDS) {
       const ok = await new Promise<boolean>((resolve) => {
@@ -341,10 +347,15 @@ export class MetadataRunner {
       });
       if (ok && fs.existsSync(target) && fs.statSync(target).size > 0) {
         if (current?.startsWith("cache:") && current.slice(6) !== file) fs.rmSync(path.join(this.ctx.artDir, path.basename(current.slice(6))), { force: true });
+        if (missed) db.prepare("DELETE FROM frame_misses WHERE item_id = ?").run(itemId);
         return `cache:${file}`;
       }
     }
     fs.rmSync(target, { force: true });
+    db.prepare(`
+      INSERT INTO frame_misses (item_id, file, size, mtime_ms) VALUES (?, ?, ?, ?)
+      ON CONFLICT(item_id) DO UPDATE SET file = excluded.file, size = excluded.size, mtime_ms = excluded.mtime_ms, at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    `).run(itemId, relative, stat.size, mtime);
     return null;
   }
 
@@ -547,7 +558,7 @@ export class MetadataRunner {
   }
 
   /** Every title of a library; `force` asks TMDB again even where it isn't due. */
-  async refreshLibrary(libraryId: string, force = false): Promise<MetadataSummary | null> {
+  async refreshLibrary(libraryId: string, force = false, onProgress: (done: number, total: number) => void = () => undefined): Promise<MetadataSummary | null> {
     const { db } = this.ctx;
     const library = db.prepare("SELECT id, kind, folder, language FROM libraries WHERE id = ? AND state = 'active'").get(libraryId) as Library | undefined;
     if (!library) return null;
@@ -558,6 +569,7 @@ export class MetadataRunner {
       : db.prepare("SELECT id, folder, file, title, original_title, year, imdb_id, tmdb_id FROM movies WHERE library_id = ? ORDER BY sort_title").all(library.id) as TitleRow[];
     let refused = false;
     const listings: Listings = new Map();
+    onProgress(0, titles.length);
     for (const title of titles) {
       // A turn for everyone else between titles: with nothing to ask TMDB and
       // no frame to take, every await below resolves at once.
@@ -568,6 +580,7 @@ export class MetadataRunner {
       summary.titles += 1;
       try {
         await this.refreshTitle(tmdb, library, { ...title, file: title.file ?? undefined }, episodes, force, summary, listings);
+        onProgress(summary.titles, titles.length);
       } catch (err) {
         if (err instanceof TmdbError && err.status === 401) {
           summary.error = "TMDB refused the key; nothing more was asked";
