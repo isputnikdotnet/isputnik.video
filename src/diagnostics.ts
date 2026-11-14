@@ -47,6 +47,11 @@ export function ffmpegVersionOf(tools: Tools | null): Promise<string | null> {
   return ffmpegVersion;
 }
 
+/** Every line, newest last: what the report carries while detailed logging is on (logging.ts). */
+export function everyLine(buffer: LogBuffer | undefined, count = 300): string[] {
+  return buffer ? buffer.tail(count) : [];
+}
+
 /** The log's warnings and errors (pino level 40 and up), newest last. */
 export function problemLines(buffer: LogBuffer | undefined, count = LOG_LINES): string[] {
   if (!buffer) return [];

@@ -26,7 +26,7 @@ import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
 import { overLimit, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { KeyframeWarmer } from "./keyframe-warmer.js";
-import { ffmpegVersionOf, problemLines, systemFacts } from "./diagnostics.js";
+import { everyLine, ffmpegVersionOf, problemLines, systemFacts } from "./diagnostics.js";
 import { HardwareTester, fingerprintOf, listChanges, listTests, noteHardware, type HardwareTest, type Scenario, type TestLimits } from "./hardware-test.js";
 import { DiskChecker, listDiskChecks, type DiskCheck, type DiskLimits } from "./disk-check.js";
 import { BASE_PATH } from "./config.js";
@@ -37,6 +37,7 @@ import { EVENT_LEVELS, EVENT_RETENTION_DAYS, countEventsSince, listEvents, prune
 import { canSee, clientIpFrom, devIdentity, forwardedRequestId, historyIdFor, identityFrom, rejectionReason, type Identity } from "./identity.js";
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
 import type { LogBuffer } from "./log-buffer.js";
+import { createLogging, type LoggingLevel } from "./logging.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
@@ -124,6 +125,11 @@ const eventsQuerySchema = z.object({
   event: z.string().trim().max(64).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(10).max(100).default(25)
+});
+
+const loggingBodySchema = z.object({
+  level: z.enum(["normal", "detailed", "everything"]),
+  minutes: z.number().int().optional()
 });
 
 const logQuerySchema = z.object({
@@ -298,9 +304,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
   const mediaProbe = tools ? new MediaProbe(db, tools) : null;
   const engineLog = {
+    debug: (obj: object, msg: string) => app.log.debug(obj, msg),
+    trace: (obj: object, msg: string) => app.log.trace(obj, msg),
     info: (obj: object, msg: string) => app.log.info(obj, msg),
     warn: (obj: object, msg: string) => app.log.warn(obj, msg)
   };
+  // How much it logs, for a while (logging.ts); home's Diagnostics sets it.
+  const logging = createLogging({ db, logger: app.log, buffer: options.logBuffer });
   // The GPU (hardware.ts): found out once ffmpeg answers, and on Check again.
   const hardware = tools ? new Hardware(() => (options.detectGpu ?? detectGpu)(tools), engineLog) : null;
   const hls = tools ? new HlsSessions(tools, options.transcodeDir ?? null, engineLog, hardware) : null;
@@ -626,6 +636,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.addHook("onClose", async () => {
     closed = true;
+    logging.close();
     clearInterval(daily);
     hls?.close();
     copies?.close();
@@ -1918,6 +1929,17 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     };
   });
 
+  app.get(`${API}/admin/logging`, { preHandler: requireAdmin }, async () => logging.state());
+
+  app.put(`${API}/admin/logging`, { preHandler: requireAdmin }, async (request, reply) => {
+    const parsed = loggingBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Invalid logging level" });
+    const state = logging.set(parsed.data.level as LoggingLevel, parsed.data.minutes ?? null);
+    recordEvent(db, { level: "info", event: "logging.level.changed", detail: state.until ? `${state.level} until ${state.until}` : "normal", actorId: request.identity?.id ?? null, actorName: request.identity?.name ?? null });
+    request.log.info({ level: state.level, until: state.until }, "Logging level changed");
+    return state;
+  });
+
   // For home's diagnostics report (diagnostics.ts): what a bug report needs to be
   // answered. Sent as it is; home hides the names and paths unless the admin opts in.
   app.get(`${API}/admin/diagnostics`, { preHandler: requireAdmin }, async () => ({
@@ -1941,7 +1963,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       titles: library.titles, episodes: library.episodes, sizeBytes: library.sizeBytes
     })),
     paths: { media: options.mediaRoot, database: options.dbPath, art: artDir, transcode: hls?.folder ?? null },
-    log: problemLines(options.logBuffer),
+    // Every line while detailed logging is on (and for an hour after); else the problems.
+    log: logging.detailed() ? everyLine(options.logBuffer) : problemLines(options.logBuffer),
+    logging: { level: logging.state().level, until: logging.state().until },
     hardwareTest: testSummary(listTests(db, 1)[0] ?? null),
     hardwareChanges: listChanges(db, 5).map((change) => `${change.at.slice(0, 16).replace("T", " ")} ${change.summary}`),
     diskCheck: diskSummary(listDiskChecks(db, 1)[0] ?? null)

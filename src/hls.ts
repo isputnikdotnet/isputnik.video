@@ -551,6 +551,9 @@ function sweepCache(cache: string): void {
 }
 
 export interface HlsLog {
+  /** Detailed and Everything logging (logging.ts); a test's logger may leave them out. */
+  debug?(obj: object, msg: string): void;
+  trace?(obj: object, msg: string): void;
   info(obj: object, msg: string): void;
   warn(obj: object, msg: string): void;
 }
@@ -1071,6 +1074,13 @@ export class HlsSessions {
     const dir = path.join(entry.dir, `run-${++this.runCount}`);
     fs.mkdirSync(dir, { recursive: true });
     const args = ffmpegArgs(entry.plan, from, dir, gpu, null, job?.encode ?? null);
+    // Detailed: why it converts, and where; Everything: the whole command.
+    this.log.debug?.({
+      item: entry.plan.itemId, from, mode: entry.plan.delivery.mode, reasons: entry.plan.delivery.reasons,
+      videoCopy: entry.plan.delivery.videoCopy, audioCopy: entry.plan.delivery.audioCopy, rung: entry.plan.delivery.rung,
+      gpu: gpu ? { decode: Boolean(gpu.decode) } : null, cpuOnly: entry.cpuOnly, job: job ? job.encode : null
+    }, "Conversion plan");
+    this.log.trace?.({ item: entry.plan.itemId, command: [this.tools.ffmpeg, ...args].join(" ") }, "ffmpeg command");
     const polite = Boolean(job?.polite) && process.platform !== "win32";
     const proc = spawn(polite ? "nice" : this.tools.ffmpeg, polite ? ["-n", "15", this.tools.ffmpeg, ...args] : args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     const run: Run = { entry, owner: viewer, proc, dir, gpu, from, writing: from - 1 };
@@ -1085,6 +1095,8 @@ export class HlsSessions {
       this.log.warn({ item: entry.plan.itemId, err }, "ffmpeg could not start");
     });
     proc.on("exit", (code, signal) => {
+      // Everything: what ffmpeg said, its last 2000 characters, however the run ended.
+      this.log.trace?.({ item: entry.plan.itemId, code, signal, stderr: stderr.trim() }, "ffmpeg output");
       if (!entry.runs.has(run)) return;
       if (code === 0) {
         // The last segment of the run is finished too.
