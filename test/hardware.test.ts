@@ -2,7 +2,7 @@
 // converted, the arguments ffmpeg gets, and the CPU taking over when the GPU
 // fails. No test needs a GPU: VAAPI is Linux-only and CI has none, so a GPU run
 // here really fails, which is what the fallback test relies on.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,8 +12,9 @@ import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
 import { findTools, probe, type MediaInfo } from "../src/ffmpeg.js";
 import { Hardware, decodeKeyOf, detectGpu, findDevice, type GpuCapabilities } from "../src/hardware.js";
-import { buildPlan, cpuTonemap, ffmpegArgs } from "../src/hls.js";
+import { CHANGED_CANVAS, buildPlan, cpuTonemap, ffmpegArgs } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
+import { writePgs } from "./helpers/pgs.js";
 
 const quiet = { info: () => undefined, warn: () => undefined };
 const tools = { ffmpeg: "ffmpeg", ffprobe: "ffprobe" };
@@ -177,10 +178,23 @@ describe("ffmpeg's arguments on the GPU", () => {
     const args = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084"), 2), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true, tonemap: true, overlay: true });
     expect(args[args.indexOf("-filter_complex") + 1]).toBe(
       "[0:0]tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=1080:format=nv12[m];" +
-      "[0:2]scale=1920:1080,format=bgra,hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]"
+      `[0:2]${CHANGED_CANVAS},hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]`
     );
     expect(args).toContain("-hwaccel");
     expect(args).not.toContain("-vf");
+  });
+
+  it("uploads the subtitle's canvas only when it changed, fitted to the picture after that when its size differs", () => {
+    const gpu = { device: "/dev/dri/renderD128", decode: true, overlay: true };
+    const filters = (args: string[]) => args[args.indexOf("-filter_complex") + 1];
+    // A 1080p film with its 1080p canvas: nothing to fit.
+    expect(filters(ffmpegArgs(plan(film("h264", "yuv420p"), 2), 0, "/tmp/s", gpu))).toBe(
+      `[0:0]scale_vaapi=format=nv12[m];[0:2]${CHANGED_CANVAS},hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]`
+    );
+    // The same at 720p: the canvases that go on are scaled, the repeats never are.
+    const info = film("h264", "yuv420p");
+    const at720 = ffmpegArgs(buildPlan("m1", "/media/film.mkv", info, decideDelivery(info, ".mkv", null, 2, 720), null), 0, "/tmp/s", gpu);
+    expect(filters(at720)).toContain(`[0:2]${CHANGED_CANVAS},scale=1280:720,format=bgra,hwupload[sub]`);
   });
 
   it("is the CPU's, as before, with no GPU", () => {
@@ -372,4 +386,49 @@ describe("a GPU that fails part-way", () => {
     expect(checked.json().hardware).toMatchObject({ mode: "auto", device: "/dev/dri/renderD128", encode: true, setAside: false });
     expect((await app.inject({ method: "POST", url: "/video/api/admin/conversion/check", headers })).statusCode).toBe(403);
   });
+});
+
+describe("an image subtitle's canvas on its way to the GPU (issue #14)", () => {
+  const real = findTools();
+  let dir: string;
+  let film: string;
+
+  beforeAll(() => {
+    // 30 s at 24 fps with a PGS track: shown 2 s in every 4 for the first 10 s,
+    // then nothing for 20 s (where a canvas must still go on, now and then).
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-pgs-"));
+    const sup = path.join(dir, "subs.sup");
+    writePgs(sup, [[1, 3], [5, 7], [8, 9]]);
+    film = path.join(dir, "film.mkv");
+    execFileSync(real.ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-i", sup,
+      "-t", "30", "-map", "0", "-map", "1", "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "copy", film]);
+  }, 60_000);
+
+  afterAll(() => fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
+
+  /** Each canvas the chain lets through: when, and a checksum of what is on it
+   *  (not the one ffmpeg sends at the end, stamped far past it). */
+  const canvases = (chain: string) => {
+    const { stderr, status } = spawnSync(real.ffmpeg, ["-hide_banner", "-nostdin", "-v", "info", "-i", film, "-filter_complex", `[0:1]${chain},showinfo[s]`,
+      "-map", "0:0", "-c:v", "copy", "-map", "[s]", "-c:v:1", "rawvideo", "-f", "null", "-"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    expect(status).toBe(0);
+    return [...stderr.matchAll(/n:\s*\d+\s+pts:\s*-?\d+\s+pts_time:(\S+).*?checksum:(\w+)/g)].map((m) => ({ at: Number(m[1]), sum: m[2] }))
+      .filter((canvas) => canvas.at <= 30);
+  };
+  const changes = (list: { at: number; sum: string }[]) => list.filter((c, i) => i === 0 || c.sum !== list[i - 1].sum);
+
+  it("lets through only the canvases that changed, at the same moments, and one every sixth frame between", () => {
+    const every = canvases("format=bgra");
+    const changed = canvases(CHANGED_CANVAS);
+    // ffmpeg sends the canvas again with each frame of the film...
+    expect(every.length).toBeGreaterThan(600);
+    // ...and only a fraction of them go on to be uploaded.
+    expect(changed.length).toBeLessThan(every.length / 4);
+    // Every subtitle appears and goes at the same moment as before.
+    expect(changes(changed)).toEqual(changes(every));
+    expect(changes(every).length).toBeGreaterThanOrEqual(6);
+    // Never more than six frames (a quarter of a second) without one, even with no subtitle on.
+    const gaps = changed.slice(1).map((c, i) => c.at - changed[i].at);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(6 / 24 + 0.01);
+  }, 60_000);
 });
