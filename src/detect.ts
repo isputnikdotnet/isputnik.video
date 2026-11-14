@@ -519,13 +519,15 @@ export interface DetectTarget {
 }
 
 /** A season's episodes, in order: intros by sound, credits by picture then by
- *  sound. Answers a row per episode. */
-export async function detectSeason(tools: Tools, episodes: DetectTarget[], signal?: AbortSignal): Promise<DetectedRow[]> {
+ *  sound. Answers a row per episode. `hold` runs before each episode's ffmpeg:
+ *  a season of 2160p episodes is an hour of decoding, too long to wait for. */
+export async function detectSeason(tools: Tools, episodes: DetectTarget[], signal?: AbortSignal, hold?: () => Promise<void>): Promise<DetectedRow[]> {
   const heads: (Uint32Array | null)[] = [];
   const tails: (Uint32Array | null)[] = [];
   const tailFrom: number[] = [];
   for (const episode of episodes) {
     signal?.throwIfAborted();
+    await hold?.();
     try {
       heads.push(await fingerprint(await decodeSound(tools, episode.absolute, 0, Math.min(INTRO_WINDOW_S, episode.duration / 3), signal)));
       const from = Math.max(0, episode.duration - Math.min(END_SOUND_WINDOW_S, episode.duration / 4));
@@ -557,6 +559,7 @@ export async function detectSeason(tools: Tools, episodes: DetectTarget[], signa
   const rows: DetectedRow[] = [];
   for (let i = 0; i < episodes.length; i++) {
     const episode = episodes[i];
+    if (heads[i]) await hold?.();
     // A file ffmpeg can't read is noted as looked at, or every pass would decode
     // its whole season again; Find again asks anew.
     let credits = heads[i] ? await creditsByPicture(tools, episode, signal) : null;
@@ -647,9 +650,10 @@ export class DetectRunner {
   }
 
   /** An episode's picture as hashes: kept from before, or made now and kept. */
-  private async printsOf(target: DetectTarget, signal?: AbortSignal): Promise<Uint32Array | null> {
+  private async printsOf(target: DetectTarget, signal?: AbortSignal, hold?: () => Promise<void>): Promise<Uint32Array | null> {
     const kept = readPrints(this.options.db, target.id, target);
     if (kept) return kept;
+    await hold?.();
     try {
       const prints = await pictureHashes(this.options.tools, target.absolute, signal);
       writePrints(this.options.db, target.id, target, prints);
@@ -661,7 +665,7 @@ export class DetectRunner {
   }
 
   /** The last episodes of the season before, which a premiere's recap is made of. */
-  private async previousSeason(showId: string, season: number, signal?: AbortSignal): Promise<Uint32Array[]> {
+  private async previousSeason(showId: string, season: number, signal?: AbortSignal, hold?: () => Promise<void>): Promise<Uint32Array[]> {
     const ids = (this.options.db.prepare(`
       SELECT id FROM episodes WHERE show_id = ? AND season = (SELECT MAX(season) FROM episodes WHERE show_id = ? AND season < ?)
       ORDER BY episode DESC LIMIT 2
@@ -669,7 +673,7 @@ export class DetectRunner {
     const out: Uint32Array[] = [];
     for (const id of ids) {
       const target = await this.target(id);
-      const prints = target ? await this.printsOf(target, signal) : null;
+      const prints = target ? await this.printsOf(target, signal, hold) : null;
       if (prints) out.push(prints);
     }
     return out;
@@ -680,12 +684,15 @@ export class DetectRunner {
 
   /** `all` (every library, what was watched lately first), a `library`, a
    *  `show`/`movie` (a title), or one `item` (its season, or the film).
-   *  `between` runs before each season or film: where more urgent work cuts in. */
+   *  `between` runs before each season or film: where more urgent work cuts in.
+   *  `hold` runs before each file is decoded, inside a season too: where the
+   *  pass waits while someone watches. */
   async run(
     scope: { all: true } | { library: string } | { show: string } | { movie: string } | { item: string },
     force: boolean,
     signal?: AbortSignal,
-    between?: () => Promise<void>
+    between?: () => Promise<void>,
+    hold?: () => Promise<void>
   ): Promise<DetectSummary> {
     const { db } = this.options;
     const summary: DetectSummary = { seasons: 0, films: 0, recaps: 0, intros: 0, credits: 0 };
@@ -733,13 +740,13 @@ export class DetectRunner {
       if (targets.length === 0 || (!force && targets.every((target) => this.fresh(target)))) continue;
       const title = (db.prepare("SELECT title FROM shows WHERE id = ?").get(show_id) as { title: string } | undefined)?.title ?? show_id;
       this.working = `${title} · season ${season}`;
-      const rows = await detectSeason(this.options.tools, targets, signal);
+      const rows = await detectSeason(this.options.tools, targets, signal, hold);
       // Recaps: each episode's opening against every episode before it this
       // season and the end of the season before — an episode's recap may reach
       // back past the premiere (Counterpart S2E02 is all season 1).
       const prints: (Uint32Array | null)[] = [];
-      for (const target of targets) prints.push(await this.printsOf(target, signal));
-      const before = await this.previousSeason(show_id, season, signal);
+      for (const target of targets) prints.push(await this.printsOf(target, signal, hold));
+      const before = await this.previousSeason(show_id, season, signal, hold);
       for (const [i, row] of rows.entries()) {
         signal?.throwIfAborted();
         const own = prints[i];

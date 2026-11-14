@@ -546,8 +546,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   /** What an admin asked for (Find again): run at the next season boundary of
    *  whatever long pass is going, not after it — a first pass takes hours. */
   const detectUrgent: { scope: DetectScope; request: FastifyRequest | null }[] = [];
-  /** While someone watches converted video, a pass waits between two seasons or
-   *  films (as copies do): its ffmpeg would take the cores and the disk from them. */
+  /** While someone watches converted video, a pass waits before its next file
+   *  (as copies do), inside a season too: its ffmpeg would take the cores and
+   *  the disk from them, and a season of 2160p episodes runs for an hour. */
   const whileWatching = async (signal: AbortSignal) => {
     while (busyConverting() && !signal.aborted) {
       await new Promise<void>((resolve) => {
@@ -563,8 +564,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const signal = AbortSignal.any([detectStop.signal, detectPause.signal]);
     // Only the passes queued by scans and on start wait; what an admin asked for runs now.
     const gate = between ? async () => { await whileWatching(signal); await between(); } : undefined;
+    const hold = between ? () => whileWatching(signal) : undefined;
     try {
-      const done = await detector.run(scope, force, signal, gate);
+      const done = await detector.run(scope, force, signal, gate, hold);
       if (done.seasons + done.films === 0) return;
       note(request, "info", "detect.finished", {
         libraryId: "library" in scope ? scope.library : null,
