@@ -159,6 +159,17 @@ export interface JobEncode {
   preset?: string;
 }
 
+/** An image subtitle reaches the filters as a canvas the size of the picture,
+ *  sent again with every frame of the film even when nothing on it changed.
+ *  Uploading each one to the GPU held a 1080p film with PGS subtitles under
+ *  real time on an Intel Arc (issue #14), so only a canvas that changed goes on
+ *  (scene > 0, compared on its BGRA as it comes, nothing converted), and every
+ *  sixth frame anyway. That way the overlay never has to hold back more than a
+ *  few frames of picture (decoded GPU surfaces, from a fixed pool) waiting for
+ *  the next canvas: with nothing to wait for, it would keep the whole stretch
+ *  until the next subtitle. */
+export const CHANGED_CANVAS = "format=bgra,select='gt(scene,0)+not(mod(n,6))'";
+
 export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null, job: JobEncode | null = null): string[] {
   const { info, delivery } = plan;
   const args = ["-hide_banner", "-nostdin", "-v", "error", "-y"];
@@ -192,12 +203,13 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   const gpuScale = shrink ? `scale_vaapi=w=${shrunkWidth}:h=${maxHeight}:format=nv12` : "scale_vaapi=format=nv12";
   if (info.video && burn && gpu?.overlay) {
     // All on the GPU (H3): the picture tone-mapped and scaled there, the
-    // subtitle's canvas fitted to it on the CPU (a few small images), uploaded
-    // with its alpha, and laid over it.
+    // subtitle's canvas, only when it changed (CHANGED_CANVAS), fitted to it on
+    // the CPU when its size differs, uploaded with its alpha, and laid over it.
     const outW = shrink ? shrunkWidth : info.video.width;
     const outH = shrink ? maxHeight : info.video.height;
+    const fits = burn.width === outW && burn.height === outH;
     const main = `[0:${info.video.index}]${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}[m];`;
-    const sub = `[0:${burn.index}]scale=${outW}:${outH},format=bgra,hwupload[sub];`;
+    const sub = `[0:${burn.index}]${CHANGED_CANVAS},${fits ? "" : `scale=${outW}:${outH},format=bgra,`}hwupload[sub];`;
     args.push("-filter_complex", `${main}${sub}[m][sub]overlay_vaapi=eof_action=pass[v]`, "-map", "[v]");
   } else if (info.video && burn) {
     // The subtitle drawn over the picture, its canvas fitted to the picture
