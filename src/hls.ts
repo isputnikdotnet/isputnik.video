@@ -33,7 +33,7 @@ import os from "node:os";
 import path from "node:path";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
-import { SUBTITLE_CHANGES, TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
+import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** Inside the conversion folder: the copies kept for download, never swept. */
 export const COPIES_FOLDER = "copies";
@@ -192,14 +192,12 @@ export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: 
   const gpuScale = shrink ? `scale_vaapi=w=${shrunkWidth}:h=${maxHeight}:format=nv12` : "scale_vaapi=format=nv12";
   if (info.video && burn && gpu?.overlay) {
     // All on the GPU (H3): the picture tone-mapped and scaled there, the
-    // subtitle's canvas uploaded with its alpha and laid over it. ffmpeg sends
-    // that canvas, full size, with every frame of the film: only the ones that
-    // changed are fitted to the picture on the CPU and uploaded (#14).
+    // subtitle's canvas fitted to it on the CPU (a few small images), uploaded
+    // with its alpha, and laid over it.
     const outW = shrink ? shrunkWidth : info.video.width;
     const outH = shrink ? maxHeight : info.video.height;
-    const fit = !(burn.width === outW && burn.height === outH);
     const main = `[0:${info.video.index}]${gpu.tonemap ? `${TONEMAP_VAAPI},` : ""}${gpuScale}[m];`;
-    const sub = `[0:${burn.index}]${SUBTITLE_CHANGES},${fit ? `scale=${outW}:${outH},` : ""}format=bgra,hwupload[sub];`;
+    const sub = `[0:${burn.index}]scale=${outW}:${outH},format=bgra,hwupload[sub];`;
     args.push("-filter_complex", `${main}${sub}[m][sub]overlay_vaapi=eof_action=pass[v]`, "-map", "[v]");
   } else if (info.video && burn) {
     // The subtitle drawn over the picture, its canvas fitted to the picture

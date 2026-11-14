@@ -49,12 +49,10 @@ COPY --from=build /build/dist ./dist
 COPY package.json ./
 
 # ffmpeg is there, with the encoders the conversion uses, on the CPU and the GPU,
-# the filters that tone-map HDR on the CPU (zscale needs libzimg), the one that
-# keeps a burned-in subtitle's upload to its changes (mpdecimate), and the tools
+# the filters that tone-map HDR on the CPU (zscale needs libzimg), and the tools
 # the GPU check runs.
 RUN ffmpeg -hide_banner -encoders | grep -q libx264 && ffmpeg -hide_banner -encoders | grep -q " aac " \
     && ffmpeg -hide_banner -encoders | grep -q h264_vaapi && ffmpeg -hide_banner -filters | grep -q scale_vaapi \
-    && ffmpeg -hide_banner -filters | grep -q " mpdecimate " \
     && ffmpeg -hide_banner -filters | grep -q " zscale " && ffmpeg -hide_banner -filters | grep -q " tonemap " \
     && ffprobe -version > /dev/null && command -v vainfo > /dev/null \
     && { [ "$(dpkg --print-architecture)" != "amd64" ] || test -f /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so; }

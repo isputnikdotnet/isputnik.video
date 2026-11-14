@@ -56,14 +56,6 @@ export interface GpuRun {
 /** The GPU's tone mapping, HDR → SDR in BT.709, as conversions and the test run it. */
 export const TONEMAP_VAAPI = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709";
 
-/** An image subtitle's canvas only when it changed, before it goes up to the GPU.
- *  ffmpeg resends the whole canvas (8 MB at 1080p) with every frame of the film,
- *  and uploading each made a burned-in film slower than real time on one thread
- *  (isputnik.video#14). The GPU's overlay keeps laying the last one over, and a
- *  canvas still goes up every 12 frames: the overlay holds the picture back
- *  until the subtitle's next frame comes, and no more than this many may wait. */
-export const SUBTITLE_CHANGES = "mpdecimate=max=12";
-
 /** A sample of each codec, as the CPU makes it, for the decode test. */
 const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
   { key: "h264", args: ["-c:v", "libx264", "-pix_fmt", "yuv420p"], ext: "mp4" },
@@ -206,7 +198,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
     overlay = (await run(tools.ffmpeg, [
       "-hide_banner", "-v", "error", ...deviceArgs(device),
       "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "color=c=white@0.5:size=640x360:rate=25",
-      "-filter_complex", `[0:v]format=nv12,hwupload[m];[1:v]${SUBTITLE_CHANGES},format=bgra,hwupload[s];[m][s]overlay_vaapi=eof_action=pass[v]`,
+      "-filter_complex", "[0:v]format=nv12,hwupload[m];[1:v]format=bgra,hwupload[s];[m][s]overlay_vaapi=eof_action=pass[v]",
       "-map", "[v]", "-t", "0.5", "-c:v", "h264_vaapi", "-f", "null", "-"
     ], TEST_TIMEOUT_MS)).ok;
   } finally {

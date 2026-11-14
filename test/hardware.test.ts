@@ -2,7 +2,7 @@
 // converted, the arguments ffmpeg gets, and the CPU taking over when the GPU
 // fails. No test needs a GPU: VAAPI is Linux-only and CI has none, so a GPU run
 // here really fails, which is what the fallback test relies on.
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { decideDelivery } from "../src/delivery.js";
 import { findTools, probe, type MediaInfo } from "../src/ffmpeg.js";
-import { Hardware, SUBTITLE_CHANGES, decodeKeyOf, detectGpu, findDevice, type GpuCapabilities } from "../src/hardware.js";
+import { Hardware, decodeKeyOf, detectGpu, findDevice, type GpuCapabilities } from "../src/hardware.js";
 import { buildPlan, cpuTonemap, ffmpegArgs } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
@@ -177,38 +177,10 @@ describe("ffmpeg's arguments on the GPU", () => {
     const args = ffmpegArgs(plan(film("hevc", "yuv420p10le", 2160, 3840, "smpte2084"), 2), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true, tonemap: true, overlay: true });
     expect(args[args.indexOf("-filter_complex") + 1]).toBe(
       "[0:0]tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=1080:format=nv12[m];" +
-      "[0:2]mpdecimate=max=12,format=bgra,hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]"
+      "[0:2]scale=1920:1080,format=bgra,hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]"
     );
     expect(args).toContain("-hwaccel");
     expect(args).not.toContain("-vf");
-  });
-
-  it("uploads only the subtitle canvases that changed, fitted to the picture after (#14)", () => {
-    // A 1080p PGS track on a 720p film: scaled, but only the canvases kept.
-    const args = ffmpegArgs(plan(film("h264", "yuv420p", 720, 1280), 2), 0, "/tmp/s", { device: "/dev/dri/renderD128", decode: true, overlay: true });
-    expect(args[args.indexOf("-filter_complex") + 1]).toBe(
-      "[0:0]scale_vaapi=format=nv12[m];[0:2]mpdecimate=max=12,scale=1280:720,format=bgra,hwupload[sub];[m][sub]overlay_vaapi=eof_action=pass[v]"
-    );
-  });
-
-  it("drops the repeated canvases on the CPU and keeps every change at its frame", () => {
-    // What the GPU branch does before the upload, run by the real ffmpeg: ten
-    // seconds of an empty canvas resent every frame, a subtitle from 3 s to 5 s.
-    const source = "color=c=black@0:size=1920x1080:rate=24:d=10,format=bgra," +
-      "drawbox=x=100:y=900:w=600:h=80:color=white@1:t=fill:enable='between(t,3,5)'";
-    const run = spawnSync(findTools().ffmpeg, ["-hide_banner", "-f", "lavfi", "-i", source,
-      "-vf", `${SUBTITLE_CHANGES},format=bgra,showinfo`, "-f", "null", "-"], { encoding: "utf8", windowsHide: true });
-    expect(run.status).toBe(0);
-    const kept = [...run.stderr.matchAll(/pts_time:([\d.]+).*?fmt:(\w+).*?mean:\[(\d+)/g)]
-      .map((m) => ({ at: Number(m[1]), fmt: m[2], on: Number(m[3]) > 0 }));
-    // A fraction of the 240 frames, the canvas back in BGRA with its alpha.
-    expect(kept.length).toBeLessThan(30);
-    expect(new Set(kept.map((frame) => frame.fmt))).toEqual(new Set(["bgra"]));
-    // Never more than 12 frames apart, so the overlay never holds the film back longer.
-    for (let i = 1; i < kept.length; i++) expect(kept[i].at - kept[i - 1].at).toBeLessThanOrEqual(13 / 24 + 1e-4);
-    // The subtitle comes and goes on its own frames, not up to half a second late.
-    expect(kept.find((frame) => frame.on)?.at).toBe(3);
-    expect(kept.find((frame, i) => i > 0 && kept[i - 1].on && !frame.on)?.at).toBeCloseTo(121 / 24, 3);
   });
 
   it("is the CPU's, as before, with no GPU", () => {
