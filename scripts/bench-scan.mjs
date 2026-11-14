@@ -8,6 +8,11 @@
 //   npm run bench:scan -- <media> <engine>     another checkout of the engine (a git worktree of an
 //                                              older tag, with this one's node_modules linked in)
 //
+// Options, for a media folder whose libraries are named otherwise (exact names;
+// Linux tells Series from series):
+//   --movies <folder>   the films library, relative to the media folder (default Movies)
+//   --shows <folder>    the shows library, relative to the media folder (default Shows)
+//
 // Runs without ffmpeg: detection and conversion are not part of it. Nothing in
 // the media folder is written to; the catalog goes in a temporary folder.
 import { execFileSync } from "node:child_process";
@@ -15,20 +20,35 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { makeFakeLibrary } from "./fake-library.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const [mediaArg, engineArg] = process.argv.slice(2);
+const { values: options, positionals } = parseArgs({
+  allowPositionals: true,
+  options: { movies: { type: "string", default: "Movies" }, shows: { type: "string", default: "Shows" } }
+});
+const [mediaArg, engineArg] = positionals;
 const engine = path.resolve(engineArg ?? path.join(here, ".."));
 let media = mediaArg ? path.resolve(mediaArg) : path.join(os.tmpdir(), "isputnik-video-fake-library");
-if (!mediaArg && !fs.existsSync(path.join(media, "Movies"))) {
+// The fake library is always Movies/ and Shows/.
+const folders = mediaArg ? { movies: options.movies, shows: options.shows } : { movies: "Movies", shows: "Shows" };
+if (!mediaArg && !fs.existsSync(path.join(media, folders.movies))) {
   const made = makeFakeLibrary(media);
   console.log(`Made a fake library: ${made.films} films, ${made.episodes} episodes, in ${media}`);
 }
-for (const folder of ["Movies", "Shows"]) {
-  if (!fs.existsSync(path.join(media, folder))) {
-    console.error(`${media} has no ${folder} folder`);
+for (const [kind, folder] of Object.entries(folders)) {
+  if (!fs.statSync(path.join(media, folder), { throwIfNoEntry: false })?.isDirectory()) {
+    let there = [];
+    try {
+      there = fs.readdirSync(media, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    } catch {
+      console.error(`${media} is not a folder that can be read`);
+      process.exit(1);
+    }
+    console.error(`${media} has no ${folder} folder for the ${kind}. Folders there: ${there.join(", ") || "none"}`);
+    console.error(`Name it with --${kind} <folder>, for example --${kind} ${there[0] ?? folder}`);
     process.exit(1);
   }
 }
@@ -82,8 +102,8 @@ try {
     await app.scansSettled();
   };
   await phase("first scan + pass", async () => {
-    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_mov", headers: admin, payload: { name: "Films", kind: "movies", folder: "Movies" } });
-    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_tv", headers: admin, payload: { name: "TV", kind: "shows", folder: "Shows" } });
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_mov", headers: admin, payload: { name: "Films", kind: "movies", folder: folders.movies } });
+    await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_tv", headers: admin, payload: { name: "TV", kind: "shows", folder: folders.shows } });
     await app.scansSettled();
   });
   await phase("rescan, nothing changed", scanAll);
