@@ -338,6 +338,11 @@ export type SegmentData = { data: Buffer } | { file: string; size: number };
 export interface ConversionViewer {
   user: string;
   title: string;
+  /** For Watching now: the item, from where (home, trusted, internet), on what, and since when. */
+  itemId: string | null;
+  network: string | null;
+  device: string | null;
+  since: string;
   mode: string;
   /** Where the picture is re-encoded; null when it goes through as it is. */
   converter: "gpu" | "cpu" | null;
@@ -442,6 +447,11 @@ interface Viewer {
   /** Whose and what, for the admin's list. */
   user: string;
   title: string;
+  /** For Watching now (watching.ts): the item, from where, on what, and since when. */
+  itemId?: string;
+  network?: string;
+  device?: string;
+  since: number;
   run: Run | null;
   failure: string | null;
   lastWanted: number;
@@ -548,6 +558,15 @@ function sweepCache(cache: string): void {
       if (inner.startsWith("run-")) fs.rmSync(path.join(dir, inner), { recursive: true, force: true });
     }
   }
+}
+
+/** Who a viewer is, for the admin's lists: the name, the title, and for Watching now where and on what. */
+export interface HlsWho {
+  user: string;
+  title: string;
+  itemId?: string;
+  network?: string;
+  device?: string;
 }
 
 export interface HlsLog {
@@ -784,6 +803,10 @@ export class HlsSessions {
       return {
         user: viewer.user,
         title: viewer.title,
+        itemId: viewer.itemId ?? null,
+        network: viewer.network ?? null,
+        device: viewer.device ?? null,
+        since: new Date(viewer.since).toISOString(),
         mode: entry.plan.delivery.mode,
         converter: entry.plan.delivery.videoCopy || entry.complete ? null : viewer.run?.gpu ? "gpu" as const : "cpu" as const,
         hdr: !entry.plan.delivery.videoCopy && hdrOf(entry.plan.info.video) !== null,
@@ -855,7 +878,7 @@ export class HlsSessions {
     const entry = this.entries.get(variant) ?? this.open(variant, plan, title);
     entry.holds += 1;
     entry.idleSince = 0;
-    const stand: Viewer = { key: `job:${variant}`, job: true, entry, user: "", title, run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const stand: Viewer = { key: `job:${variant}`, job: true, entry, user: "", title, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
     const note = path.join(entry.dir, FILLING_FILE);
     try {
       fs.writeFileSync(note, JSON.stringify({ variant, itemId: plan.itemId, title }));
@@ -993,7 +1016,7 @@ export class HlsSessions {
     return this.storage !== "memory" && !entry.plan.delivery.videoCopy;
   }
 
-  private attach(key: string, plan: HlsPlan, variant: string, who: { user: string; title: string }): Viewer {
+  private attach(key: string, plan: HlsPlan, variant: string, who: HlsWho): Viewer {
     // refusal let this through, so any other film of theirs has gone quiet.
     const person = personOf(key);
     for (const other of [...this.viewers.keys()]) {
@@ -1001,7 +1024,7 @@ export class HlsSessions {
     }
     const entry = this.entries.get(variant) ?? this.fromKept(variant, plan, who.title) ?? this.open(variant, plan, who.title);
     entry.idleSince = 0;
-    const viewer: Viewer = { key, entry, user: who.user, title: who.title, run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const viewer: Viewer = { key, entry, user: who.user, title: who.title, itemId: who.itemId, network: who.network, device: who.device, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
     entry.viewers.add(viewer);
     this.viewers.set(key, viewer);
     const film = this.kept.get(variant);

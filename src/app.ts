@@ -17,7 +17,7 @@ import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
 import { MetadataRunner, artFileAsync, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
-import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type SegmentData } from "./hls.js";
+import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type HlsWho, type SegmentData } from "./hls.js";
 import { isInside, isMapped } from "./mounts.js";
 import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, readJobs, saveConversion, saveCopies, saveDetection, saveJobs } from "./settings.js";
 import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, jobSettingsSchema, type CopyKey } from "./copies.js";
@@ -38,6 +38,7 @@ import { canSee, clientIpFrom, devIdentity, forwardedRequestId, historyIdFor, id
 import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, putLibrary, setScanState, syncLibraries } from "./libraries.js";
 import type { LogBuffer } from "./log-buffer.js";
 import { createLogging, type LoggingLevel } from "./logging.js";
+import { deviceOf, Watching } from "./watching.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
@@ -126,6 +127,11 @@ const eventsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(10).max(100).default(25)
 });
+
+/** A title as the admin's lists name it: a film by its name, an episode as "Show S01E02". */
+function episodeTitle(item: { title: string; show: { title: string } | null; season: number | null; episode: number | null }): string {
+  return item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
+}
 
 const loggingBodySchema = z.object({
   level: z.enum(["normal", "detailed", "everything"]),
@@ -309,6 +315,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     info: (obj: object, msg: string) => app.log.info(obj, msg),
     warn: (obj: object, msg: string) => app.log.warn(obj, msg)
   };
+  // What is played as it is and downloaded right now (watching.ts); converted video is hls.ts's.
+  const watching = new Watching();
   // How much it logs, for a while (logging.ts); home's Diagnostics sets it.
   const logging = createLogging({ db, logger: app.log, buffer: options.logBuffer });
   // The GPU (hardware.ts): found out once ffmpeg answers, and on Check again.
@@ -1018,19 +1026,25 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return;
     }
     const stream = fs.createReadStream(file.absolute, { start, end });
+    const identity = request.identity!;
+    const play = watching.begin({
+      kind: "direct", user: identity.name || identity.id, userId: identity.id, itemId: item.id,
+      title: episodeTitle(item), network: identity.network, device: deviceOf(request.headers["user-agent"])
+    });
+    stream.on("data", (chunk) => play.sent(chunk.length));
     stream.on("error", (err) => {
       request.log.warn({ err, item: item.id }, "Reading a video file failed mid-stream");
       reply.raw.destroy(err);
     });
     // A player that seeks closes the connection: stop reading the disk too.
-    reply.raw.on("close", () => stream.destroy());
+    reply.raw.on("close", () => { stream.destroy(); play.end(); });
     stream.pipe(reply.raw);
   };
   app.get(`${API}/stream/:id`, { preHandler: requireIdentity }, serveStream);
 
   // HLS, for what the browser can't play as it is: the playlist of the whole
   // film, then each segment, made as it is asked for (hls.ts).
-  const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan; who: { user: string; title: string } } | null> => {
+  const planFor = async (request: FastifyRequest): Promise<{ key: string; plan: HlsPlan; who: HlsWho } | null> => {
     const identity = request.identity!;
     const { id, track } = request.params as { id: string; track?: string };
     const item = findItem(db, identity, itemIdSchema.parse(id));
@@ -1049,11 +1063,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     // An address for a track the file doesn't have is not this film.
     if (track !== undefined && trackSegment(decided.delivery) !== track) return null;
     const keyframes = decided.delivery.videoCopy ? await mediaProbe.keyframes(item.id, file) : null;
-    const title = item.show ? `${item.show.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : item.title;
     return {
       key: `${identity.id}:${item.id}`,
       plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes, `${file.size}:${file.modified.getTime()}`),
-      who: { user: identity.name || identity.id, title }
+      who: { user: identity.name || identity.id, title: episodeTitle(item), itemId: item.id, network: identity.network, device: deviceOf(request.headers["user-agent"]) }
     };
   };
 
@@ -1312,6 +1325,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return;
     }
     const stream = fs.createReadStream(made.path, { start, end });
+    const identity = request.identity!;
+    const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
+    const fetching = watching.begin({
+      kind: "download", user: identity.name || identity.id, userId: identity.id, itemId: item?.id ?? (request.params as { id: string }).id,
+      title: item ? episodeTitle(item) : (request.params as { id: string }).id, network: identity.network, device: deviceOf(request.headers["user-agent"])
+    });
+    stream.on("data", (chunk) => fetching.sent(chunk.length));
+    reply.raw.on("close", () => fetching.end());
     stream.on("error", (err) => reply.raw.destroy(err));
     // Away from home, held to the admin's speed (all such copies together).
     const slow = request.identity!.network === "internet" && (copies?.remoteBytesPerSecond ?? 0) > 0 ? throttled(remoteBucket) : null;
@@ -1950,6 +1971,28 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     recordEvent(db, { level: "info", event: "logging.level.changed", detail: state.until ? `${state.level} until ${state.until}` : "normal", actorId: request.identity?.id ?? null, actorName: request.identity?.name ?? null });
     request.log.info({ level: state.level, until: state.until }, "Logging level changed");
     return state;
+  });
+
+  // Watching now (home's Diagnostics › Video): every play and download going on —
+  // as it is (watching.ts) or converted (hls.ts) — with who, from where, on what.
+  app.get(`${API}/admin/watching`, { preHandler: requireAdmin }, async () => {
+    const converted = (hls?.usage().viewers ?? []).map((viewer) => ({
+      kind: "converted" as const,
+      user: viewer.user,
+      itemId: viewer.itemId,
+      title: viewer.title,
+      network: viewer.network,
+      device: viewer.device,
+      since: viewer.since,
+      mode: viewer.mode,
+      converter: viewer.converter ?? null,
+      rung: viewer.rung ?? null,
+      hdr: viewer.hdr ?? false,
+      converting: viewer.converting,
+      shared: viewer.shared ?? false,
+      kept: viewer.kept ?? false
+    }));
+    return { plays: [...watching.current(), ...converted].sort((a, b) => String(b.since).localeCompare(String(a.since))) };
   });
 
   // For home's diagnostics report (diagnostics.ts): what a bug report needs to be
