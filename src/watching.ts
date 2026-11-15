@@ -17,6 +17,8 @@ export interface DirectPlay {
   kind: PlayKind;
   user: string;
   userId: string;
+  /** Whose watch history (progress) it is: a viewing profile's, or the person's. */
+  historyId: string;
   itemId: string;
   title: string;
   network: string;
@@ -25,13 +27,20 @@ export interface DirectPlay {
   lastSeen: string;
   /** Bytes sent so far in this play. */
   bytes: number;
+  /** What it has been sent at lately, in Mbit/s: the last half minute. */
+  mbps: number;
 }
 
-interface Tracked extends Omit<DirectPlay, "since" | "lastSeen"> {
+interface Tracked extends Omit<DirectPlay, "since" | "lastSeen" | "mbps"> {
   since: number;
   lastSeen: number;
   open: number;
+  /** Bytes sent, by when: the last half minute's, for the rate. */
+  recent: { at: number; bytes: number }[];
 }
+
+/** The window the rate is taken over. */
+const RATE_MS = 30_000;
 
 /** A device in a word, from its User-Agent: enough to tell the TV from a phone. */
 export function deviceOf(userAgent: string | undefined): string {
@@ -50,12 +59,12 @@ export class Watching {
   constructor(private now: () => number = Date.now) {}
 
   /** A request for a range of a file began; call the returned function when it ends. */
-  begin(play: Omit<DirectPlay, "since" | "lastSeen" | "bytes">): { sent(bytes: number): void; end(): void } {
+  begin(play: Omit<DirectPlay, "since" | "lastSeen" | "bytes" | "mbps">): { sent(bytes: number): void; end(): void } {
     const key = `${play.kind}|${play.userId}|${play.itemId}|${play.device}`;
     const at = this.now();
     let tracked = this.plays.get(key);
     if (!tracked || (tracked.open === 0 && at - tracked.lastSeen > IDLE_MS)) {
-      tracked = { ...play, since: at, lastSeen: at, bytes: 0, open: 0 };
+      tracked = { ...play, since: at, lastSeen: at, bytes: 0, open: 0, recent: [] };
       this.plays.set(key, tracked);
     }
     tracked.open += 1;
@@ -63,7 +72,13 @@ export class Watching {
     const mine = tracked;
     let ended = false;
     return {
-      sent: (bytes) => { mine.bytes += bytes; mine.lastSeen = this.now(); },
+      sent: (bytes) => {
+        const now = this.now();
+        mine.bytes += bytes;
+        mine.lastSeen = now;
+        mine.recent.push({ at: now, bytes });
+        while (mine.recent.length > 0 && now - mine.recent[0].at > RATE_MS) mine.recent.shift();
+      },
       end: () => {
         if (ended) return;
         ended = true;
@@ -82,8 +97,11 @@ export class Watching {
         this.plays.delete(key);
         continue;
       }
-      const { open: _open, since, lastSeen, ...rest } = play;
-      out.push({ ...rest, since: new Date(since).toISOString(), lastSeen: new Date(lastSeen).toISOString() });
+      const { open: _open, since, lastSeen, recent, ...rest } = play;
+      const windowed = recent.filter((sample) => at - sample.at <= RATE_MS);
+      const seconds = Math.max(1, Math.min(RATE_MS, at - since) / 1000);
+      const mbps = Math.round((windowed.reduce((sum, sample) => sum + sample.bytes, 0) * 8) / 1_000_000 / seconds * 10) / 10;
+      out.push({ ...rest, mbps, since: new Date(since).toISOString(), lastSeen: new Date(lastSeen).toISOString() });
     }
     return out.sort((a, b) => b.since.localeCompare(a.since));
   }

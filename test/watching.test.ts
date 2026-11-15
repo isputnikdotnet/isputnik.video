@@ -21,7 +21,7 @@ describe("the play tracker", () => {
   it("makes one play of a player's many range requests, and forgets it a minute after the last", () => {
     let now = Date.parse("2026-11-14T20:00:00Z");
     const watching = new Watching(() => now);
-    const play = { kind: "direct" as const, user: "Mum", userId: "mum", itemId: "ep2", title: "Радар S01E02", network: "home", device: "TV" };
+    const play = { kind: "direct" as const, user: "Mum", userId: "mum", historyId: "mum", itemId: "ep2", title: "Радар S01E02", network: "home", device: "TV" };
     const first = watching.begin(play);
     first.sent(1000);
     first.end();
@@ -78,5 +78,9 @@ describe("GET /admin/watching", () => {
     const plays = (await app.inject({ method: "GET", url: "/video/api/admin/watching", headers: as("admin") })).json().plays;
     expect(plays).toEqual([expect.objectContaining({ kind: "direct", user: "Mum", itemId: episode.id, title: "Радар S01E02", device: "Phone", bytes: 10 })]);
     expect(["internet", "home"]).toContain(plays[0].network);
+    // What a Now playing card needs: the show and the episode, how long it is, how fast it goes.
+    expect(plays[0]).toMatchObject({ type: "episode", heading: "Радар", subheading: expect.stringMatching(/^S1 · E2/) });
+    expect(typeof plays[0].mbps).toBe("number");
+    expect(plays[0]).not.toHaveProperty("historyId");
   });
 });

@@ -14,7 +14,7 @@ import { findTools, toolsWork, type AudioStream, type MediaInfo, type Tools } fr
 import { SubtitleCache, burnIndexOf, listSubtitles, type SubtitleTrack } from "./subtitles.js";
 import { MarkError, clearMark, detectedMarkers, findMarkers, purgeOrphanMarkers, readMarks, setMark } from "./markers.js";
 import { DetectRunner, purgeOrphanDetected, readDetected } from "./detect.js";
-import { MetadataRunner, artFileAsync, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind } from "./metadata.js";
+import { MetadataRunner, artFileAsync, artUrl, keyHint, metaFor, partOfKey, posterStateOf, purgeOrphanMetadata, readTmdbKey, removePosterUpload, savePosterUpload, saveTmdbKey, setBackdropChoice, setMatch, setPosterChoice, tmdbKeySchema, tmdbMatchOf, type ArtKind, type MetaRow } from "./metadata.js";
 import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmdb.js";
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type HlsWho, type SegmentData } from "./hls.js";
@@ -1028,7 +1028,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const stream = fs.createReadStream(file.absolute, { start, end });
     const identity = request.identity!;
     const play = watching.begin({
-      kind: "direct", user: identity.name || identity.id, userId: identity.id, itemId: item.id,
+      kind: "direct", user: identity.name || identity.id, userId: identity.id, historyId: identity.historyId, itemId: item.id,
       title: episodeTitle(item), network: identity.network, device: deviceOf(request.headers["user-agent"])
     });
     stream.on("data", (chunk) => play.sent(chunk.length));
@@ -1066,7 +1066,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return {
       key: `${identity.id}:${item.id}`,
       plan: buildPlan(item.id, file.absolute, decided.info, decided.delivery, keyframes, `${file.size}:${file.modified.getTime()}`),
-      who: { user: identity.name || identity.id, title: episodeTitle(item), itemId: item.id, network: identity.network, device: deviceOf(request.headers["user-agent"]) }
+      who: { user: identity.name || identity.id, title: episodeTitle(item), historyId: identity.historyId, itemId: item.id, network: identity.network, device: deviceOf(request.headers["user-agent"]) }
     };
   };
 
@@ -1328,7 +1328,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const identity = request.identity!;
     const item = findItem(db, identity, itemIdSchema.parse((request.params as { id: string }).id));
     const fetching = watching.begin({
-      kind: "download", user: identity.name || identity.id, userId: identity.id, itemId: item?.id ?? (request.params as { id: string }).id,
+      kind: "download", user: identity.name || identity.id, userId: identity.id, historyId: identity.historyId, itemId: item?.id ?? (request.params as { id: string }).id,
       title: item ? episodeTitle(item) : (request.params as { id: string }).id, network: identity.network, device: deviceOf(request.headers["user-agent"])
     });
     stream.on("data", (chunk) => fetching.sent(chunk.length));
@@ -1980,6 +1980,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       kind: "converted" as const,
       user: viewer.user,
       itemId: viewer.itemId,
+      historyId: viewer.historyId,
+      atSeconds: viewer.atSeconds,
       title: viewer.title,
       network: viewer.network,
       device: viewer.device,
@@ -1992,7 +1994,32 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       shared: viewer.shared ?? false,
       kept: viewer.kept ?? false
     }));
-    return { plays: [...watching.current(), ...converted].sort((a, b) => String(b.since).localeCompare(String(a.since))) };
+    const progressOf = db.prepare("SELECT position_s, duration_s FROM progress WHERE user_id = ? AND item_id = ?");
+    const metaOf = db.prepare("SELECT * FROM metadata WHERE item_id = ?");
+    const episodeOf = db.prepare("SELECT e.show_id, e.season, e.episode, s.title AS show_title FROM episodes e JOIN shows s ON s.id = e.show_id WHERE e.id = ?");
+    const movieOf = db.prepare("SELECT title, year FROM movies WHERE id = ?");
+    // Plex's Now playing card: the picture, where in the film, how long it runs.
+    const card = (play: { itemId: string | null; historyId?: string | null; title: string; atSeconds?: number | null }) => {
+      if (!play.itemId) return {};
+      const episode = episodeOf.get(play.itemId) as { show_id: string; season: number; episode: number; show_title: string } | undefined;
+      const own = metaOf.get(play.itemId) as MetaRow | undefined;
+      const show = episode ? (metaOf.get(episode.show_id) as MetaRow | undefined) : undefined;
+      const progress = play.historyId ? (progressOf.get(play.historyId, play.itemId) as { position_s: number; duration_s: number | null } | undefined) : undefined;
+      const movie = episode ? undefined : (movieOf.get(play.itemId) as { title: string; year: number | null } | undefined);
+      return {
+        type: episode ? "episode" as const : "movie" as const,
+        heading: episode ? episode.show_title : movie?.title ?? play.title,
+        subheading: episode ? `S${episode.season} · E${episode.episode}${own?.title ? ` · ${own.title}` : ""}` : movie?.year ? String(movie.year) : null,
+        poster: artUrl(API, episode ? show : own, "poster"),
+        backdrop: artUrl(API, episode ? show : own, "backdrop") ?? (episode ? artUrl(API, own, "still") : null),
+        positionSeconds: progress?.position_s ?? play.atSeconds ?? null,
+        durationSeconds: progress?.duration_s ?? null
+      };
+    };
+    const plays = [...watching.current(), ...converted]
+      .map(({ historyId: _historyId, ...play }) => ({ ...play, ...card({ ...play, historyId: _historyId }) }))
+      .sort((a, b) => String(b.since).localeCompare(String(a.since)));
+    return { plays };
   });
 
   // For home's diagnostics report (diagnostics.ts): what a bug report needs to be

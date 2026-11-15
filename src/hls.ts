@@ -340,9 +340,12 @@ export interface ConversionViewer {
   title: string;
   /** For Watching now: the item, from where (home, trusted, internet), on what, and since when. */
   itemId: string | null;
+  historyId: string | null;
   network: string | null;
   device: string | null;
   since: string;
+  /** Where the player last asked to be, in the film's seconds (the segment it wanted). */
+  atSeconds: number | null;
   mode: string;
   /** Where the picture is re-encoded; null when it goes through as it is. */
   converter: "gpu" | "cpu" | null;
@@ -449,6 +452,7 @@ interface Viewer {
   title: string;
   /** For Watching now (watching.ts): the item, from where, on what, and since when. */
   itemId?: string;
+  historyId?: string;
   network?: string;
   device?: string;
   since: number;
@@ -564,6 +568,7 @@ function sweepCache(cache: string): void {
 export interface HlsWho {
   user: string;
   title: string;
+  historyId?: string;
   itemId?: string;
   network?: string;
   device?: string;
@@ -804,6 +809,8 @@ export class HlsSessions {
         user: viewer.user,
         title: viewer.title,
         itemId: viewer.itemId ?? null,
+        historyId: viewer.historyId ?? null,
+        atSeconds: entry.plan.starts[viewer.lastWanted] ?? null,
         network: viewer.network ?? null,
         device: viewer.device ?? null,
         since: new Date(viewer.since).toISOString(),
@@ -1024,7 +1031,7 @@ export class HlsSessions {
     }
     const entry = this.entries.get(variant) ?? this.fromKept(variant, plan, who.title) ?? this.open(variant, plan, who.title);
     entry.idleSince = 0;
-    const viewer: Viewer = { key, entry, user: who.user, title: who.title, itemId: who.itemId, network: who.network, device: who.device, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const viewer: Viewer = { key, entry, user: who.user, title: who.title, itemId: who.itemId, historyId: who.historyId, network: who.network, device: who.device, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
     entry.viewers.add(viewer);
     this.viewers.set(key, viewer);
     const film = this.kept.get(variant);
