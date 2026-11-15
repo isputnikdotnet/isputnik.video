@@ -539,8 +539,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // One scan at a time: scans read a whole disk, and two would only fight over it.
   let scanChain: Promise<void> = Promise.resolve();
-  // A scan the engine was stopped in the middle of (docker stop, a crash) left
-  // its library queued or scanning; nothing is either on start.
+  // A scan the engine was stopped in the middle of (docker stop, an update, a
+  // crash) left its library queued or scanning; nothing is either on start. The
+  // active ones are scanned again once the engine is up (below, by the metadata
+  // pass taken up on start): a scan cut short can leave new titles out and gone
+  // ones listed, and nothing else would look until someone asked for a rescan.
+  const interruptedScans = (db.prepare("SELECT id FROM libraries WHERE scan_state IN ('queued', 'scanning') AND state = 'active'").all() as { id: string }[]).map((row) => row.id);
   db.prepare("UPDATE libraries SET scan_state = 'idle' WHERE scan_state IN ('queued', 'scanning')").run();
   const queued = new Set<string>();
   // Scans and metadata passes queued or running. A restore waits for none: it is
@@ -841,9 +845,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     WHERE metadata.item_id IS NULL OR metadata.checked_at IS NULL OR metadata.tmdb_state IN ('none', 'error')
     LIMIT 1
   `);
+  // A scan cut short is run again; it queues its library's metadata pass when it
+  // finishes, as every scan does, so that library isn't given a second one here.
+  for (const libraryId of interruptedScans) queueScan(libraryId, null);
   if (readTmdbKey(db)) {
     for (const library of listLibraries(db)) {
-      if (library.state === "active" && unfinished.get({ library: library.id })) queueMetadata(library.id, null, false);
+      if (library.state === "active" && !interruptedScans.includes(library.id) && unfinished.get({ library: library.id })) queueMetadata(library.id, null, false);
     }
   }
 

@@ -1,5 +1,8 @@
 // A library from home to the family's screens: home puts it, the engine scans
 // it, and the catalog answers only from the libraries a person may see.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import type { FastifyInstance } from "fastify";
@@ -289,5 +292,55 @@ describe("libraries as home manages them", () => {
     const copy = new Database((await get("/video/api/admin/backup", home)).rawPayload);
     expect((copy.prepare("SELECT COUNT(*) AS n FROM episodes").get() as { n: number }).n).toBe(0);
     copy.close();
+  });
+});
+
+describe("a scan the engine was stopped in", () => {
+  it("is run again on start; a library that wasn't scanning is left alone", async () => {
+    // A database of its own, kept across three runs of the engine.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-rescan-"));
+    const dbPath = path.join(dir, "video.sqlite");
+    const boot = () => buildApp({
+      gatewaySecret: SECRET, devUser: null, dbPath, mediaRoot: fixture.root, version: "0.0.0-test", stage: null,
+      scan: { settleMs: 60_000 }, fastify: { logger: false }
+    });
+    const titles = async (own: FastifyInstance) =>
+      ((await own.inject({ method: "GET", url: "/video/api/movies", headers: as("mum", "member", ["lib_films"]) })).json().items as { title: string }[]).map((film) => film.title);
+    const scanState = () => {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        return (db.prepare("SELECT scan_state FROM libraries WHERE id = 'lib_films'").get() as { scan_state: string }).scan_state;
+      } finally {
+        db.close();
+      }
+    };
+    let own: FastifyInstance | null = await boot();
+    try {
+      await own.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: home, payload: { name: "Films", kind: "movies", folder: "Movies" } });
+      await own.scansSettled();
+      await own.close();
+      own = null;
+      // A film arrives while the engine is down. Nothing watches the disk: only a scan finds it.
+      fixture.write("Movies/A Film Added Later (2020)/A Film Added Later (2020).mkv", "x".repeat(4000));
+
+      // Started with no scan cut short: none runs, so the film isn't listed yet.
+      own = await boot();
+      await own.scansSettled();
+      expect(await titles(own)).not.toContain("A Film Added Later");
+      await own.close();
+      own = null;
+
+      // The engine stopped mid-scan (docker stop, an update): started again, the scan is run again.
+      const db = new Database(dbPath);
+      db.prepare("UPDATE libraries SET scan_state = 'scanning' WHERE id = 'lib_films'").run();
+      db.close();
+      own = await boot();
+      await own.scansSettled();
+      expect(await titles(own)).toContain("A Film Added Later");
+      expect(scanState()).toBe("idle");
+    } finally {
+      await own?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

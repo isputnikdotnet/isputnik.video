@@ -43,7 +43,7 @@ const start = (dbPath: string, mediaRoot: string) => buildApp({
 });
 
 describe("after a scan", () => {
-  it("leaves no library queued or scanning once the engine starts again", async () => {
+  it("scans again what a stop cut short, and leaves no library stuck queued or scanning", async () => {
     fixture = makeFixture();
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-work-"));
     const dbPath = path.join(dataDir, "video.sqlite");
@@ -59,6 +59,9 @@ describe("after a scan", () => {
     db.close();
 
     app = await start(dbPath, fixture.root);
+    // Both are scanned again (library.test.ts: what the cut-short scan missed is
+    // found), then idle — not left saying they scan when nothing does.
+    await app.scansSettled();
     const libraries = (await app.inject({ method: "GET", url: "/video/api/admin/libraries", headers: admin })).json().libraries as { id: string; scanState: string }[];
     expect(libraries.map((library) => [library.id, library.scanState]).sort()).toEqual([["lib_mov", "idle"], ["lib_tv", "idle"]]);
   });
