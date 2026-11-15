@@ -10,6 +10,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 import { bestBackdrop } from "../src/tmdb.js";
+import { saveTmdbKey } from "../src/metadata.js";
 
 const SECRET = "video-secret-video-secret-0123456789";
 const GOOD_KEY = "0123456789abcdef0123456789abcdef";
@@ -484,6 +485,59 @@ describe("with a TMDB key", () => {
     await app.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films renamed", kind: "movies", folder: "Movies", language: "ru" } });
     await app.scansSettled();
     expect(tmdb.asked.length).toBe(now);
+  });
+});
+
+describe("a metadata pass the engine was stopped in", () => {
+  it("is taken up again on start, and a finished library is left alone", async () => {
+    // A database and art folder of their own, kept across three runs of the engine.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-resume-"));
+    const dbPath = path.join(dir, "video.sqlite");
+    const artDir = path.join(dir, "art");
+    const boot = () => buildApp({
+      gatewaySecret: SECRET, devUser: null, dbPath, artDir, mediaRoot: fixture.root, version: "0.0.0-test", stage: null,
+      scan: { settleMs: 60_000 }, fetch: tmdb.fetchImpl, tools: null, fastify: { logger: false }
+    });
+    const states = () => {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        return Object.fromEntries((db.prepare("SELECT tmdb_state, COUNT(*) AS n FROM metadata WHERE kind = 'movie' GROUP BY tmdb_state").all() as { tmdb_state: string; n: number }[]).map((row) => [row.tmdb_state, row.n]));
+      } finally {
+        db.close();
+      }
+    };
+    let own: FastifyInstance | null = await boot();
+    try {
+      await own.inject({ method: "PUT", url: "/video/api/admin/libraries/lib_films", headers: admin, payload: { name: "Films", kind: "movies", folder: "Movies" } });
+      await own.scansSettled();
+      await own.close();
+      own = null;
+      // The key saved, and the engine stopped before its pass got anywhere (a
+      // container update mid-way through thousands of films): nothing asked yet.
+      const db = new Database(dbPath);
+      saveTmdbKey(db, GOOD_KEY);
+      db.close();
+      expect(states().none).toBeGreaterThan(0);
+
+      // Started again: the pass runs without anyone asking for it.
+      const before = tmdb.asked.length;
+      own = await boot();
+      await own.scansSettled();
+      expect(tmdb.asked.slice(before).some((asked) => asked.startsWith("/3/search/movie"))).toBe(true);
+      expect(states().none).toBeUndefined();
+      expect(states().matched).toBeGreaterThan(0);
+      await own.close();
+      own = null;
+
+      // Started once more with nothing due: TMDB isn't asked anything.
+      const after = tmdb.asked.length;
+      own = await boot();
+      await own.scansSettled();
+      expect(tmdb.asked.length).toBe(after);
+    } finally {
+      await own?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

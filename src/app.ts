@@ -826,6 +826,27 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     }).finally(() => { catalogWork -= 1; });
   };
 
+  // A metadata pass the engine was stopped in the middle of (docker stop, an
+  // update, a crash) isn't lost with it: nothing else would ask again until the
+  // next scan, and a first pass over thousands of films takes long enough to be
+  // cut short. So on start, with a key, every active library that still has a
+  // film or show TMDB hasn't answered for — no metadata yet, or 'none'/'error' —
+  // gets an ordinary pass. Nothing due, no pass: a plain restart asks TMDB nothing.
+  const unfinished = db.prepare(`
+    SELECT 1 FROM (
+      SELECT id FROM movies WHERE library_id = @library
+      UNION ALL SELECT id FROM shows WHERE library_id = @library
+    ) AS title
+    LEFT JOIN metadata ON metadata.item_id = title.id
+    WHERE metadata.item_id IS NULL OR metadata.checked_at IS NULL OR metadata.tmdb_state IN ('none', 'error')
+    LIMIT 1
+  `);
+  if (readTmdbKey(db)) {
+    for (const library of listLibraries(db)) {
+      if (library.state === "active" && unfinished.get({ library: library.id })) queueMetadata(library.id, null, false);
+    }
+  }
+
   // ── Open to the gateway's probes ─────────────────────────────────────────
 
   app.get(`${API}/health`, async () => ({ ok: true, version: options.version }));
