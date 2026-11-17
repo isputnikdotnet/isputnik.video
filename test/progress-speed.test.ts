@@ -1,9 +1,12 @@
 // How fast a conversion is going right now (hls.ts progressSpeed, from ffmpeg's
 // -progress), and what the GPU encodes as vainfo lists it (hardware.ts) — both for
 // home's Diagnostics › Video page.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { addProgress, ffmpegArgs, progressSpeed, SPEED_WINDOW_MS, type ProgressSample } from "../src/hls.js";
-import { encodeFormatsOf } from "../src/hardware.js";
+import { cpuDecodersOf, encodeFormatsOf, maxDecodeOf, pciOf } from "../src/hardware.js";
 
 describe("a run's speed", () => {
   it("is film written over the time it took, across the last few seconds", () => {
@@ -34,6 +37,23 @@ describe("a run's speed", () => {
   });
 });
 
+describe("which card it is", () => {
+  it("reads the render node's PCI ids from sysfs", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-sys-"));
+    try {
+      const dir = path.join(root, "renderD128", "device");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "vendor"), "0x8086\n");
+      fs.writeFileSync(path.join(dir, "device"), "0x56A5\n");
+      expect(pciOf("/dev/dri/renderD128", root)).toEqual({ vendor: "0x8086", device: "0x56a5" });
+      expect(pciOf("/dev/dri/renderD129", root)).toBeNull();
+      expect(pciOf(null, root)).toBeNull();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("what the GPU encodes", () => {
   it("reads the encode entrypoints vainfo lists", () => {
     const vainfo = [
@@ -47,6 +67,38 @@ describe("what the GPU encodes", () => {
       "      VAProfileAV1Profile0            :	VAEntrypointVLD"
     ].join("\n");
     expect(encodeFormatsOf(vainfo)).toEqual(["h264", "hevc"]);
+    expect(encodeFormatsOf("      VAProfileJPEGBaseline           :	VAEntrypointEncPicture")).toEqual(["mjpeg"]);
     expect(encodeFormatsOf("")).toEqual([]);
+  });
+
+  it("reads the largest picture it decodes from vainfo --all", () => {
+    const all = [
+      "VAProfileH264High/VAEntrypointVLD",
+      "    VAConfigAttribRTFormat                 : VA_RT_FORMAT_YUV420",
+      "    VAConfigAttribMaxPictureWidth          : 4096",
+      "    VAConfigAttribMaxPictureHeight         : 4096",
+      "VAProfileHEVCMain/VAEntrypointVLD",
+      "    VAConfigAttribMaxPictureWidth          : 8192",
+      "    VAConfigAttribMaxPictureHeight         : 8192",
+      "VAProfileHEVCMain/VAEntrypointEncSlice",
+      "    VAConfigAttribMaxPictureWidth          : 16384",
+      "    VAConfigAttribMaxPictureHeight         : 16384"
+    ].join("\n");
+    expect(maxDecodeOf(all)).toEqual({ width: 8192, height: 8192 });
+    expect(maxDecodeOf("vainfo: unrecognized option '--all'")).toBeNull();
+  });
+
+  it("names what the CPU can still decode", () => {
+    const list = [
+      "Decoders:",
+      " V..... = Video",
+      " ------",
+      " VFS..D h264                 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+      " V....D mpeg4                MPEG-4 part 2",
+      " V....D vp8                  On2 VP8",
+      " A....D aac                  AAC (Advanced Audio Coding)"
+    ].join("\n");
+    expect(cpuDecodersOf(list)).toEqual(["vp8", "mpeg4", "h264"]);
+    expect(cpuDecodersOf(`${list}\n V....D vvc                  VVC (Versatile Video Coding)`)).toEqual(["vvc", "vp8", "mpeg4", "h264"]);
   });
 });

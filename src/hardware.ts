@@ -21,7 +21,12 @@ export type HardwareMode = "auto" | "cpu" | "gpu";
  *  profiles apart too: a driver may decode Main and High and not them, and
  *  ffmpeg then decodes on the CPU without a word, which scale_vaapi refuses
  *  ("Function not implemented"; the hardware test's 720p case on an Intel Arc). */
-export type DecodeKey = "h264" | "h264_baseline" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video" | "vc1";
+export type DecodeKey = "h264" | "h264_baseline" | "hevc" | "hevc10" | "hevc12" | "vp9" | "vp9_10" | "vp9_12" | "av1" | "av1_10" | "mpeg2video" | "vc1" | "mjpeg";
+
+/** Decoders of the engine's ffmpeg worth naming to the admin: what the CPU falls
+ *  back to for what no GPU decodes (VVC only in ffmpeg 7.1 and later). */
+export const CPU_DECODERS = ["vvc", "vp8", "mpeg4", "h264"] as const;
+export type CpuDecoder = (typeof CPU_DECODERS)[number];
 
 /** The formats vainfo lists an encode entrypoint for (VAEntrypointEncSlice, or
  *  the low-power EncSliceLP), by decode's keys. */
@@ -32,7 +37,8 @@ const ENCODE_PROFILES: { key: DecodeKey; profile: RegExp }[] = [
   { key: "vp9", profile: /VAProfileVP9Profile0\s*:\s*VAEntrypointEncSlice/ },
   { key: "vp9_10", profile: /VAProfileVP9Profile2\s*:\s*VAEntrypointEncSlice/ },
   { key: "av1", profile: /VAProfileAV1Profile0\s*:\s*VAEntrypointEncSlice/ },
-  { key: "mpeg2video", profile: /VAProfileMPEG2(Simple|Main)\s*:\s*VAEntrypointEncSlice/ }
+  { key: "mpeg2video", profile: /VAProfileMPEG2(Simple|Main)\s*:\s*VAEntrypointEncSlice/ },
+  { key: "mjpeg", profile: /VAProfileJPEGBaseline\s*:\s*VAEntrypointEncPicture/ }
 ];
 
 /** What vainfo's list says the GPU encodes. */
@@ -51,11 +57,18 @@ export interface GpuCapabilities {
   device: string | null;
   /** The VAAPI driver, from vainfo, when it says. */
   driver: string | null;
+  /** The render node's PCI ids (sysfs), e.g. { vendor: "0x8086", device: "0x56a5" }:
+   *  which card it is, for home's picture of it. Null where sysfs doesn't say. */
+  pci?: { vendor: string; device: string } | null;
   /** Encodes H.264 with keyframes where asked: what a GPU conversion needs. */
   encode: boolean;
   /** Every format vainfo says it encodes (an encode entrypoint), for the admin's
    *  capabilities table; conversions only ever make H.264. Absent without vainfo. */
   encodeFormats?: DecodeKey[];
+  /** The largest picture it decodes (vainfo --all), for "4K"/"8K"; null where vainfo doesn't say. */
+  maxDecode?: { width: number; height: number } | null;
+  /** Which of CPU_DECODERS the engine's ffmpeg has: what the CPU can still play. */
+  cpuDecoders?: CpuDecoder[];
   decode: DecodeKey[];
   /** Tone-maps HDR to SDR (tonemap_vaapi) on what it decodes: else the CPU does (H2). */
   tonemap?: boolean;
@@ -88,7 +101,14 @@ const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
   { key: "vp9", args: ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-deadline", "realtime"], ext: "webm" },
   { key: "vp9_10", args: ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p10le", "-deadline", "realtime"], ext: "webm" },
   { key: "av1", args: ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p", "-preset", "12"], ext: "mp4" },
-  { key: "mpeg2video", args: ["-c:v", "mpeg2video", "-pix_fmt", "yuv420p"], ext: "ts" }
+  { key: "mpeg2video", args: ["-c:v", "mpeg2video", "-pix_fmt", "yuv420p"], ext: "ts" },
+  // Only where this ffmpeg's encoders make them (x265 and libvpx built for 12-bit):
+  // without a sample the CPU decodes them, as before.
+  { key: "hevc12", args: ["-c:v", "libx265", "-pix_fmt", "yuv420p12le", "-x265-params", "log-level=error"], ext: "mp4" },
+  { key: "vp9_12", args: ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p12le", "-deadline", "realtime"], ext: "webm" },
+  { key: "av1_10", args: ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le", "-preset", "12"], ext: "mp4" },
+  // Motion JPEG, as old cameras made it: 4:2:0 only (decodeKeyOf), the GPU's JPEG decoder.
+  { key: "mjpeg", args: ["-c:v", "mjpeg", "-pix_fmt", "yuvj420p"], ext: "avi" }
 ];
 
 const TEST_TIMEOUT_MS = 20_000;
@@ -123,13 +143,17 @@ export function findDevice(env: NodeJS.ProcessEnv = process.env, dir = "/dev/dri
 export function decodeKeyOf(info: MediaInfo): DecodeKey | null {
   const video = info.video;
   if (!video) return null;
-  const tenBit = /10|12/.test(video.pixelFormat ?? "");
+  const pixelFormat = video.pixelFormat ?? "";
+  // 12-bit apart from 10: a GPU that decodes one may not the other.
+  const depth = /12/.test(pixelFormat) ? 12 : /10/.test(pixelFormat) ? 10 : 8;
   switch (video.codec) {
     // ffprobe says "Baseline" or "Constrained Baseline" (x264's ultrafast makes it).
-    case "h264": return tenBit ? null : /baseline/i.test(video.profile ?? "") ? "h264_baseline" : "h264";
-    case "hevc": return tenBit ? "hevc10" : "hevc";
-    case "vp9": return tenBit ? "vp9_10" : "vp9";
-    case "av1": return tenBit ? null : "av1";
+    case "h264": return depth > 8 ? null : /baseline/i.test(video.profile ?? "") ? "h264_baseline" : "h264";
+    case "hevc": return depth === 12 ? "hevc12" : depth === 10 ? "hevc10" : "hevc";
+    case "vp9": return depth === 12 ? "vp9_12" : depth === 10 ? "vp9_10" : "vp9";
+    case "av1": return depth === 12 ? null : depth === 10 ? "av1_10" : "av1";
+    // A camera's Motion JPEG: 4:2:0 only, the one the GPU's JPEG decoder is sure to take.
+    case "mjpeg": return /^yuvj?420p$/.test(pixelFormat) ? "mjpeg" : null;
     case "mpeg2video": return "mpeg2video";
     // WMV3 is VC-1's Main profile.
     case "vc1":
@@ -142,11 +166,49 @@ export function decodeKeyOf(info: MediaInfo): DecodeKey | null {
 export const deviceArgs = (device: string) => ["-init_hw_device", `vaapi=va:${device}`, "-filter_hw_device", "va"];
 
 /** Finds out what the GPU does in this container, by trying it. */
-export async function detectGpu(tools: Tools, options: { device?: string | null; vainfo?: string | null; run?: Runner; workDir?: string } = {}): Promise<GpuCapabilities> {
+/** Which of CPU_DECODERS an ffmpeg's `-decoders` list has. */
+export function cpuDecodersOf(list: string): CpuDecoder[] {
+  const names = new Set([...list.matchAll(/^\s*V\S*\s+(\S+)/gm)].map((match) => match[1]));
+  return CPU_DECODERS.filter((name) => names.has(name));
+}
+
+/** The largest picture vainfo --all says it decodes (VAEntrypointVLD's
+ *  MaxPictureWidth/Height, across profiles); null when it doesn't say. */
+export function maxDecodeOf(all: string): { width: number; height: number } | null {
+  let best: { width: number; height: number } | null = null;
+  // A block per profile/entrypoint: its name at the line's start, its attributes indented.
+  for (const block of all.split(/\n(?=\S)/)) {
+    if (!/VAEntrypointVLD/.test(block.split("\n")[0])) continue;
+    const width = Number(block.match(/MaxPictureWidth\s*:\s*(\d+)/)?.[1] ?? NaN);
+    const height = Number(block.match(/MaxPictureHeight\s*:\s*(\d+)/)?.[1] ?? NaN);
+    if (Number.isFinite(width) && Number.isFinite(height) && (!best || width * height > best.width * best.height)) best = { width, height };
+  }
+  return best;
+}
+
+/** A render node's PCI vendor and device ids, as sysfs has them (/sys/class/drm/renderD128/device/…). */
+export function pciOf(device: string | null, sysRoot = "/sys/class/drm"): { vendor: string; device: string } | null {
+  if (!device) return null;
+  try {
+    const dir = path.join(sysRoot, path.basename(device), "device");
+    const read = (name: string) => fs.readFileSync(path.join(dir, name), "utf8").trim().toLowerCase();
+    const vendor = read("vendor");
+    const id = read("device");
+    return /^0x[0-9a-f]{4}$/.test(vendor) && /^0x[0-9a-f]{4}$/.test(id) ? { vendor, device: id } : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function detectGpu(tools: Tools, options: { device?: string | null; vainfo?: string | null; run?: Runner; workDir?: string; sysRoot?: string } = {}): Promise<GpuCapabilities> {
   const run = options.run ?? runTool;
   const checkedAt = new Date().toISOString();
   const device = options.device === undefined ? findDevice() : options.device;
-  const none = (error: string): GpuCapabilities => ({ device, driver: null, encode: false, decode: [], error, checkedAt });
+  const pci = pciOf(device, options.sysRoot);
+  // What the CPU can play whatever the GPU does.
+  const decoders = await run(tools.ffmpeg, ["-hide_banner", "-decoders"], TEST_TIMEOUT_MS);
+  const cpuDecoders = decoders.ok ? cpuDecodersOf(decoders.out) : undefined;
+  const none = (error: string): GpuCapabilities => ({ device, driver: null, pci, encode: false, decode: [], ...(cpuDecoders ? { cpuDecoders } : {}), error, checkedAt });
   if (!device) return none("No GPU: /dev/dri is not passed to the container");
   if (!options.run) {
     try {
@@ -158,11 +220,15 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
 
   let driver: string | null = null;
   let profiles = "";
+  let maxDecode: { width: number; height: number } | null = null;
   const vainfo = options.vainfo === undefined ? vainfoPath(tools) : options.vainfo;
   if (vainfo) {
     const answer = await run(vainfo, ["--display", "drm", "--device", device], TEST_TIMEOUT_MS);
     driver = answer.out.match(/Driver version:\s*(.+)/)?.[1]?.trim() ?? null;
     profiles = answer.out;
+    // Each profile's limits, the largest picture among them: an older vainfo has no --all.
+    const all = await run(vainfo, ["--display", "drm", "--device", device, "--all"], TEST_TIMEOUT_MS);
+    maxDecode = all.ok ? maxDecodeOf(all.out) : null;
   }
 
   // The encode a conversion makes: H.264 on the GPU, with keyframes forced.
@@ -229,7 +295,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
   } finally {
     fs.rmSync(extra, { recursive: true, force: true });
   }
-  return { device, driver, encode: true, decode, ...(profiles ? { encodeFormats: encodeFormatsOf(profiles) } : {}), tonemap, overlay, error: null, checkedAt };
+  return { device, driver, pci, encode: true, decode, ...(profiles ? { encodeFormats: encodeFormatsOf(profiles), maxDecode } : {}), ...(cpuDecoders ? { cpuDecoders } : {}), tonemap, overlay, error: null, checkedAt };
 }
 
 /** vainfo beside ffmpeg (a build that ships its own), else on the PATH. */
@@ -264,6 +330,8 @@ const FAILURES_KEPT = 10;
 
 export interface HardwareState extends GpuCapabilities {
   mode: HardwareMode;
+  /** The CPU's model (os.cpus()), for the picture when the CPU converts. */
+  cpu: string | null;
   checking: boolean;
   /** Automatic stopped using the GPU after failures, until Check again. */
   setAside: boolean;
@@ -371,6 +439,6 @@ export class Hardware {
 
   state(): HardwareState {
     const caps = this.caps ?? { device: null, driver: null, encode: false, decode: [], error: this.mode === "cpu" ? null : "Not checked yet", checkedAt: "" };
-    return { ...caps, mode: this.mode, checking: this.checking !== null, setAside: this.setAside };
+    return { ...caps, mode: this.mode, cpu: os.cpus()[0]?.model.trim() || null, checking: this.checking !== null, setAside: this.setAside };
   }
 }

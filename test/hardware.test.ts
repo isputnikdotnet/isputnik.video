@@ -48,6 +48,13 @@ describe("which codec a film's picture is, for the decode test", () => {
     expect(decodeKeyOf(film("vc1", "yuv420p"))).toBe("vc1");
     expect(decodeKeyOf(film("wmv3", "yuv420p"))).toBe("vc1");
     expect(decodeKeyOf(film("mpeg4", "yuv420p"))).toBeNull();
+    // 12-bit apart from 10; AV1 10-bit its own; Motion JPEG only 4:2:0.
+    expect(decodeKeyOf(film("hevc", "yuv420p12le"))).toBe("hevc12");
+    expect(decodeKeyOf(film("vp9", "yuv420p12le"))).toBe("vp9_12");
+    expect(decodeKeyOf(film("av1", "yuv420p10le"))).toBe("av1_10");
+    expect(decodeKeyOf(film("av1", "yuv420p12le"))).toBeNull();
+    expect(decodeKeyOf(film("mjpeg", "yuvj420p"))).toBe("mjpeg");
+    expect(decodeKeyOf(film("mjpeg", "yuvj422p"))).toBeNull();
   });
 
   it("files H.264's Baseline profiles apart: a GPU may decode High and not them", async () => {
@@ -290,7 +297,8 @@ describe("finding out what the GPU does", () => {
     });
     expect(caps).toMatchObject({ device: "/dev/dri/renderD128", driver: "Intel iHD driver for Intel(R) Gen Graphics - 24.1.0", encode: true, error: null });
     // VC-1 can't be sampled (ffmpeg has no encoder for it): vainfo's word for it is taken.
-    expect(caps.decode).toEqual(["h264", "hevc", "hevc10", "vp9", "mpeg2video", "vc1"]);
+    // 12-bit HEVC and VP9 and Motion JPEG decode too (no AV1, 10-bit or not: no encoder for its sample).
+    expect(caps.decode).toEqual(["h264", "hevc", "hevc10", "vp9", "mpeg2video", "hevc12", "vp9_12", "mjpeg", "vc1"]);
     expect(calls.find((call) => call.includes("h264_vaapi"))).toEqual(expect.arrayContaining(["-force_key_frames", "0,0.5"]));
     // 10-bit HEVC decodes, so tone mapping was tried; and drawing a subtitle.
     expect(caps).toMatchObject({ tonemap: true, overlay: true });
