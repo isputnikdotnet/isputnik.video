@@ -23,6 +23,23 @@ export type HardwareMode = "auto" | "cpu" | "gpu";
  *  ("Function not implemented"; the hardware test's 720p case on an Intel Arc). */
 export type DecodeKey = "h264" | "h264_baseline" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video" | "vc1";
 
+/** The formats vainfo lists an encode entrypoint for (VAEntrypointEncSlice, or
+ *  the low-power EncSliceLP), by decode's keys. */
+const ENCODE_PROFILES: { key: DecodeKey; profile: RegExp }[] = [
+  { key: "h264", profile: /VAProfileH264(Main|High|ConstrainedBaseline)\s*:\s*VAEntrypointEncSlice/ },
+  { key: "hevc", profile: /VAProfileHEVCMain\s*:\s*VAEntrypointEncSlice/ },
+  { key: "hevc10", profile: /VAProfileHEVCMain10\s*:\s*VAEntrypointEncSlice/ },
+  { key: "vp9", profile: /VAProfileVP9Profile0\s*:\s*VAEntrypointEncSlice/ },
+  { key: "vp9_10", profile: /VAProfileVP9Profile2\s*:\s*VAEntrypointEncSlice/ },
+  { key: "av1", profile: /VAProfileAV1Profile0\s*:\s*VAEntrypointEncSlice/ },
+  { key: "mpeg2video", profile: /VAProfileMPEG2(Simple|Main)\s*:\s*VAEntrypointEncSlice/ }
+];
+
+/** What vainfo's list says the GPU encodes. */
+export function encodeFormatsOf(vainfo: string): DecodeKey[] {
+  return ENCODE_PROFILES.filter((entry) => entry.profile.test(vainfo)).map((entry) => entry.key);
+}
+
 /** Codecs ffmpeg can decode but not make a sample of: what vainfo lists for them
  *  is taken as it says (a VAAPI decode profile, VAEntrypointVLD). */
 const LISTED_ONLY: { key: DecodeKey; profile: RegExp }[] = [
@@ -36,6 +53,9 @@ export interface GpuCapabilities {
   driver: string | null;
   /** Encodes H.264 with keyframes where asked: what a GPU conversion needs. */
   encode: boolean;
+  /** Every format vainfo says it encodes (an encode entrypoint), for the admin's
+   *  capabilities table; conversions only ever make H.264. Absent without vainfo. */
+  encodeFormats?: DecodeKey[];
   decode: DecodeKey[];
   /** Tone-maps HDR to SDR (tonemap_vaapi) on what it decodes: else the CPU does (H2). */
   tonemap?: boolean;
@@ -209,7 +229,7 @@ export async function detectGpu(tools: Tools, options: { device?: string | null;
   } finally {
     fs.rmSync(extra, { recursive: true, force: true });
   }
-  return { device, driver, encode: true, decode, tonemap, overlay, error: null, checkedAt };
+  return { device, driver, encode: true, decode, ...(profiles ? { encodeFormats: encodeFormatsOf(profiles) } : {}), tonemap, overlay, error: null, checkedAt };
 }
 
 /** vainfo beside ffmpeg (a build that ships its own), else on the PATH. */

@@ -2019,6 +2019,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       rung: viewer.rung ?? null,
       hdr: viewer.hdr ?? false,
       converting: viewer.converting,
+      speed: viewer.speed ?? null,
       shared: viewer.shared ?? false,
       kept: viewer.kept ?? false
     }));

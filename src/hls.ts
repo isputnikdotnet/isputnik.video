@@ -170,11 +170,12 @@ export interface JobEncode {
  *  until the next subtitle. */
 export const CHANGED_CANVAS = "format=bgra,select='gt(scene,0)+not(mod(n,6))'";
 
-export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null, job: JobEncode | null = null): string[] {
+export function ffmpegArgs(plan: HlsPlan, from: number, outDir: string, gpuRun: GpuRun | null = null, whole: WholeFile | null = null, job: JobEncode | null = null, progress = false): string[] {
   const { info, delivery } = plan;
   const args = ["-hide_banner", "-nostdin", "-v", "error", "-y"];
-  // A whole file says how far it is on its standard output, for whoever waits.
-  if (whole) args.push("-nostats", "-progress", "pipe:1");
+  // A whole file says how far it is on its standard output, for whoever waits; a
+  // viewer's run too, for how fast it converts (progressSpeed).
+  if (whole || progress) args.push("-nostats", "-progress", "pipe:1");
   const gpu = delivery.videoCopy || !info.video ? null : gpuRun;
   if (gpu) {
     args.push(...deviceArgs(gpu.device));
@@ -354,6 +355,8 @@ export interface ConversionViewer {
   /** The quality rung the picture is held under; null for the file as it is. */
   rung: Rung | null;
   converting: boolean;
+  /** How many times faster than real time their run converts lately; null when it isn't, or not yet known. */
+  speed: number | null;
   /** What their version holds (shared with whoever watches it too). */
   memoryBytes: number;
   diskBytes: number;
@@ -421,6 +424,38 @@ interface Run {
   writing: number;
   /** A job's run, stood still while someone watches converted video. */
   paused?: boolean;
+  /** How far it had got, now and then (ffmpeg's -progress): its speed is worked out from them. */
+  progress: ProgressSample[];
+}
+
+/** A moment of a run: when (ms) and how far into the film it had written (µs). */
+export interface ProgressSample {
+  at: number;
+  out: number;
+}
+
+/** How long a stretch the speed is measured over: "right now", not since the run began. */
+export const SPEED_WINDOW_MS = 10_000;
+
+/** How many times faster than real time a run converts lately: film written over
+ *  the time it took, across the last SPEED_WINDOW_MS. ffmpeg's own speed= is its
+ *  average since it started, which a slow start or a stand-still drags down for
+ *  long after. Null until two samples a second apart. */
+export function progressSpeed(samples: readonly ProgressSample[]): number | null {
+  if (samples.length < 2) return null;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const wall = last.at - first.at;
+  if (wall < 1000) return null;
+  const speed = (last.out - first.out) / 1000 / wall;
+  return Number.isFinite(speed) && speed >= 0 ? Math.round(speed * 100) / 100 : null;
+}
+
+/** A run's new sample: the window kept to SPEED_WINDOW_MS (and one before it, to measure from). */
+export function addProgress(samples: ProgressSample[], sample: ProgressSample): ProgressSample[] {
+  const kept = [...samples, sample];
+  while (kept.length > 2 && sample.at - kept[1].at >= SPEED_WINDOW_MS) kept.shift();
+  return kept;
 }
 
 /** How a background fill stands. */
@@ -819,6 +854,7 @@ export class HlsSessions {
         hdr: !entry.plan.delivery.videoCopy && hdrOf(entry.plan.info.video) !== null,
         rung: entry.plan.delivery.rung,
         converting: viewer.run !== null,
+        speed: viewer.run ? progressSpeed(viewer.run.progress) : null,
         memoryBytes: entry.memoryBytes,
         diskBytes: sumOf(entry.onDisk),
         shared: entry.viewers.size > 1,
@@ -1103,7 +1139,7 @@ export class HlsSessions {
     const gpu = entry.cpuOnly ? null : this.hardware?.choose(entry.plan.info, entry.plan.delivery) ?? null;
     const dir = path.join(entry.dir, `run-${++this.runCount}`);
     fs.mkdirSync(dir, { recursive: true });
-    const args = ffmpegArgs(entry.plan, from, dir, gpu, null, job?.encode ?? null);
+    const args = ffmpegArgs(entry.plan, from, dir, gpu, null, job?.encode ?? null, true);
     // Detailed: why it converts, and where; Everything: the whole command.
     this.log.debug?.({
       item: entry.plan.itemId, from, mode: entry.plan.delivery.mode, reasons: entry.plan.delivery.reasons,
@@ -1112,10 +1148,23 @@ export class HlsSessions {
     }, "Conversion plan");
     this.log.trace?.({ item: entry.plan.itemId, command: [this.tools.ffmpeg, ...args].join(" ") }, "ffmpeg command");
     const polite = Boolean(job?.polite) && process.platform !== "win32";
-    const proc = spawn(polite ? "nice" : this.tools.ffmpeg, polite ? ["-n", "15", this.tools.ffmpeg, ...args] : args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
-    const run: Run = { entry, owner: viewer, proc, dir, gpu, from, writing: from - 1 };
+    const proc = spawn(polite ? "nice" : this.tools.ffmpeg, polite ? ["-n", "15", this.tools.ffmpeg, ...args] : args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const run: Run = { entry, owner: viewer, proc, dir, gpu, from, writing: from - 1, progress: [] };
     entry.runs.add(run);
     viewer.run = run;
+    // How far it has got (-progress): a sample each time it says, for its speed.
+    // A run stood still starts measuring afresh when it goes on.
+    let pending = "";
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      pending += chunk.toString();
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        const out = line.match(/^out_time_us=(\d+)/)?.[1];
+        if (!out) continue;
+        run.progress = run.paused ? [] : addProgress(run.progress, { at: Date.now(), out: Number(out) });
+      }
+    });
     let stderr = "";
     proc.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000); });
     proc.on("error", (err) => {
