@@ -17,8 +17,11 @@ import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 export type HardwareMode = "auto" | "cpu" | "gpu";
 
 /** Codecs the decode test knows, by the name delivery and the probe use, with
- *  10-bit apart: a GPU can decode 8-bit HEVC and not 10-bit. */
-export type DecodeKey = "h264" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video" | "vc1";
+ *  10-bit apart: a GPU can decode 8-bit HEVC and not 10-bit. H.264's Baseline
+ *  profiles apart too: a driver may decode Main and High and not them, and
+ *  ffmpeg then decodes on the CPU without a word, which scale_vaapi refuses
+ *  ("Function not implemented"; the hardware test's 720p case on an Intel Arc). */
+export type DecodeKey = "h264" | "h264_baseline" | "hevc" | "hevc10" | "vp9" | "vp9_10" | "av1" | "mpeg2video" | "vc1";
 
 /** Codecs ffmpeg can decode but not make a sample of: what vainfo lists for them
  *  is taken as it says (a VAAPI decode profile, VAEntrypointVLD). */
@@ -59,6 +62,7 @@ export const TONEMAP_VAAPI = "tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709"
 /** A sample of each codec, as the CPU makes it, for the decode test. */
 const SAMPLES: { key: DecodeKey; args: string[]; ext: string }[] = [
   { key: "h264", args: ["-c:v", "libx264", "-pix_fmt", "yuv420p"], ext: "mp4" },
+  { key: "h264_baseline", args: ["-c:v", "libx264", "-profile:v", "baseline", "-pix_fmt", "yuv420p"], ext: "mp4" },
   { key: "hevc", args: ["-c:v", "libx265", "-pix_fmt", "yuv420p", "-x265-params", "log-level=error"], ext: "mp4" },
   { key: "hevc10", args: ["-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error"], ext: "mp4" },
   { key: "vp9", args: ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-deadline", "realtime"], ext: "webm" },
@@ -101,7 +105,8 @@ export function decodeKeyOf(info: MediaInfo): DecodeKey | null {
   if (!video) return null;
   const tenBit = /10|12/.test(video.pixelFormat ?? "");
   switch (video.codec) {
-    case "h264": return tenBit ? null : "h264";
+    // ffprobe says "Baseline" or "Constrained Baseline" (x264's ultrafast makes it).
+    case "h264": return tenBit ? null : /baseline/i.test(video.profile ?? "") ? "h264_baseline" : "h264";
     case "hevc": return tenBit ? "hevc10" : "hevc";
     case "vp9": return tenBit ? "vp9_10" : "vp9";
     case "av1": return tenBit ? null : "av1";

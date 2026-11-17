@@ -49,6 +49,25 @@ describe("which codec a film's picture is, for the decode test", () => {
     expect(decodeKeyOf(film("wmv3", "yuv420p"))).toBe("vc1");
     expect(decodeKeyOf(film("mpeg4", "yuv420p"))).toBeNull();
   });
+
+  it("files H.264's Baseline profiles apart: a GPU may decode High and not them", async () => {
+    const h264 = (profile: string | null): MediaInfo => {
+      const info = film("h264", "yuv420p");
+      return { ...info, video: { ...info.video!, profile } };
+    };
+    expect(decodeKeyOf(h264("Constrained Baseline"))).toBe("h264_baseline");
+    expect(decodeKeyOf(h264("Baseline"))).toBe("h264_baseline");
+    expect(decodeKeyOf(h264("High"))).toBe("h264");
+    expect(decodeKeyOf(h264(null))).toBe("h264");
+    // An Intel Arc decodes High and not Constrained Baseline: shrunk to 720p for
+    // someone away from home, the CPU decodes that one and the GPU only encodes.
+    const hardware = await hardwareWith(found());
+    const baseline = h264("Constrained Baseline");
+    expect(hardware.choose(baseline, decideDelivery(baseline, ".mkv", null, null, 720))).toMatchObject({ decode: false });
+    const high = h264("High");
+    expect(hardware.choose(high, decideDelivery(high, ".mkv", null, null, 720))).toMatchObject({ decode: true });
+    expect((await hardwareWith(found({ decode: ["h264", "h264_baseline"] }))).choose(baseline, decideDelivery(baseline, ".mkv", null, null, 720))).toMatchObject({ decode: true });
+  });
 });
 
 describe("where a film is converted", () => {
@@ -264,6 +283,8 @@ describe("finding out what the GPU does", () => {
         // No AV1 encoder in this ffmpeg; HEVC 10-bit made, but not decoded on the GPU.
         if (joined.includes("libsvtav1")) return { ok: false, out: "Unknown encoder 'libsvtav1'" };
         if (joined.includes("-hwaccel") && joined.includes("vp9_10.webm")) return { ok: false, out: "Impossible to convert between the formats" };
+        // H.264 High decodes, Constrained Baseline doesn't (an Intel Arc's 720p test case).
+        if (joined.includes("-hwaccel") && joined.includes("h264_baseline.mp4")) return { ok: false, out: "Function not implemented" };
         return { ok: true, out: "" };
       }
     });
