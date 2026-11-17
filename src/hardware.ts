@@ -20,7 +20,9 @@ export type HardwareMode = "auto" | "cpu" | "gpu";
  *  10-bit apart: a GPU can decode 8-bit HEVC and not 10-bit. H.264's Baseline
  *  profiles apart too: a driver may decode Main and High and not them, and
  *  ffmpeg then decodes on the CPU without a word, which scale_vaapi refuses
- *  ("Function not implemented"; the hardware test's 720p case on an Intel Arc). */
+ *  ("Function not implemented"). (Not what failed the hardware test's 720p case
+ *  on an Arc and a Kaby Lake, as first thought: both decode Baseline; that was
+ *  -stream_loop, hardware-test.ts.) */
 export type DecodeKey = "h264" | "h264_baseline" | "hevc" | "hevc10" | "hevc12" | "vp9" | "vp9_10" | "vp9_12" | "av1" | "av1_10" | "mpeg2video" | "vc1" | "mjpeg";
 
 /** Decoders of the engine's ffmpeg worth naming to the admin: what the CPU falls

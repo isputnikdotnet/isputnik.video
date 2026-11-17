@@ -9,7 +9,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { openDatabase, upgradeDatabase } from "../src/db.js";
 import { findTools } from "../src/ffmpeg.js";
-import { describeChange, listChanges, noteHardware, suggestViewers, verdictOf, type HardwareFingerprint, type Scenario } from "../src/hardware-test.js";
+import { concatList, copiesFor, describeChange, listChanges, noteHardware, suggestViewers, verdictOf, type HardwareFingerprint, type Scenario } from "../src/hardware-test.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
 
 describe("what the numbers mean", () => {
@@ -23,6 +23,19 @@ describe("what the numbers mean", () => {
     // Too slow for 4K at all: what 1080p allows.
     expect(suggestViewers([step("4k-hdr", 0), step("1080p-hevc", 3)])).toBe(3);
     expect(suggestViewers([step("4k-hdr", 0)])).toBeNull();
+  });
+});
+
+describe("the clip, over and over", () => {
+  it("names it often enough to keep the fastest case busy, from a concat list ffmpeg reads", () => {
+    // 15 s at up to 100x real time, from a 20 s clip: 75 copies.
+    expect(copiesFor(15_000, 20)).toBe(75);
+    expect(copiesFor(15_000, null)).toBe(75);
+    expect(copiesFor(100, 600)).toBe(2);
+    expect(copiesFor(15_000, 0.01)).toBe(1000);
+    // A quote in the path closes, escapes and reopens; Windows separators go forward.
+    const line = String.raw`file '/tmp/it'\''s/clip.mkv'`;
+    expect(concatList(path.join("/tmp", "it's", "clip.mkv"), 2)).toBe(`${line}\n${line}\n`);
   });
 });
 

@@ -203,7 +203,7 @@ export async function ensureSamples(
       const partial = `${file}.part${scenario.ext}`;
       const answer = await runTool(tools.ffmpeg, [
         "-hide_banner", "-v", "error", "-y",
-        "-f", "lavfi", "-i", `testsrc2=size=${scenario.width}x${scenario.height}:rate=24`,
+        "-f", "lavfi", "-i", `testsrc2=size=${scenario.width}x${scenario.height}:rate=${CLIP_FPS}`,
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
         "-t", String(limits.clipSeconds), "-map", "0:v", "-map", "1:a", ...encoder, ...scenario.audio, partial
       ], limits.makeMs, signal);
@@ -219,6 +219,25 @@ export async function ensureSamples(
     made.set(scenario.id, error ? { skipped: `This ffmpeg can't make the clip: ${error}` } : { file });
   }
   return made;
+}
+
+/** Every clip is made at this rate, so its frames say how much film was converted. */
+export const CLIP_FPS = 24;
+
+/** The fastest a case is expected to go (×real time): the list holds enough of
+ *  the clip to keep that busy for the whole run. */
+const FASTEST = 100;
+
+/** How many times the list names the clip. */
+export function copiesFor(limitMs: number, clipSeconds: number | null): number {
+  const seconds = clipSeconds && clipSeconds > 0 ? clipSeconds : 20;
+  return Math.min(1000, Math.max(2, Math.ceil(((limitMs / 1000) * FASTEST) / seconds)));
+}
+
+/** A concat demuxer list naming `file` `copies` times, quoted as it wants. */
+export function concatList(file: string, copies: number): string {
+  const quoted = `'${file.split(path.sep).join("/").replace(/'/g, "'\\''")}'`;
+  return `file ${quoted}\n`.repeat(copies);
 }
 
 /** A viewer's conversion of the clip, as hls.ts would start it, timed. */
@@ -239,7 +258,15 @@ export async function timeConversion(
   args.splice(args.indexOf("-y") + 1, 0, "-nostats", "-progress", "pipe:1");
   // The clip over and over, so every case is timed for the whole time allowed:
   // a fast one would otherwise finish in a moment and measure ffmpeg starting.
-  args.splice(args.indexOf("-i"), 0, "-stream_loop", "-1");
+  // From a list naming it again and again (the concat demuxer: one unbroken
+  // stream), not -stream_loop: that restarts the input, and an H.264 picture
+  // decoded on the GPU then rebuilds the filters with frames scale_vaapi can't
+  // take ("Function not implemented"), failing a case that plays fine (issue #2:
+  // 1080p H.264 to 720p on an Intel Arc and a Kaby Lake).
+  const list = path.join(out, "clip.txt");
+  fs.writeFileSync(list, concatList(sample.file, copiesFor(limitMs, sample.info.duration)));
+  const input = args.indexOf("-i");
+  args.splice(input, 2, "-f", "concat", "-safe", "0", "-i", list);
   const started = performance.now();
   return new Promise<RunResult>((resolve) => {
     const proc = spawn(tools.ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
@@ -274,6 +301,9 @@ export async function timeConversion(
       fs.rm(out, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }, () => undefined);
       const wallSeconds = (performance.now() - started) / 1000;
       const failed = !timedOut && code !== 0;
+      // Frames are the surer count: ffmpeg's out_time trails them over a concat
+      // list (a 720p run on a Kaby Lake: 1441 frames, 60 s of film, out_time 51.9 s).
+      filmSeconds = Math.max(filmSeconds, frames / CLIP_FPS);
       const speed = failed || filmSeconds <= 0 || wallSeconds <= 0 ? null : filmSeconds / wallSeconds;
       const fps = speed === null || frames <= 0 ? null : frames / wallSeconds;
       resolve({
