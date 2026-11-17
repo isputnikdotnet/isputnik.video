@@ -37,9 +37,20 @@ The video engine for isputnik.home, in a container of its own: TV shows and movi
 This is an add-on for isputnik.home and does nothing on its own: it has no sign-in and no pages. Install it beside the isputnik container; video libraries are added, shared and watched in isputnik.home. Set it up from isputnik.home, on Control panel, Settings, Apps, Video. Before installing, press Generate secret there and copy it (it is shown once); paste it into the Gateway Secret field below, which is required. Give the container your video share as Video Folders (read-only: the engine never writes to it). Once it runs, enter its address on the same page (http://[your Unraid IP]:4300 as installed here) and press Test connection, which then says Paired. Then add a library under Control panel, Library, Libraries, Add library, Video. Needs isputnik.home 4.38 or newer.
   </Overview>
 
-  <Date>1794571200</Date>
+  <Date>1794916800</Date>
   <Changes>
-### 2026.11.13 — 0.38.1 Diagnostics, released
+### 2026.11.17 — 0.41.0 Hardware test, and what's playing now
+- **A hardware test, run from home.** Six kinds of film (4K HDR, 4K, 1080p 10-bit HEVC, 1080p H.264 to 720p for someone away from home, DivX and AV1), each converted exactly as a viewer's would be, on the GPU and on the CPU, with how many times real time each manages. Then 4K HDR and 1080p several at once, to suggest how many people can watch converted video at the same time. It waits while someone watches converted video, and stops if someone starts. A change of GPU, driver or ffmpeg between starts is noted too.
+- **A disk check for each library.** How long its disks take to answer (a sleeping disk takes seconds to wake) and how fast its largest film reads, against what its heaviest film needs. Reads only.
+- **What is playing right now.** Every play in progress, converted, played as it is or downloaded for offline, with the title, how far through, the device, the quality and the bandwidth; and for a conversion, its speed over the last few seconds, so one falling behind shows.
+- **More detailed logging for a while.** Detailed (why each film is converted, and where) or Everything (ffmpeg's whole command and output) for 15 minutes, an hour or 4 hours, then back to Normal by itself. It goes into home's diagnostics report.
+- **More kinds of film on the GPU.** The start-up check now also tries 12-bit HEVC and VP9, 10-bit AV1, Motion JPEG from old cameras, and H.264 Baseline on its own, so each goes to the GPU only where it really decodes there (10-bit AV1 always went to the CPU before). It also says which card it is, what it encodes and the largest picture it decodes.
+- **Burned-in picture subtitles keep up on the GPU.** A Blu-ray's PGS subtitles burned into the picture held a 1080p film under real time on an Intel GPU, because the whole subtitle picture went to the GPU with every frame. Now only one that changed does. Contributed by StefanKnol (#15).
+- **A scan or metadata pass cut short is finished on start.** Stopping or updating the container in the middle of one left the library half scanned, or titles without posters, until someone asked again. Each is now taken up again when the engine starts; a plain restart asks TMDB nothing.
+- **A metadata pass shows how far it is, and stops retrying frames that can't be taken.** Home showed "Up to date" through the whole of a long pass. And an episode whose picture ffmpeg couldn't grab was tried three times on every pass: 12,752 of them made one pass take 25 minutes doing nothing else. They wait now until the file changes.
+- The hardware test, disk check, what is playing now and the logging levels are seen on home's Control panel › Infrastructure › Diagnostics, in the home release after 4.89.1.
+
+### 2026.11.12 — 0.38.1 Diagnostics, released
 - **0.38.0 reaches the image.** It was never published: a test that runs before the image is built looked at the conversion's memory and disk once, right as a new segment sat on the disk on its way into memory, and failed. It now waits for that moment to pass. This release carries everything in 0.38.0: the engine's part of home's diagnostics report (home 4.89.0), and the GPU's recent failures kept with ffmpeg's own words.
 
 ### 2026.11.12 — 0.38.0 Diagnostics for bug reports
@@ -59,10 +70,6 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
 - **Films played before 0.31.0 no longer read the whole file again.** Probing a film again for what 0.31.0 added threw away where its keyframes are, though the file had not changed, so each such film's next play had to read it all through. They are now kept while the file stays the same.
 - **HDR films can be tone-mapped on an Intel GPU.** The start-up check always said the GPU could not tone-map, because its test picture carried none of the mastering details an HDR10 film has and the GPU refuses a picture without them. The test picture has them now. HLG films, which usually carry none, are tone-mapped on the CPU, and a film the GPU refuses for want of them goes to the CPU without counting against the GPU.
 - **Backups are taken a little at a time.** The catalog was copied for a backup in one piece in memory; it is now copied with SQLite's own backup between other work and streamed to home, and the copy a restore keeps for undoing it is made the same way.
-
-### 2026.11.12 — 0.36.1 Released for real
-- **0.35.0 and 0.36.0 reach the image at last.** Neither was published: the tests that run before the image is built failed, because the ffmpeg they used (a separate build, not the one the image ships) crashed whenever it put an MPEG-TS video into an MP4, which is how a copy for download is finished. The tests now use the same kind of ffmpeg as the image. This release carries everything in 0.35.0 (converting in memory unless /transcode is a disk, one shared conversion, films kept once converted, Keep ready) and 0.36.0 (big films start sooner).
-- **A copy for download is put together from one stream.** Its kept pieces are now handed to ffmpeg one after another rather than through a list file: simpler, and nothing left behind if it stops.
   </Changes>
 
   <Requires>Needs the isputnik (isputnik.home) container, version 4.38 or newer, installed on the same server. The engine is reached only through it.</Requires>

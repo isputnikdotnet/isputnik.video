@@ -1,5 +1,20 @@
 [
   {
+    "version": "0.41.0",
+    "label": "Hardware test, and what's playing now",
+    "changes": [
+      "**A hardware test, run from home.** Six kinds of film (4K HDR, 4K, 1080p 10-bit HEVC, 1080p H.264 to 720p for someone away from home, DivX and AV1), each converted exactly as a viewer's would be, on the GPU and on the CPU, with how many times real time each manages. Then 4K HDR and 1080p several at once, to suggest how many people can watch converted video at the same time. It waits while someone watches converted video, and stops if someone starts. A change of GPU, driver or ffmpeg between starts is noted too.",
+      "**A disk check for each library.** How long its disks take to answer (a sleeping disk takes seconds to wake) and how fast its largest film reads, against what its heaviest film needs. Reads only.",
+      "**What is playing right now.** Every play in progress, converted, played as it is or downloaded for offline, with the title, how far through, the device, the quality and the bandwidth; and for a conversion, its speed over the last few seconds, so one falling behind shows.",
+      "**More detailed logging for a while.** Detailed (why each film is converted, and where) or Everything (ffmpeg's whole command and output) for 15 minutes, an hour or 4 hours, then back to Normal by itself. It goes into home's diagnostics report.",
+      "**More kinds of film on the GPU.** The start-up check now also tries 12-bit HEVC and VP9, 10-bit AV1, Motion JPEG from old cameras, and H.264 Baseline on its own, so each goes to the GPU only where it really decodes there (10-bit AV1 always went to the CPU before). It also says which card it is, what it encodes and the largest picture it decodes.",
+      "**Burned-in picture subtitles keep up on the GPU.** A Blu-ray's PGS subtitles burned into the picture held a 1080p film under real time on an Intel GPU, because the whole subtitle picture went to the GPU with every frame. Now only one that changed does. Contributed by StefanKnol (#15).",
+      "**A scan or metadata pass cut short is finished on start.** Stopping or updating the container in the middle of one left the library half scanned, or titles without posters, until someone asked again. Each is now taken up again when the engine starts; a plain restart asks TMDB nothing.",
+      "**A metadata pass shows how far it is, and stops retrying frames that can't be taken.** Home showed \"Up to date\" through the whole of a long pass. And an episode whose picture ffmpeg couldn't grab was tried three times on every pass: 12,752 of them made one pass take 25 minutes doing nothing else. They wait now until the file changes.",
+      "The hardware test, disk check, what is playing now and the logging levels are seen on home's Control panel › Infrastructure › Diagnostics, in the home release after 4.89.1."
+    ]
+  },
+  {
     "version": "0.38.1",
     "label": "Diagnostics, released",
     "changes": [
