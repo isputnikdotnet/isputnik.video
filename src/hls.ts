@@ -34,7 +34,7 @@ import path from "node:path";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { noteSent, sentMbps, type SentSamples } from "./watching.js";
-import { MAX_HEIGHT, describeMedia, type PlayMedia } from "./media-summary.js";
+import { MAX_HEIGHT, describeMedia, pipelineOf, type Pipeline, type PlayMedia } from "./media-summary.js";
 import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** Inside the conversion folder: the copies kept for download, never swept. */
@@ -360,6 +360,8 @@ export interface ConversionViewer {
   mbps: number;
   /** The file's picture and sound, and what the conversion sends of them. */
   media: PlayMedia;
+  /** Where its run decodes, tone-maps, scales, draws on and encodes; null when nothing is converted now. */
+  pipeline: Pipeline | null;
   /** What their version holds (shared with whoever watches it too). */
   memoryBytes: number;
   diskBytes: number;
@@ -868,6 +870,7 @@ export class HlsSessions {
         speed: viewer.run ? progressSpeed(viewer.run.progress) : null,
         mbps: sentMbps(viewer.sent, viewer.since, Date.now()),
         media: describeMedia(entry.plan.info, entry.plan.delivery),
+        pipeline: viewer.run && !entry.complete ? pipelineOf(entry.plan.info, entry.plan.delivery, viewer.run.gpu) : null,
         memoryBytes: entry.memoryBytes,
         diskBytes: sumOf(entry.onDisk),
         shared: entry.viewers.size > 1,

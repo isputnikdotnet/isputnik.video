@@ -2027,6 +2027,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       speed: viewer.speed ?? null,
       mbps: viewer.mbps,
       media: viewer.media,
+      pipeline: viewer.pipeline,
       shared: viewer.shared ?? false,
       kept: viewer.kept ?? false
     }));

@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import { decideDelivery } from "../src/delivery.js";
 import type { MediaInfo } from "../src/ffmpeg.js";
-import { containerOf, describeMedia } from "../src/media-summary.js";
+import { containerOf, describeMedia, pipelineOf } from "../src/media-summary.js";
 
 const uhd: MediaInfo = {
   container: "matroska,webm",
@@ -32,16 +32,16 @@ describe("what a play is made of", () => {
     expect(media.source).toEqual({
       container: "mkv",
       video: { codec: "hevc", profile: "Main 10", width: 3840, height: 2160, bitDepth: 10, hdr: "pq" },
-      audio: { codec: "truehd", channels: 8, language: "eng" },
+      audio: { codec: "truehd", channels: 8, language: "eng", title: null },
       bitRate: 60_000_000
     });
     expect(media.sent).toEqual({
       container: "hls",
       video: { codec: "h264", profile: "High", width: 1920, height: 1080, bitDepth: 8, hdr: null },
-      audio: { codec: "aac", channels: 2, language: "eng" },
+      audio: { codec: "aac", channels: 2, language: "eng", title: null },
       bitRate: null
     });
-    expect(media).toMatchObject({ videoCopied: false, audioCopied: false, subtitlesBurned: false });
+    expect(media).toMatchObject({ videoCopied: false, audioCopied: false, subtitlesBurned: false, subtitle: null });
     expect(media.reasons).toEqual(expect.arrayContaining(["container", "audio", "video"]));
   });
 
@@ -63,5 +63,21 @@ describe("what a play is made of", () => {
     expect(media.sent).toBe(media.source);
     expect(media.source.video).toMatchObject({ codec: "h264", width: 1920, height: 800, bitDepth: 8, hdr: null });
     expect(media.reasons).toEqual([]);
+  });
+
+  it("says where each step of a conversion runs: all on the GPU, or what falls back to the CPU", () => {
+    const delivery = decideDelivery(uhd, ".mkv");
+    expect(pipelineOf(uhd, delivery, { device: "/dev/dri/renderD128", decode: true, tonemap: true })).toEqual({ decode: "gpu", tonemap: "gpu", scale: "gpu", overlay: null, encode: "gpu" });
+    expect(pipelineOf(uhd, delivery, { device: "/dev/dri/renderD128", decode: false })).toEqual({ decode: "cpu", tonemap: "cpu", scale: "cpu", overlay: null, encode: "gpu" });
+    expect(pipelineOf(uhd, delivery, null)).toEqual({ decode: "cpu", tonemap: "cpu", scale: "cpu", overlay: null, encode: "cpu" });
+  });
+
+  it("names the subtitle drawn in, and has no pipeline for a picture copied", () => {
+    const withPgs: MediaInfo = { ...uhd, subtitles: [{ index: 3, codec: "hdmv_pgs_subtitle", language: "eng", title: null, default: false, forced: false, width: 1920, height: 1080 }] };
+    const delivery = decideDelivery(withPgs, ".mkv", null, 3);
+    expect(describeMedia(withPgs, delivery).subtitle).toEqual({ codec: "hdmv_pgs_subtitle", language: "eng", title: null, forced: false });
+    expect(pipelineOf(withPgs, delivery, { device: "d", decode: true, tonemap: true, overlay: true })).toMatchObject({ overlay: "gpu", scale: "gpu" });
+    const h264: MediaInfo = { ...uhd, bitRate: 5_000_000, video: { ...uhd.video!, codec: "h264", pixelFormat: "yuv420p", width: 1920, height: 1080, colorTransfer: null } };
+    expect(pipelineOf(h264, decideDelivery(h264, ".mkv"), null)).toBeNull();
   });
 });

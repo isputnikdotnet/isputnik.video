@@ -4,7 +4,8 @@
 // it (hls.ts's encode: H.264 held under the rung, AAC stereo, MPEG-TS segments).
 
 import { chooseAudio, type Delivery, type DeliveryReason } from "./delivery.js";
-import { hdrOf, type AudioStream, type MediaInfo } from "./ffmpeg.js";
+import { hdrOf, type AudioStream, type MediaInfo, type SubtitleStream } from "./ffmpeg.js";
+import type { GpuRun } from "./hardware.js";
 
 /** The tallest picture a conversion makes with no rung asked (hls.ts). */
 export const MAX_HEIGHT = 1080;
@@ -23,6 +24,14 @@ export interface MediaAudio {
   codec: string;
   channels: number;
   language: string | null;
+  title: string | null;
+}
+
+export interface MediaSubtitle {
+  codec: string;
+  language: string | null;
+  title: string | null;
+  forced: boolean;
 }
 
 export interface MediaSide {
@@ -43,6 +52,21 @@ export interface PlayMedia {
   audioCopied: boolean;
   /** An image subtitle drawn onto the picture. */
   subtitlesBurned: boolean;
+  /** The subtitle drawn onto the picture; null when none is. */
+  subtitle: MediaSubtitle | null;
+}
+
+/** Where each step of a conversion's picture runs: null for a step it doesn't take. */
+export type Where = "gpu" | "cpu" | null;
+export interface Pipeline {
+  decode: Where;
+  /** HDR to SDR. */
+  tonemap: Where;
+  /** Down to the rung. */
+  scale: Where;
+  /** The subtitle drawn in. */
+  overlay: Where;
+  encode: Where;
 }
 
 /** ffprobe's format names in a word. */
@@ -63,7 +87,27 @@ function bitDepthOf(pixelFormat: string | null): number | null {
 }
 
 const audioOf = (stream: AudioStream | null): MediaAudio | null =>
-  stream ? { codec: stream.codec, channels: stream.channels, language: stream.language } : null;
+  stream ? { codec: stream.codec, channels: stream.channels, language: stream.language, title: stream.title } : null;
+
+const subtitleOf = (stream: SubtitleStream | null): MediaSubtitle | null =>
+  stream ? { codec: stream.codec, language: stream.language, title: stream.title, forced: stream.forced } : null;
+
+/** Where a run's picture is decoded, tone-mapped, scaled, drawn on and encoded,
+ *  as hls.ts's encode arguments place them; null when the picture is copied. */
+export function pipelineOf(info: MediaInfo, delivery: Delivery, gpu: GpuRun | null): Pipeline | null {
+  if (!info.video || delivery.videoCopy) return null;
+  const on = (yes: boolean | undefined): Where => (yes ? "gpu" : "cpu");
+  const burn = delivery.burn !== null;
+  const shrink = info.video.height > (delivery.rung ?? MAX_HEIGHT);
+  return {
+    decode: on(gpu?.decode),
+    tonemap: hdrOf(info.video) ? on(gpu?.tonemap) : null,
+    // The GPU scales a picture it decoded (or overlays on); otherwise the CPU does, then uploads.
+    scale: shrink ? on(Boolean(gpu && (burn ? gpu.overlay : gpu.decode))) : null,
+    overlay: burn ? on(gpu?.overlay) : null,
+    encode: on(Boolean(gpu))
+  };
+}
 
 /** The file and what reaches the player; `delivery` null for a file played as it is. */
 export function describeMedia(info: MediaInfo, delivery: Delivery | null, extension?: string): PlayMedia {
@@ -74,7 +118,7 @@ export function describeMedia(info: MediaInfo, delivery: Delivery | null, extens
   const container = extension === ".webm" ? "webm" : containerOf(info.container);
   const source: MediaSide = { container, video, audio: audioOf(chosen), bitRate: info.bitRate };
   if (!delivery || delivery.mode === "direct") {
-    return { source, sent: source, reasons: [], videoCopied: true, audioCopied: true, subtitlesBurned: false };
+    return { source, sent: source, reasons: [], videoCopied: true, audioCopied: true, subtitlesBurned: false, subtitle: null };
   }
 
   let sentVideo = video;
@@ -90,13 +134,14 @@ export function describeMedia(info: MediaInfo, delivery: Delivery | null, extens
       hdr: null
     };
   }
-  const sentAudio = !chosen ? null : delivery.audioCopy ? audioOf(chosen) : { codec: "aac", channels: 2, language: chosen.language };
+  const sentAudio = !chosen ? null : delivery.audioCopy ? audioOf(chosen) : { codec: "aac", channels: 2, language: chosen.language, title: chosen.title };
   return {
     source,
     sent: { container: "hls", video: sentVideo, audio: sentAudio, bitRate: null },
     reasons: delivery.reasons,
     videoCopied: delivery.videoCopy,
     audioCopied: delivery.audioCopy,
-    subtitlesBurned: Boolean(delivery.burn)
+    subtitlesBurned: Boolean(delivery.burn),
+    subtitle: subtitleOf(info.video ? delivery.burn : null)
   };
 }
