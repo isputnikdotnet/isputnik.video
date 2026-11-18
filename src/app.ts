@@ -39,6 +39,7 @@ import { LibraryError, getLibrary, listLibraries, purgeDetached, purgeLibrary, p
 import type { LogBuffer } from "./log-buffer.js";
 import { createLogging, type LoggingLevel } from "./logging.js";
 import { deviceOf, Watching } from "./watching.js";
+import { describeMedia } from "./media-summary.js";
 import { listFolders, resolveInside } from "./media.js";
 import { ScanError, scanLibrary, type ScanOptions } from "./scan.js";
 import { getSet, listSets, nextInSet, rebuildSets, setArtRow } from "./sets.js";
@@ -2025,6 +2026,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       converting: viewer.converting,
       speed: viewer.speed ?? null,
       mbps: viewer.mbps,
+      media: viewer.media,
       shared: viewer.shared ?? false,
       kept: viewer.kept ?? false
     }));
@@ -2050,7 +2052,18 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         durationSeconds: progress?.duration_s ?? null
       };
     };
-    const plays = [...watching.current(), ...converted]
+    // A file played as it is: what ffprobe found in it when it was first played (media_probe).
+    const probedOf = db.prepare("SELECT info FROM media_probe WHERE item_id = ?");
+    const direct = watching.current().map((play) => {
+      const row = probedOf.get(play.itemId) as { info: string } | undefined;
+      if (!row) return { ...play, media: null };
+      try {
+        return { ...play, media: describeMedia(JSON.parse(row.info) as MediaInfo, null) };
+      } catch {
+        return { ...play, media: null };
+      }
+    });
+    const plays = [...direct, ...converted]
       .map(({ historyId: _historyId, ...play }) => ({ ...play, ...card({ ...play, historyId: _historyId }) }))
       .sort((a, b) => String(b.since).localeCompare(String(a.since)));
     return { plays };

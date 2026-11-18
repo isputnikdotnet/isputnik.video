@@ -34,6 +34,7 @@ import path from "node:path";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
 import { noteSent, sentMbps, type SentSamples } from "./watching.js";
+import { MAX_HEIGHT, describeMedia, type PlayMedia } from "./media-summary.js";
 import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** Inside the conversion folder: the copies kept for download, never swept. */
@@ -126,9 +127,6 @@ export function playlist(plan: HlsPlan): string {
   lines.push("#EXT-X-ENDLIST", "");
   return lines.join("\n");
 }
-
-/** The tallest picture a conversion makes without a rung asked; taller ones are scaled down to it. */
-const MAX_HEIGHT = 1080;
 
 /** ffmpeg's spelling of a bitrate: "8M", "1.5M", "128k". */
 const rate = (bitsPerSecond: number) => (bitsPerSecond >= 1_000_000 ? `${bitsPerSecond / 1_000_000}M` : `${bitsPerSecond / 1000}k`);
@@ -360,6 +358,8 @@ export interface ConversionViewer {
   speed: number | null;
   /** What their segments have gone out at lately, in Mbit/s (watching.ts's window). */
   mbps: number;
+  /** The file's picture and sound, and what the conversion sends of them. */
+  media: PlayMedia;
   /** What their version holds (shared with whoever watches it too). */
   memoryBytes: number;
   diskBytes: number;
@@ -867,6 +867,7 @@ export class HlsSessions {
         converting: viewer.run !== null,
         speed: viewer.run ? progressSpeed(viewer.run.progress) : null,
         mbps: sentMbps(viewer.sent, viewer.since, Date.now()),
+        media: describeMedia(entry.plan.info, entry.plan.delivery),
         memoryBytes: entry.memoryBytes,
         diskBytes: sumOf(entry.onDisk),
         shared: entry.viewers.size > 1,
