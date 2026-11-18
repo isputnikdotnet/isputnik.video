@@ -216,6 +216,12 @@ describe("seeking", () => {
     try {
       await sessions.segment("mum:seek", plan, 0);
       expect(sessions.usage().viewers[0]).toMatchObject({ mode: "remux", rung: null, converter: null });
+      // What its segments went out at (Diagnostics › Video, Sending now): 1.25 MB is 10 Mbit, over at least a second.
+      expect(sessions.usage().viewers[0].mbps).toBe(0);
+      sessions.sent("mum:seek", 1_250_000);
+      sessions.sent("dad:nobody", 9_000_000);
+      expect(sessions.usage().viewers[0].mbps).toBeGreaterThan(0);
+      expect(sessions.usage().viewers[0].mbps).toBeLessThanOrEqual(10);
       // The same film said to be 50 Mbit/s: above the 480p rung, so the picture is re-encoded.
       const heavy = { ...plan.info, bitRate: 50_000_000 };
       const smaller = buildPlan("seek", plan.file, heavy, decideDelivery(heavy, ".mkv", null, null, 480), null);

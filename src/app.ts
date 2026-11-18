@@ -1131,13 +1131,17 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return reply.code(503).header("Retry-After", "2").send({ error: err.message });
     }
     const headers = { "Content-Type": "video/mp2t", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
-    if ("data" in made) return reply.headers(headers).send(made.data);
+    if ("data" in made) {
+      hls!.sent(found.key, made.data.length);
+      return reply.headers(headers).send(made.data);
+    }
     const file = made.file;
     if (!fs.existsSync(file)) return reply.code(503).header("Retry-After", "1").send({ error: "The segment went missing" });
     reply.hijack();
     reply.raw.writeHead(200, { ...headers, "Content-Length": made.size || fs.statSync(file).size });
     const stream = fs.createReadStream(file);
     stream.on("error", (err) => reply.raw.destroy(err));
+    stream.on("data", (chunk) => hls!.sent(found.key, chunk.length));
     reply.raw.on("close", () => stream.destroy());
     stream.pipe(reply.raw);
   };
@@ -2020,6 +2024,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       hdr: viewer.hdr ?? false,
       converting: viewer.converting,
       speed: viewer.speed ?? null,
+      mbps: viewer.mbps,
       shared: viewer.shared ?? false,
       kept: viewer.kept ?? false
     }));

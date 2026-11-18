@@ -36,11 +36,27 @@ interface Tracked extends Omit<DirectPlay, "since" | "lastSeen" | "mbps"> {
   lastSeen: number;
   open: number;
   /** Bytes sent, by when: the last half minute's, for the rate. */
-  recent: { at: number; bytes: number }[];
+  recent: SentSamples;
 }
 
 /** The window the rate is taken over. */
 const RATE_MS = 30_000;
+
+/** Bytes sent, by when. */
+export type SentSamples = { at: number; bytes: number }[];
+
+/** Notes bytes sent now and lets go of what fell out of the window. */
+export function noteSent(recent: SentSamples, bytes: number, now: number): void {
+  recent.push({ at: now, bytes });
+  while (recent.length > 0 && now - recent[0].at > RATE_MS) recent.shift();
+}
+
+/** What was sent lately, in Mbit/s: the last half minute, or since it began when that is shorter. */
+export function sentMbps(recent: SentSamples, since: number, now: number): number {
+  const windowed = recent.filter((sample) => now - sample.at <= RATE_MS);
+  const seconds = Math.max(1, Math.min(RATE_MS, now - since) / 1000);
+  return Math.round((windowed.reduce((sum, sample) => sum + sample.bytes, 0) * 8) / 1_000_000 / seconds * 10) / 10;
+}
 
 /** A device in a word, from its User-Agent: enough to tell the TV from a phone. */
 export function deviceOf(userAgent: string | undefined): string {
@@ -76,8 +92,7 @@ export class Watching {
         const now = this.now();
         mine.bytes += bytes;
         mine.lastSeen = now;
-        mine.recent.push({ at: now, bytes });
-        while (mine.recent.length > 0 && now - mine.recent[0].at > RATE_MS) mine.recent.shift();
+        noteSent(mine.recent, bytes, now);
       },
       end: () => {
         if (ended) return;
@@ -98,9 +113,7 @@ export class Watching {
         continue;
       }
       const { open: _open, since, lastSeen, recent, ...rest } = play;
-      const windowed = recent.filter((sample) => at - sample.at <= RATE_MS);
-      const seconds = Math.max(1, Math.min(RATE_MS, at - since) / 1000);
-      const mbps = Math.round((windowed.reduce((sum, sample) => sum + sample.bytes, 0) * 8) / 1_000_000 / seconds * 10) / 10;
+      const mbps = sentMbps(recent, since, at);
       out.push({ ...rest, mbps, since: new Date(since).toISOString(), lastSeen: new Date(lastSeen).toISOString() });
     }
     return out.sort((a, b) => b.since.localeCompare(a.since));

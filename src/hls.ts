@@ -33,6 +33,7 @@ import os from "node:os";
 import path from "node:path";
 import { RUNG_LIMITS, type Delivery, type Rung } from "./delivery.js";
 import { hdrOf, type MediaInfo, type Tools } from "./ffmpeg.js";
+import { noteSent, sentMbps, type SentSamples } from "./watching.js";
 import { TONEMAP_VAAPI, deviceArgs, type GpuRun, type Hardware, type HardwareMode } from "./hardware.js";
 
 /** Inside the conversion folder: the copies kept for download, never swept. */
@@ -357,6 +358,8 @@ export interface ConversionViewer {
   converting: boolean;
   /** How many times faster than real time their run converts lately; null when it isn't, or not yet known. */
   speed: number | null;
+  /** What their segments have gone out at lately, in Mbit/s (watching.ts's window). */
+  mbps: number;
   /** What their version holds (shared with whoever watches it too). */
   memoryBytes: number;
   diskBytes: number;
@@ -494,6 +497,8 @@ interface Viewer {
   run: Run | null;
   failure: string | null;
   lastWanted: number;
+  /** Segment bytes sent to them, by when: the rate on Watching now. */
+  sent: SentSamples;
   /** Counts requests: only the newest may move the run (a seek), so one
    *  still waiting for a segment behind it can't drag the run back. */
   asked: number;
@@ -837,6 +842,12 @@ export class HlsSessions {
   }
 
   /** Who is watching converted video, and what it holds in memory and on the disk. */
+  /** Bytes of a segment went out to a viewer (app.ts, as they are written). */
+  sent(key: string, bytes: number): void {
+    const viewer = this.viewers.get(key);
+    if (viewer && !viewer.job) noteSent(viewer.sent, bytes, Date.now());
+  }
+
   usage(): ConversionUsage {
     const viewers = [...this.viewers.values()].map((viewer) => {
       const entry = viewer.entry;
@@ -855,6 +866,7 @@ export class HlsSessions {
         rung: entry.plan.delivery.rung,
         converting: viewer.run !== null,
         speed: viewer.run ? progressSpeed(viewer.run.progress) : null,
+        mbps: sentMbps(viewer.sent, viewer.since, Date.now()),
         memoryBytes: entry.memoryBytes,
         diskBytes: sumOf(entry.onDisk),
         shared: entry.viewers.size > 1,
@@ -921,7 +933,7 @@ export class HlsSessions {
     const entry = this.entries.get(variant) ?? this.open(variant, plan, title);
     entry.holds += 1;
     entry.idleSince = 0;
-    const stand: Viewer = { key: `job:${variant}`, job: true, entry, user: "", title, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const stand: Viewer = { key: `job:${variant}`, job: true, entry, user: "", title, since: Date.now(), run: null, failure: null, lastWanted: 0, sent: [], asked: 0, touched: Date.now() };
     const note = path.join(entry.dir, FILLING_FILE);
     try {
       fs.writeFileSync(note, JSON.stringify({ variant, itemId: plan.itemId, title }));
@@ -1067,7 +1079,7 @@ export class HlsSessions {
     }
     const entry = this.entries.get(variant) ?? this.fromKept(variant, plan, who.title) ?? this.open(variant, plan, who.title);
     entry.idleSince = 0;
-    const viewer: Viewer = { key, entry, user: who.user, title: who.title, itemId: who.itemId, historyId: who.historyId, network: who.network, device: who.device, since: Date.now(), run: null, failure: null, lastWanted: 0, asked: 0, touched: Date.now() };
+    const viewer: Viewer = { key, entry, user: who.user, title: who.title, itemId: who.itemId, historyId: who.historyId, network: who.network, device: who.device, since: Date.now(), run: null, failure: null, lastWanted: 0, sent: [], asked: 0, touched: Date.now() };
     entry.viewers.add(viewer);
     this.viewers.set(key, viewer);
     const film = this.kept.get(variant);
