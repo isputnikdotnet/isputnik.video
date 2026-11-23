@@ -19,11 +19,12 @@ import { IMAGE_SIZES, Tmdb, TmdbError, imagePathSchema, type Fetch } from "./tmd
 import { Hardware, detectGpu, type GpuCapabilities } from "./hardware.js";
 import { HlsBusyError, HlsError, HlsSessions, HlsSupersededError, buildPlan, fileStamp, legacyOf, playlist, variantOf, type HlsPlan, type HlsRefusal, type HlsWho, type SegmentData } from "./hls.js";
 import { isInside, isMapped } from "./mounts.js";
-import { detectionSchema, mergeConversion, readConversion, readCopies, readDetection, readJobs, saveConversion, saveCopies, saveDetection, saveJobs } from "./settings.js";
+import { VIDEO_FOLDER, folderPlaces, folderProblem, readMountinfo, videoRootIn } from "./video-folder.js";
+import { readVideoFolder, saveVideoFolder, detectionSchema, mergeConversion, readConversion, readCopies, readDetection, readJobs, saveConversion, saveCopies, saveDetection, saveJobs } from "./settings.js";
 import { COPY_LIMITS, Copies, copySettingsSchema, estimateCopySeconds, jobSettingsSchema, type CopyKey } from "./copies.js";
 import { Bucket, throttled } from "./throttle.js";
 import { KeepReady, keepReadySchema, type KeepReadyRow } from "./keep-ready.js";
-import { overLimit, type KeptThing } from "./cache.js";
+import { overLimit, unusedFor, type KeptThing } from "./cache.js";
 import { MediaProbe, purgeOrphanProbes, type ProbedFile } from "./media-probe.js";
 import { KeyframeWarmer } from "./keyframe-warmer.js";
 import { everyLine, ffmpegVersionOf, problemLines, systemFacts } from "./diagnostics.js";
@@ -143,6 +144,8 @@ const logQuerySchema = z.object({
   lines: z.coerce.number().int().min(10).max(LOG_LINES_MAX).default(200)
 });
 
+/** The place for video, chosen in home; null goes back to the container's setting. */
+const folderChoiceSchema = z.object({ folder: z.string().trim().min(1).max(1024).nullable() });
 const libraryIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 
 const libraryBodySchema = z.object({
@@ -155,6 +158,7 @@ const libraryBodySchema = z.object({
 const syncBodySchema = z.object({ ids: z.array(libraryIdSchema).max(1000) });
 
 const foldersQuerySchema = z.object({ path: z.string().max(1024).default("") });
+const browseQuerySchema = z.object({ place: z.string().regex(/^[a-z0-9-]{1,32}$/), path: z.string().max(1024).default("") });
 
 const listQuerySchema = z.object({
   library: libraryIdSchema.optional(),
@@ -322,9 +326,22 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const logging = createLogging({ db, logger: app.log, buffer: options.logBuffer });
   // The GPU (hardware.ts): found out once ffmpeg answers, and on Check again.
   const hardware = tools ? new Hardware(() => (options.detectGpu ?? detectGpu)(tools), engineLog) : null;
-  const hls = tools ? new HlsSessions(tools, options.transcodeDir ?? null, engineLog, hardware) : null;
+  // The folder for video: the place the admin chose in home (video-folder.ts),
+  // else the container's own setting (TRANSCODE_PATH). A choice that no longer
+  // works (the disk is gone, or not mapped any more) is set aside, not lost.
+  // Outside Linux (development) nothing can be asked of the mounts: a folder
+  // that was chosen counts as a disk.
+  const mappedFolder = options.isMapped ?? ((folder: string) => isMapped(folder) || process.platform !== "linux");
+  const catalogDir = options.dbPath === ":memory:" ? null : path.dirname(path.resolve(options.dbPath));
+  const savedPlace = readVideoFolder(db);
+  const placeProblem = savedPlace ? folderProblem(savedPlace, { mediaRoot: options.mediaRoot, catalogDir, isMapped: mappedFolder }) : null;
+  if (savedPlace && placeProblem) engineLog.warn({ folder: savedPlace }, `The folder chosen for video can't be used (${placeProblem}); using the container's own setting instead`);
+  /** The place in force since this start; null for the container's setting. */
+  const chosenPlace = savedPlace && !placeProblem ? savedPlace : null;
+  const chosenRoot = chosenPlace ? videoRootIn(chosenPlace) : null;
+  const hls = tools ? new HlsSessions(tools, chosenRoot ?? options.transcodeDir ?? null, engineLog, hardware) : null;
   hls?.configure(readConversion(db));
-  hls?.setMapped((options.isMapped ?? isMapped)(hls.folder));
+  hls?.setMapped(chosenRoot ? true : (options.isMapped ?? isMapped)(hls.folder));
   // Not once the app has closed (a short test can close before ffmpeg answers).
   let closed = false;
   void toolsReady.then((ok) => { if (ok && !closed) hardware?.configure(readConversion(db).hardware); });
@@ -365,7 +382,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     };
   }
   // Copies made for download: a queue of its own, which waits while anyone watches.
-  const copiesDir = options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
+  // In the chosen folder when there is one, as they sit in TRANSCODE_PATH otherwise.
+  const ownsCopiesDir = !chosenRoot && options.copiesDir === undefined;
+  const copiesDir = chosenRoot ? path.join(chosenRoot, "copies") : options.copiesDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "isputnik-video-copies-"));
   const copies = tools ? new Copies(db, tools, copiesDir, engineLog, hardware, busyConverting, hls) : null;
   // When the queue works, and how much (C4): home's Settings › Video › Downloads and Keep ready.
   copies?.configureJobs(readJobs(db));
@@ -389,7 +408,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       ...(hls?.keptFilms() ?? []).map((film) => ({ kind: "film" as const, id: film.variant, sizeBytes: film.sizeBytes, usedAt: film.usedAt, held: Boolean(film.inUse) || film.variant === justMade || pinned.has(`${film.itemId}:${film.rung}`) }))
     ];
     const ready = new Map(copies.readyItems().map((copy) => [copyId(copy.key), copy.key]));
-    for (const thing of overLimit(things, readCopies(db).limitGb * 1024 ** 3)) {
+    // First what has gone unused too long (Retention), then, of the rest, what
+    // the room has no place for.
+    const settings = readCopies(db);
+    const stale = unusedFor(things, settings.retentionDays, Date.now());
+    const rest = things.filter((thing) => !stale.includes(thing));
+    for (const thing of [...stale, ...overLimit(rest, settings.limitGb * 1024 ** 3)]) {
       if (thing.kind === "film") hls?.removeKept(thing.id);
       else if (ready.has(thing.id)) copies.remove(ready.get(thing.id)!);
     }
@@ -657,7 +681,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     clearInterval(daily);
     hls?.close();
     copies?.close();
-    if (options.copiesDir === undefined) fs.rmSync(copiesDir, { recursive: true, force: true });
+    if (ownsCopiesDir) fs.rmSync(copiesDir, { recursive: true, force: true });
     detectStop.abort();
     tester?.stop("The engine is stopping");
     disks.stop("The engine is stopping");
@@ -680,6 +704,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (purged > 0) recordEvent(db, { level: "info", event: "library.purged", detail: `${purged} library(ies) detached for over 30 days were removed` });
     purgeOrphanProgress(db);
     copies?.purgeOrphans();
+    // Kept video that has gone unused past its days (Retention) goes with the day's sweep.
+    trimCache();
     purgeOrphanProbes(db);
     purgeOrphanMarkers(db);
     purgeOrphanDetected(db);
@@ -1460,7 +1486,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     saveCopies(db, settings);
     copies.configure(settings);
     trimCache();
-    note(request, "info", "copies.changed", { detail: `Copies to download may take ${settings.limitGb} GB` });
+    note(request, "info", "copies.changed", { detail: `Kept video may take ${settings.limitGb} GB${settings.retentionDays > 0 ? `, and goes after ${settings.retentionDays} days unused` : ""}` });
     return copiesList(copies);
   });
 
@@ -1574,6 +1600,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   // ── The admin's window, read by home through the gateway ─────────────────
 
+  /** The place chosen for video as it is saved, and whether this run uses it yet. */
+  const folderChoice = () => {
+    const saved = readVideoFolder(db);
+    // Why the saved place was set aside at this start, if it was.
+    const problem = saved !== null && saved === savedPlace ? placeProblem : null;
+    return { folder: saved, pending: saved !== chosenPlace && problem === null, problem };
+  };
+
   // Watching converted video: the admin's limits, and who is using what now.
   const conversion = () => {
     const settings = readConversion(db);
@@ -1583,7 +1617,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       settings: { ...settings, ...legacyOf(settings) },
       // Engine 0.35+: whether the conversion folder is a disk of its own, and the
       // storage in force (memory only without one, whatever was chosen).
-      disk: hls ? { mapped: hls.mapped, folder: hls.folder, ...freeSpace(hls.folder) } : null,
+      // Engine 0.42+: `choice` is the place chosen in home (null: the container's
+      // setting), and whether it waits for the next start to be in force.
+      disk: hls ? { mapped: hls.mapped, folder: hls.folder, ...freeSpace(hls.folder), choice: folderChoice() } : null,
       storage: hls?.storage ?? null,
       usage: hls?.usage() ?? { viewers: [], memoryBytes: 0, diskBytes: 0 },
       // What the GPU does here (engine 0.20+); null without ffmpeg.
@@ -1604,6 +1640,46 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const where = { auto: "on the GPU where it can", cpu: "on the CPU only", gpu: "on the GPU only" }[settings.hardware];
     const away = settings.remoteQuality === null ? "the original" : `${settings.remoteQuality}p`;
     note(request, "info", "conversion.changed", { detail: `Up to ${settings.maxViewers} viewer(s) converting ${where}, ${memory}; away from home up to ${away}` });
+    return conversion();
+  });
+
+  // The folder for video, chosen in home (video-folder.ts): the places this
+  // container can keep video in, and the choice. In force from the next start.
+  /** What is used with no choice: the container's own setting, when it is a disk. */
+  const containerFolder = options.transcodeDir && (options.isMapped ?? isMapped)(options.transcodeDir) ? path.resolve(options.transcodeDir) : null;
+  const videoPlaces = () => folderPlaces({ mediaRoot: options.mediaRoot, containerFolder, catalogDir, mountinfo: readMountinfo(), isMapped: mappedFolder });
+  app.get(`${API}/admin/conversion/folders`, { preHandler: requireAdmin }, async () => ({
+    places: videoPlaces().map((place) => ({ ...place, ...freeSpace(place.path) })),
+    subfolder: VIDEO_FOLDER,
+    choice: folderChoice(),
+    container: containerFolder
+  }));
+
+  // The picker walks a location's folders, as Add library walks the libraries'.
+  app.get(`${API}/admin/conversion/folders/browse`, { preHandler: requireAdmin }, async (request, reply) => {
+    const { place: id, path: relative } = browseQuerySchema.parse(request.query ?? {});
+    const place = videoPlaces().find((entry) => entry.id === id);
+    const listed = place ? await listFolders(place.path, relative) : null;
+    if (!place || !listed) return reply.code(404).send({ error: "No such folder" });
+    const parts = listed.path ? listed.path.split("/") : [];
+    return {
+      root: { id: place.id, name: place.path },
+      currentPath: listed.path,
+      selectedPath: parts.length > 0 ? path.join(place.path, ...parts) : place.path,
+      parentPath: parts.length > 0 ? parts.slice(0, -1).join("/") : null,
+      entries: listed.folders.map((folder) => ({ name: folder.name, relativePath: folder.path }))
+    };
+  });
+
+  app.put(`${API}/admin/conversion/folder`, { preHandler: requireAdmin }, async (request, reply) => {
+    const { folder } = folderChoiceSchema.parse(request.body);
+    if (folder !== null && !path.isAbsolute(folder)) return reply.code(400).send({ error: "Give the folder's full path, starting from the root." });
+    // The container's own cache folder, picked: that IS the container's setting.
+    const place = folder === null || (containerFolder !== null && path.resolve(folder) === containerFolder) ? null : path.resolve(folder);
+    const problem = place ? folderProblem(place, { mediaRoot: options.mediaRoot, catalogDir, isMapped: mappedFolder }) : null;
+    if (problem) return reply.code(400).send({ error: problem });
+    saveVideoFolder(db, place);
+    note(request, "info", "conversion.folder", { detail: place ? `Video is kept in ${videoRootIn(place)} from the next start` : "Video is kept where the container says again, from the next start" });
     return conversion();
   });
 

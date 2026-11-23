@@ -117,13 +117,15 @@ This is an add-on for isputnik.home and does nothing on its own: it has no sign-
           Required="true"
           Mask="false">/mnt/user/data/video</Config>
 
-  <Config Name="Transcode"
+  <!-- Named Transcode, and under advanced settings, until 0.42: the path inside the
+       container is unchanged, so an install made before keeps working as it is. -->
+  <Config Name="Video Cache (Fast Disk)"
           Target="/transcode"
           Default=""
           Mode="rw"
-          Description="Optional fast disk for video: conversion that overflows memory, and copies prepared for download. Point it at a cache-pool or SSD folder. Left empty, video is converted in memory only and no copies are prepared; how much memory is set in the app (Videos › Settings)."
+          Description="Optional, recommended: a folder for video the engine makes itself. Either on your cache pool or an SSD (fastest), for example /mnt/cache/isputnik-video-cache, or beside your libraries, for example /mnt/user/data/video-cache. Not inside Config &amp; Data, which is backed up, and not inside a library folder. Holds converted video that does not fit in memory, films kept after watching, titles kept ready and copies prepared for download; all of it can be made again. Left empty, video is converted in memory only and nothing is kept."
           Type="Path"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false"></Config>
 

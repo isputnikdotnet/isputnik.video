@@ -8,7 +8,9 @@ import path from "node:path";
 export const VIDEO_EXTENSIONS = new Set([".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv", ".mpg", ".mpeg"]);
 
 /** Folders a NAS or a desktop leaves behind that are never media. */
-const IGNORED = /^(\.|@eaDir$|#recycle$|\$RECYCLE\.BIN$|System Volume Information$|lost\+found$)/i;
+// video-cache: the engine's own folder for kept video (video-folder.ts), when the
+// admin keeps it on the disk the libraries are on. Never films to catalog.
+const IGNORED = /^(\.|@eaDir$|#recycle$|\$RECYCLE\.BIN$|System Volume Information$|lost\+found$|video-cache$)/i;
 
 export function isIgnoredName(name: string): boolean {
   return IGNORED.test(name);

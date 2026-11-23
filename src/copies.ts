@@ -46,10 +46,13 @@ export const COPY_LIMITS: Record<Rung, { bitRate: number; maxRate: number; audio
 
 export const copySettingsSchema = z.object({
   /** The most the kept copies may take together. */
-  limitGb: z.number().int().min(1).max(10_000)
+  limitGb: z.number().int().min(1).max(10_000),
+  /** Engine 0.42+: kept video nobody has used for this many days is removed
+   *  (cache.ts unusedFor); 0, the start, keeps it until the room runs out. */
+  retentionDays: z.number().int().min(0).max(3650)
 });
 export type CopySettings = z.infer<typeof copySettingsSchema>;
-export const DEFAULT_COPIES: CopySettings = { limitGb: 50 };
+export const DEFAULT_COPIES: CopySettings = { limitGb: 50, retentionDays: 0 };
 
 export type CopyState = "queued" | "running" | "ready" | "failed";
 

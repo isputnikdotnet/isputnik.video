@@ -88,6 +88,24 @@ export function saveCopies(db: Db, settings: CopySettings): void {
   save(db, COPIES_KEY, settings);
 }
 
+// The folder for video the admin chose in home (video-folder.ts); null until
+// then, and the container's TRANSCODE_PATH is used.
+const FOLDER_KEY = "video-folder";
+
+export function readVideoFolder(db: Db): string | null {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(FOLDER_KEY) as { value: string } | undefined;
+  try {
+    const value: unknown = row ? JSON.parse(row.value) : null;
+    return typeof value === "string" && value.trim() !== "" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveVideoFolder(db: Db, folder: string | null): void {
+  save(db, FOLDER_KEY, folder);
+}
+
 // Finding intros, recaps and credits by itself (detect.ts): on unless the admin
 // turned it off on home's Settings → Video. It reads every episode's sound and
 // picture once, which a small server may rather not spend.

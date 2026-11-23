@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
-import { overLimit } from "../src/cache.js";
+import { overLimit, unusedFor } from "../src/cache.js";
 import { findTools } from "../src/ffmpeg.js";
 import { CACHE_FOLDER } from "../src/hls.js";
 import { makeFixture, type Fixture } from "./helpers/fixture.js";
@@ -20,6 +20,19 @@ const as = (id: string) => ({
   "x-isputnik-user-name": id,
   "x-isputnik-user-role": id === "admin" ? "admin" : "member",
   "x-isputnik-libraries": "lib_mov"
+});
+
+describe("kept video nobody has used for a while", () => {
+  const now = Date.parse("2026-11-22T12:00:00Z");
+  const days = (count: number) => new Date(now - count * 24 * 60 * 60 * 1000).toISOString();
+  const thing = (id: string, usedDaysAgo: number, held = false) => ({ kind: "film" as const, id, sizeBytes: 1, usedAt: days(usedDaysAgo), held });
+
+  it("goes after the days set, and never while it is held or with retention off", () => {
+    const things = [thing("fresh", 2), thing("old", 45), thing("older", 400), thing("watched", 400, true)];
+    expect(unusedFor(things, 30, now).map((entry) => entry.id)).toEqual(["old", "older"]);
+    expect(unusedFor(things, 365, now).map((entry) => entry.id)).toEqual(["older"]);
+    expect(unusedFor(things, 0, now)).toEqual([]);
+  });
 });
 
 let fixture: Fixture;

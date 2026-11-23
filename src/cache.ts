@@ -14,6 +14,15 @@ export interface KeptThing {
   held: boolean;
 }
 
+/** What nobody has wanted for `days` days (home's Videos › Video Streaming ›
+ *  Retention): removed whatever room is left. 0 keeps things until the room
+ *  runs out. Never something being watched, just made, or kept ready. */
+export function unusedFor(things: KeptThing[], days: number, now: number): KeptThing[] {
+  if (days <= 0) return [];
+  const before = new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
+  return things.filter((thing) => !thing.held && thing.usedAt < before);
+}
+
 /** What to remove so the rest fit under `limitBytes`, oldest first. */
 export function overLimit(things: KeptThing[], limitBytes: number): KeptThing[] {
   let used = things.reduce((sum, thing) => sum + thing.sizeBytes, 0);
