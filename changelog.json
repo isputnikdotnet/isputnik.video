@@ -1,5 +1,12 @@
 [
   {
+    "version": "0.42.1",
+    "label": "0.42.0, published",
+    "changes": [
+      "**0.42.0 was tagged but its image was never published**: a test of the list of folders offered for video failed on the build machine, which has disks of its own. The test now pins only the two locations it is about. Everything in 0.42.0 — the folder for video chosen in home, kept video that goes when unused, more about each play — arrives with this release."
+    ]
+  },
+  {
     "version": "0.42.0",
     "label": "The folder for video, chosen in home",
     "changes": [

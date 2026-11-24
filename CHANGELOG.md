@@ -3,6 +3,10 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.42.1 — 0.42.0, published
+
+- **0.42.0 was tagged but its image was never published**: a test of the list of folders offered for video failed on the build machine, which has disks of its own. The test now pins only the two locations it is about. Everything in 0.42.0 — the folder for video chosen in home, kept video that goes when unused, more about each play — arrives with this release.
+
 ## 0.42.0 — The folder for video, chosen in home
 
 - **Where video is kept is chosen in home.** Home's Videos › Video Streaming › Disk & memory has a **Change** button that picks the folder for converted video and download copies: beside the libraries, on the cache disk, or on any other disk mapped into the container. Until now that needed the container's Transcode path. The choice takes effect at the next start, and one that stops working is set aside and said so, not lost. The folder that holds the catalog is never offered, because it is backed up.

@@ -79,7 +79,10 @@ describe("choosing the folder for video", () => {
     expect(offered.subfolder).toBe(VIDEO_FOLDER);
     // Two locations, as the picker names them: where the libraries are, and the
     // container's cache folder. Never the catalog's folder.
-    expect(offered.places.map((entry: { id: string; path: string; writable: boolean }) => [entry.id, entry.path, entry.writable])).toEqual([
+    // (On Linux the machine's own other disks follow as disk-N, and a CI runner has
+    // some, so only these two are pinned.)
+    const pinned = offered.places.filter((entry: { id: string }) => !entry.id.startsWith("disk-"));
+    expect(pinned.map((entry: { id: string; path: string; writable: boolean }) => [entry.id, entry.path, entry.writable])).toEqual([
       ["libraries", path.join(root, "media"), true],
       ["cache", path.join(root, "transcode"), true]
     ]);
