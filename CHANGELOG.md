@@ -3,6 +3,14 @@
 Every release, newest first. Generated from `changelog.json` by `npm run changelog` —
 edit that file, not this one.
 
+## 0.42.0 — The folder for video, chosen in home
+
+- **Where video is kept is chosen in home.** Home's Videos › Video Streaming › Disk & memory has a **Change** button that picks the folder for converted video and download copies: beside the libraries, on the cache disk, or on any other disk mapped into the container. Until now that needed the container's Transcode path. The choice takes effect at the next start, and one that stops working is set aside and said so, not lost. The folder that holds the catalog is never offered, because it is backed up.
+- **Kept video that goes when nobody uses it.** Films kept after watching and download copies can be removed once they have gone unused for 7, 30, 90 or 365 days. It is off to start with, so nothing changes until you set it.
+- **The container's Transcode path has a plainer name.** In the Unraid template it is **Video Cache (Fast Disk)** and shows without opening the advanced settings. The path inside the container is the same, so an existing install needs no change.
+- **More about each play in progress.** What the file is — container, picture, sound — and what reaches the player, with why it is being converted; and for a conversion, whether each step (decoding, tone mapping, scaling, a subtitle drawn in, encoding) runs on the GPU or the CPU. Home's Diagnostics › Video shows it.
+- **Fixed: a film being converted showed 0 Mbit/s sent.** Only films played as they are were counted.
+
 ## 0.41.0 — Hardware test, and what's playing now
 
 - **A hardware test, run from home.** Six kinds of film (4K HDR, 4K, 1080p 10-bit HEVC, 1080p H.264 to 720p for someone away from home, DivX and AV1), each converted exactly as a viewer's would be, on the GPU and on the CPU, with how many times real time each manages. Then 4K HDR and 1080p several at once, to suggest how many people can watch converted video at the same time. It waits while someone watches converted video, and stops if someone starts. A change of GPU, driver or ffmpeg between starts is noted too.
